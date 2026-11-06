@@ -8,11 +8,7 @@
 
 ---
 
-## Announcement Trailer
-
 [![FleshCore Announcement Trailer](docs/images/fleshcore_trailer_preview.gif)](https://tacticalcoconut.github.io/FleshCore/trailer.html)
-
----
 
 ## Overview & How FleshCore Works
 
