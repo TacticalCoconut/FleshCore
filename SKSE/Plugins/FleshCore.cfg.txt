@@ -1,0 +1,408 @@
+# FleshCore.cfg.txt -- do not edit the ids.
+# Q anchor quest local id          P chunk pool local ids
+# L cell wound maxcells budget mincells dropcells   H hitmode radius cooldownms
+# M shardnames sectionnames         -- 0 0 = built-in; small = force a wrap
+# S skinshader tintgain             G goreDiffuse goreNormal
+# V trianglesPerLump                 -- how the solid fill is grouped
+# C prewarm                          -- 1: build a body when they LOAD
+# R reread pollMs roster             -- 1: rebuild a changed 3D off the game's thread.
+#   roster: 1 offers every actor this session has seen to the warm thread whenever
+#   that thread is idle, so a target a same-cell load raises no event for is built BEFORE
+#   something hits them. Otherwise such targets are a large share of game-thread rebuilds.
+# K clearGain jointGain headGain     -- the clearance rule; headGain is not used yet (0 = none)
+# HD probes swap lock skinGate       -- the head probes, [HEAD] in the log.
+#   probes 1 costs about a millisecond on the FIRST wound of each of the first
+#   eight targets (read-only). HD 0, as shipped, leaves them off.
+# E mode perFrame prime clearance lift -- 0 script places; 1 PROBE (engine places first piece);
+#                                       2 engine places all. clearance/lift: as FL_Watch's SpawnClearance/SpawnLift
+# NL spell hit player  -- NEVER KILL BY ORIGIN. A wound from an origin
+#   marked 1 takes flesh and never counts toward death. player 1 applies this
+#   (and a W row's nokill column) to the player too; 0 exempts them. A mod's
+#   FL_Api.SetNoKill on an actor outranks both and always applies.
+#   W rows take an optional column 15, nokill, after mark: 1 = this wound never
+#   kills. Every shipped row has its # comment there, so none sets it.
+# PK on key doubleMs effectLocal spellLocal pauseGame  -- THE PANEL
+#   NOT `P`: that is the chunk pool's list of local ids, and its parser APPENDS
+#   rather than assigns, so a second P row would push a bad record onto the pool.
+#   Rows are compared whole at both ends, so PK cannot be read as P.
+#   key is a DX scan code and is read by FL_WATCH, not by the DLL: the key is
+#   watched in Papyrus, where the engine already refuses to deliver key events
+#   while a menu owns the controls. 52 is DIK_PERIOD -- the '.' on the main
+#   keyboard; the numpad's is 83. doubleMs is how close two taps must be.
+#   effectLocal is the DLL's -- the magic effect it watches for. spellLocal is
+#   FL_Watch's -- the spell that carries it. Two records, two numbers.
+#   pauseGame 1 pauses the game while the panel has focus; 0 leaves it running.
+#   What the panel SETS lives in FleshCore.panel.json beside this file, and is
+#   applied over these rows before their range checks run.
+# HK on tickMs  -- THE HOOKS' SWITCH AND THE HOOK THREAD'S CADENCE.
+#   on 0 turns every T row and every registered row off; the hit path is then
+#   the H row alone. tickMs (50..1000, default 100) is how often the
+#   hook thread looks for a command file, a vortex, a heal, a tracked blow or an
+#   event to relay -- and posts nothing at all when there is nothing to do.
+# T type kind thr window form size count cells budget depth layers parts anchor sweep kick mark nokill prio  # name
+#   THE TRIGGER TABLE: a blow becomes a wound by ROW.
+#   type    what swung: blunt (mace, warhammer, any bash) slash (sword, dagger,
+#           axe, greatsword, battleaxe) pierce (bow, crossbow) any
+#           kw:<KeywordEditorID> (a keyword on the weapon). unarmed and staff
+#           parse and never fire: neither hit voxelises.
+#           fire frost shock shout werewolf drain are typed from a HOSTILE
+#           effect's record when it lands (resist value, keyword, archetype);
+#           mgef:<signed runtime FormID> names one effect.
+#           THE WEAPON ITSELF: sword dagger waraxe mace greatsword
+#           battleaxe warhammer bow staff crossbow, by the record's animation
+#           type (warhammer by its keyword; a bound weapon is the kind its
+#           record is). A bash matches no weapon kind; `bash` is
+#           its own type -- any weapon or shield swung as a bash.
+#   kind    any = every blow of that type; pct = one blow of at least thr per cent of their max health; abs = one blow of at least thr points;
+#           per = every blow of that type, and the wound's SIZE is thr units
+#           per point of damage (0 < thr <= 10): never under the row's own
+#           size, never over 40. On a magic type it never fires on the apply
+#           (no damage there): the damage taken over one element cooldown sizes it;
+#           winpct / winabs = the damage of that type within `window` seconds
+#           (0.5..60), summed on the tick, once per window; drain = thr cells
+#           per second for `window` seconds (0.5..120) after each apply of a
+#           matching effect, as bites at the row's anchor.
+#   window  seconds, for the window kinds and drain; 0 otherwise.
+#   form .. nokill are the W row's columns 3-15, same order, same meaning.
+#   prio    config rows carry -1 so that any row a mod registers outranks them.
+#   ONE WOUND PER BLOW: rows are tried by prio, then a row naming them before
+#   one naming everyone, then by threshold descending. Size scales with how
+#   far past the threshold the blow was, up to three times (a per row's size
+#   is the damage's instead). THE HQ'S COMBAT PAGE builds its own rows
+#   -- one per weapon kind and magic type it has switched on, owner HQ, prio 5
+#   -- from FleshCore.panel.json, and while it is on these T rows stand down
+#   unless its "keep the config's rows" switch is set. Its gates (who may be
+#   cut, the health % above which nobody is, the reset clocks) apply to every
+#   row of every owner.
+#   Damage and health are read from the engine's own HitData and actor values
+#   (facts.h, THE BLOW) and cross-checked against the event before they are
+#   believed; a blow whose numbers are not believed can only fire `any` rows.
+#   A registry `vulnhp` on them declines every blow above that health % here.
+#   A registered SCALAR on them (FL_Api.SetScalar) divides every threshold and
+#   scales what a blow or a drain does to them -- never a spell or a command.
+# D sever severMin severMax rings rigid partSpan lossLimb lossTrunk lossHead
+#   sever: 1 forges severed sections into physical pieces; 0 still sweeps,
+#   still takes the part off them and still kills them for it -- it only writes no object.
+#     headSkinPct headBonePct headBrainPct coalesce coalesceGap sectLumps
+#   sectLumps (column 16): lumps of fill a cell a layer a SEVERED SECTION
+#   carries; 0 = every lump there is. Shards keep one whole lump a cell.
+#   Capping sections at one lump too leaves a severed thigh hollow.
+#   Counted in WHOLE lumps of the size the mesh makes them (48 body,
+#   108 head fill). Default 8 when the column is absent; clamped 0..64.
+#   Columns 11-13 are the head's by-layer death thresholds, in per cent of what they were
+#   born with: skin 40, bone 15, brain 25 (0 = any loss at all is fatal). Shipped
+#   explicitly only so that columns 14 and 15 can be reached. Skin is
+#   40, not lower: an UNDRESSED target has only face skin on their head, no skull and
+#   no brain, so at 20 one BisectSkull kills them before the cut can be looked at.
+# W effect form size count cells budget depth layers parts anchor sweep kick mark -- one per spell
+#   parts:  which parts it may touch, by name ('head', 'left thigh' or the
+#           API's one-word key 'lthigh' -- either spelling), comma-
+#           separated, '-' = every part; a name the engine does not know is
+#           logged and ignored here, refused on a T row or a command
+#   anchor: WHERE it lands -- '-'/aim = the crosshair; centre/front/back/
+#           top/bottom/left/right = that side of the locked part's live
+#           cells, and the aim is not consulted at all
+#   sweep:  'nosever' skips the dismemberment sweep for this wound, so what
+#           it cuts free stays where it is instead of dropping as a piece
+#   kick:   N multiplies the launch force of every piece (0 = the default throw)
+#   mark:   what every piece wears -- 0 as they do, 1 blood, 2 alt
+#   budget 0 = STRIP (remove it, build nothing); layers 0 = derive from depth
+Q	2101
+X	2188
+K	1.00	1.60	0.00
+P	2049,2050,2051,2052,2053,2054,2055,2056,2057,2058,2059,2060,2061,2062,2063,2064,2065,2066,2067,2068
+L	4.0	12.0	34	12	34	10
+M	0	0
+H	0	9.0	900
+HD	0	0	0	0
+# HF mode -- THEIR OWN FACE. 0 off; 1 READ their live FaceGen
+#   face into the lattice as their skin, with nothing drawn changed and nothing
+#   of it counting towards their death; 2 as 1, and their face's skin counts
+#   towards the head's skin threshold (D row); 3 as 2, AND their face
+#   is cut on them like their body's skin -- its skin partition privatised and
+#   the survivors written into a new index buffer on the DLL's clone.
+HF	3
+# FA acc maxVerts -- THEIR EYES, BROWS, MOUTH AND HAIR. acc 0 reads no accessories;
+#   acc 1 reads every OTHER BSDynamicTriShape on them -- eyes, brows, mouth,
+#   face overlays, hair -- through the same private-buffer reader as their face,
+#   but as WARDROBE: layer 0, not skin, forging nothing and counting towards no
+#   death rule, and cut by the same Redraw that cuts their body. maxVerts is a
+#   COST ceiling, not a filter against physics hair: 12000 admits
+#   typical physics wigs (8,000-11,000 vertices) and excludes far denser shapes. See
+#   Config::accMaxVerts in flesh.cpp. FA 1 needs HF 3: an accessory is always cut, and
+#   below HF 3 their face is not.
+FA	1	12000
+# FO x y z -- head-bind space to root space, for the shapes above. Measured
+#   off the vanilla head node's own local transform and corroborated to about a
+#   quarter of a unit by the heads' bounding boxes; overridden by their own face
+#   when theirs measured it as a pure translation, and in every case verified
+#   against their face's bounding box before anything is built. See Config::headOffset in flesh.cpp.
+FO	0.000	-1.548	120.344
+# FOM x y z -- the same offset for a MALE BODY. Read off a male high-poly head
+#   (malehead.nif, 'NPC Head [Head]' translation -0.000256 -1.547517 120.343590)
+#   and off skeleton_male.nif root-to-head: the same three numbers as the female row to
+#   the third decimal, kept as its own row because it is a constant of the MALE rig.
+FOM	0.000	-1.548	120.344
+# DC <mode> <delta> <hold> <bleedX> -- the death camera, written into the
+#   player camera's state objects on the game's thread when a wound of theirs
+#   posts. delta is added to the third-person zoom offsets, bleedX multiplies
+#   the bleedout state's own zoom, and both are put back after hold seconds.
+#   In play: state 9 at the wound, state 11 within half
+#   a second, bleedout zoom 200 -> 500, and the camera visibly further out.
+DC	1	0.35	6	2.5
+S	0	1.00
+G	Textures\FleshCore\flesh_muscle.dds	Textures\FleshCore\flesh_muscle_n.dds
+V	108
+C	1
+R	1	500	1
+#   E 2 (shipped): the engine places every piece on the game's thread at
+#   about 0.1-0.2 ms each, their 3D arriving within about 16 ms, every
+#   position and rotation as set. The script's own loop costs about 0.2 s PER
+#   PIECE -- seconds for a Detonate -- which is the hitch felt
+#   when shards spawn. 1 = the engine places the first piece only; 0 = the script places all.
+E	2	6	0	14.0	6.0
+# PART SPAN (col 7) -- the widest a severed SECTION may be, in JOINTS,
+# before it is split into pieces that are not. A bisection otherwise leaves
+# an entire side of them as ONE rigid object -- an arm and a leg joined
+# through the pelvis -- which reads as a mannequin rather than as gore.
+#   thigh <-> hip 1   thigh <-> chest 2   a whole arm 2   a whole leg 2
+#   a right hand to a right foot 7
+# 2 keeps a whole arm and a whole leg intact and forbids a whole side of the body.
+# 1 makes limbs come apart at the elbow and the knee.  0 turns the rule off.
+# LOSS DIVISORS (cols 8 and 9) -- a part counts as LOST when
+#   cells_now * N < cells_at_birth.   4 = 'under a quarter left',
+#   2 = 'under half left'.  Higher N is HARDER to lose.
+# A limb is lost by coming OFF, so it asks whether almost none is left.
+# The trunk is lost by being DESTROYED, so it asks whether most is gone:
+# half a thigh is a terrible wound, half a chest is a death: a target can
+# survive with 35 of 87 torso cells and 10 of 31 abdomen cells.
+# lossHead (col 10) is its own case: a head is lost by being OPENED, so 1
+# means ANY cell of their skull going is fatal. Only something that takes
+# BONE empties a cell -- stripping the face leaves the bone and does not
+# kill. Raise it if a split skull should be survivable.
+# COALESCE (col 14) -- the smallest a severed SECTION may be before it is
+#   merged into the nearest section of another part within COALESCE_GAP cells (col 15).
+#   Raise-only: a spell whose pieces are already bigger keeps them.
+#   COALESCE_GAP (col 15) -- how far apart, in cells, two sections may be and still merge.
+D	1	7	6	1	1	2	4	2	2	40	15	25	24	4	8
+PK	1	52	300	2242	2243	0
+NL	0	0	1
+HK	1	100
+# ND noDecals -- NO ENGINE DECALS ON FLESHCORE'S OWN GEOMETRY. Bit 1 (1):
+#   the fill shapes carry NiAVObject "No Decals" (bit 10, 1024) from the moment
+#   the meat is revealed, so a blow's blood splash is not projected onto
+#   forty-five skinned shells of fifty thousand triangles each -- the 75-115 ms
+#   frame every hit on a revealed target costs without it.
+#   Bit 2 (2): the forged pieces' NIFs carry the same flag. 3 = both (shipped);
+#   0 = off.
+ND	3
+# FP frameProbe -- THE FRAME PROBE. 1: one task a frame; after every
+#   wound one [FRAME] line says the frame rate before it and the longest frames
+#   after it, with offsets on the wound's own clock. 0: off.
+FP	1
+# RA redrawAsync -- THE REDRAW WORKER. 1: a wound's new index buffers
+#   (one per partition of every shape it touched -- thirty to seventy shapes,
+#   about 0.2 ms each on the blow's own frame) are
+#   gathered and created on a worker thread and installed on the next frame;
+#   the cut shows one frame after the blow instead of on it, and the frame the
+#   blow lands on no longer pays for it. 0 = off.
+#   The restore and re-read paths stay on the game's thread either way.
+RA	1
+# TE tear -- THE TEAR RULE. A limb tears the rest of the way when a
+#   wound has taken this fraction or more of its cross-section at the wound, or
+#   of the flesh that joins it to the part it hangs from: a bite wider than the
+#   arm cannot leave the arm, and half a shoulder does not hold one. Against
+#   what they were born with, so the second bite at a joint tears what the first
+#   left. Arms and legs -- and the trunk across a blade's cut: a
+#   cleave that leaves standing half of what this lets a limb keep (a quarter at
+#   0.5) of their chest and belly where its plane crosses them, with trunk on
+#   both sides of it, went through, so the rest of that band tears and the cut
+#   reaches past the blade's reach, across the trunk and an arm's thickness
+#   beyond. 0 turns it off (a limb then stays until every cell at
+#   the joint is gone, and a cleave stops where its reach does).
+TE	0.5
+# DR effect rate seconds [parts] [anchor] -- A DRAIN SPELL. The effect
+#   (a local id in FleshCore.esp) is not a wound but a FEED: while it is on them
+#   the tick takes rate cells a second from them, as one bite a second at the
+#   anchor of the named parts (a part name or the API's key; '-' = anywhere),
+#   for up to seconds after the last apply -- the effect's own script ends it
+#   the moment the caster lets go. Never a spell's W row. 2379 is Voxel Drain
+#   (0x94B, a copy of the vampire's drain that still absorbs health): a
+#   vampire feeds from the neck down, so the chest's top.
+DR	2379	4.0	30	chest	top	# Voxel Drain
+# AR on reach  hard: slash pierce blunt magic  soft: slash pierce blunt magic
+#   cloth: slash pierce blunt magic -- THE ARMOUR, PARSED BUT NOT APPLIED. In this
+#   release no wound is weighed against what they wear: physical weapons deal
+#   full flesh damage, and these numbers are read and logged but change no
+#   wound's size, pieces, depth or threshold damage. What is worn is still classed,
+#   for the HQ's tester, by AREA: the cells within `reach` units of the spot that still have their
+#   outer layer and hold a worn shape -- a hole cut in a breastplate covers
+#   nothing. The hardest class there wins.
+#   Classes: hard = heavy armour, and light armour of metal, glass, scales,
+#   chitin, stalhrim, bonemold, Nordic or Falmer material; soft = every other
+#   light armour (leather, hide, fur, studded); cloth = clothing; jewellery and
+#   wigs are none. Families: slash (blades, axes, claws), pierce (arrows, bolts),
+#   blunt (maces, hammers, bashes), magic (fire, frost, shock, shouts,
+#   drains, staves). The HQ has no Armour card in this release.
+T	any	pct	25	0	slabz	6.0	1	34	16	3	0	-	-	-	0	0	-	-1	# weapon
+W	2072	bite	6.0	1	34	4	1	0	-	-	-	0	0	# Nick
+W	2074	bite	12.0	1	34	12	2	0	-	-	-	0	0	# Flense
+W	2076	bite	20.0	1	34	14	3	0	-	-	-	0	0	# Maul
+W	2078	bite	34.0	1	47	16	3	0	-	-	-	0	0	# Excavate
+W	2080	bite	20.0	1	10	20	3	0	-	-	-	0	0	# Shatter
+W	2082	bite	14.0	1	3	20	2	0	-	-	-	0	0	# Rend
+W	2084	bite	24.0	1	14	16	1	0	-	-	-	0	0	# Flay
+#  (as a diagnostic, 'all 1.0 1 12 0 1 1' strips skin only over the
+#  whole body and forges nothing, which shows whether the worn interior is
+#  drawn. Flay itself is a bite.)
+W	2086	slabz	5.0	1	34	16	3	0	-	-	-	0	0	# Cleave
+W	2088	slabx	5.0	1	34	16	3	0	-	centre	-	0	0	# Bisect
+#  anchor is 'centre', not '-' (the crosshair): a plane through wherever the ray
+#  landed on them often took an arm off instead of halving them. 'centre' puts it on their
+#  midline. Change this row's anchor column to '-' to aim it.
+W	2090	slaby	5.0	1	34	16	3	0	-	-	-	0	0	# Sunder
+W	2092	borey	7.0	1	27	12	3	0	-	-	-	0	0	# Skewer
+W	2094	borez	7.0	1	27	12	3	0	-	-	-	0	0	# Impale
+W	2096	scatter	7.0	6	20	20	1	0	-	-	-	0	0	# Shred
+W	2098	all	1.0	1	40	20	3	0	-	-	-	0	0	# Unmake
+W	2107	layerz	1.0	1	14	16	3	0	-	-	-	0	0	# ThinCut
+W	2109	halve	7.0	1	40	20	3	0	-	-	-	0	0	# Halve
+W	2121	all	1.0	1	40	0	3	7	-	-	-	0	0	# Excarnate
+W	2133	slabx	5.0	1	34	16	3	0	-	centre	-	0	0	# BisectSelf
+#  anchored on their centre, for the same reason as Bisect above.
+#  Change THIS row's anchor column to '-' to aim it.
+W	2135	grind	1.0	2	7	4	3	0	-	-	-	0	0	# GrindTick
+W	2145	diagf	5.0	1	34	16	3	0	-	-	-	0	0	# Slash
+W	2147	diags	5.0	1	34	16	3	0	-	-	-	0	0	# Rake
+#  Slash and Rake are the two DIAGONAL cuts. With slabz horizontal,
+#  slabx vertical-from-the-front and slaby vertical-from-the-side, that is all
+#  six directions. The mirror of each diagonal would be a new form, not a knob:
+#  the row has nowhere to put an angle.
+W	2149	layerz	1.0	1	10	12	3	0	head	centre	nosever	0	0	# CleaveSkull
+W	2151	layerx	1.0	1	10	12	3	0	head	centre	nosever	0	0	# BisectSkull
+W	2153	layery	1.0	1	10	12	3	0	head	centre	nosever	0	0	# SunderSkull
+W	2155	diagf	1.5	1	10	12	3	0	head	centre	nosever	0	0	# SlashSkull
+W	2157	diags	1.5	1	10	12	3	0	head	centre	nosever	0	0	# RakeSkull
+W	2159	midhead	1.5	1	10	12	3	0	head	centre	nosever	0	0	# Level
+W	2161	bite	4.0	1	3	6	3	0	head	top	-	0	0	# Trepan
+W	2163	bite	8.0	1	10	0	3	7	head	front	-	0	0	# Unmask
+W	2165	crown	1.5	1	10	12	3	0	head	centre	-	0	0	# Crown
+W	2167	all	1.0	1	10	0	3	7	head	centre	-	0	0	# Hollow
+W	2169	neck	2.0	1	14	16	3	0	-	centre	-	0	0	# Decapitate
+W	2197	neck	2.0	1	14	16	3	0	-	centre	-	0	0	# DecapitateSelf
+#  DECAPITATE SELF is the same cut on its own Self-delivery record, for a
+#  self-cast: an aimed Decapitate has nowhere to fly from its own
+#  caster. Same numbers, same anchor -- the neck form does not consult the aim anyway.
+W	2171	restore	1.0	1	3	0	1	0	-	-	-	0	0	# Restore
+W	2173	restore	1.0	1	3	0	1	0	-	-	-	0	0	# RestoreSelf
+W	2175	detonate	1.0	1	20	20	3	0	-	-	-	0	0	# Detonate
+#  kick is 0: a x4 throw puts every piece across the room. 0 is the
+#  throw every other wound gives its pieces, and it is the intended one.
+W	2177	detonate	1.0	1	20	20	3	0	-	-	-	0	2	# Detonate (Alt)
+W	2180	detonate	1.0	1	20	20	3	0	-	-	-	0	2	# DetonateSelf (Alt)
+# DetonateSelf -- the SAME wound as 2175, on an effect whose spell is
+#   delivery = Self. The Shredder spells cast it on the victim FROM the victim,
+#   which cannot miss; the aimed 2175 fires a projectile and did, every time.
+W	2205	detonate	1.0	1	20	20	3	0	-	-	-	0	0	# DetonateSelf
+#
+# THE FOUR LIMB CUTS (ArmOffL/R, LegOffL/R): both forearms-and-hands and
+#   both lower-legs-and-feet. They are delivery = Self like DecapitateSelf, so
+#   Cast(who, who) lands on them instead of firing a bolt along their facing.
+#
+#   ANCHOR IS centre AND NOT top.
+#   Top looks right because the lattice
+#   is in skeleton-root BIND space (measured: a shot on a live calf logged at
+#   z 29.9, a head at z 110..132) so top would be the elbow and the knee
+#   whatever way they are lying when the cut lands. It is not:
+#   Anchor::Top is (mean x, mean y, MAX z) -- the centroid in two axes and
+#   the top in the third. For the lower legs, which are vertical in bind pose,
+#   that is the knee and it would have worked. For a forearm, which is not,
+#   the point sits beside the limb rather than on it, and a bite there clips
+#   the side of the arm without ever taking a full cross-section.
+#   Top would sever two limbs of four and look like a bug in the other two.
+#
+#   centre is the one anchor that is inside the part no matter how the bind
+#   pose holds it, so the radius does the work instead: big enough to swallow
+#   the WHOLE named part. That is safe here in a way it is nowhere else,
+#   because the parts column bounds what may be taken -- nothing outside the
+#   named part is eligible, so a radius larger than the limb cannot eat the
+#   upper arm or the thigh. What it does is remove the forearm (or the lower
+#   leg) entirely, which leaves the hand (or the foot) attached to nothing:
+#   the sever pass then drops it whole, the same way the head drops after
+#   neck. A piece of them on the floor, not only a spray.
+#
+#   16.0 and 22.0 are those parts half-lengths with margin, off a 128-unit
+#   bind-space body. Sever stays ON -- a nosever here would take the forearm
+#   and leave the hand hanging in the air.
+W	2207	bite	16.0	1	14	16	3	0	left forearm	centre	-	0	0	# ArmOffL
+W	2209	bite	16.0	1	14	16	3	0	right forearm	centre	-	0	0	# ArmOffR
+W	2211	bite	22.0	1	14	16	3	0	left lower leg	centre	-	0	0	# LegOffL
+W	2213	bite	22.0	1	14	16	3	0	right lower leg	centre	-	0	0	# LegOffR
+#
+# TAKE A NAMED LIMB -- twelve aimed spells, 0x8AB..0x8C1.
+#   Design note: one spell per limb part -- upper arm, forearm, hand,
+#   thigh, calf and foot, each side.
+#
+#   TWO SHAPES. A joint cut takes the PROXIMAL part with a bite at its own
+#   centre, and whatever hangs below it -- attached to nothing now -- is
+#   dropped WHOLE by the sever pass: cut the thigh and the entire leg falls.
+#   That is the shape of the four limb cuts above. A hand or a foot has nothing
+#   distal to drop, so those use `all` with the part named, which removes
+#   every cell of it and nothing else -- Form::Everything honours the parts
+#   mask (lattice.cpp, C.Alive(mask, parts)).
+#
+#   THE RADII ARE MEASURED. Each is the greatest distance from
+#   that part centroid to any of its own vertices, taken off a BodySlide-built
+#   male body -- the mesh the game actually loads -- with every vertex
+#   assigned by dominant skin bone:
+#       upper arm 13.9   forearm 11.4   thigh 20.3   lower leg 18.2
+#   rounded up so the bite swallows the whole part rather than most of it.
+#   Oversizing is safe because the parts column bounds what may be taken.
+W	2218	bite	14.0	1	14	16	3	0	left upper arm	centre	-	0	0	# TakeArmL
+W	2220	bite	14.0	1	14	16	3	0	right upper arm	centre	-	0	0	# TakeArmR
+W	2222	bite	12.0	1	14	16	3	0	left forearm	centre	-	0	0	# TakeForearmL
+W	2224	bite	12.0	1	14	16	3	0	right forearm	centre	-	0	0	# TakeForearmR
+W	2226	all	1.0	1	14	16	3	0	left hand	centre	-	0	0	# TakeHandL
+W	2228	all	1.0	1	14	16	3	0	right hand	centre	-	0	0	# TakeHandR
+W	2230	bite	21.0	1	14	16	3	0	left thigh	centre	-	0	0	# TakeLegL
+W	2232	bite	21.0	1	14	16	3	0	right thigh	centre	-	0	0	# TakeLegR
+W	2234	bite	19.0	1	14	16	3	0	left lower leg	centre	-	0	0	# TakeShinL
+W	2236	bite	19.0	1	14	16	3	0	right lower leg	centre	-	0	0	# TakeShinR
+W	2238	all	1.0	1	14	16	3	0	left foot	centre	-	0	0	# TakeFootL
+W	2240	all	1.0	1	14	16	3	0	right foot	centre	-	0	0	# TakeFootR
+
+# ----------------------------------------------------------------------------------------
+# LP maxLive shardLife sectionLife -- THE LIVE-PIECE CAP. At most maxLive pieces
+#   (shards and severed sections together, every target's) lie about at once; a new
+#   one born over that evicts the OLDEST first. shardLife / sectionLife are the
+#   seconds a shard / a severed section stays (FL_Chunk's own defaults are 45 / 300).
+#   Read by FL_Watch on every load and handed to FL_Chunk through StorageUtil
+#   (FC_maxpieces, FC_shardlife, FC_sectionlife); the DLL validates and logs the row.
+#   maxLive 0 = no cap.
+#   the HQ's "Pieces kept on the ground" slider (Engine page) overrides maxLive
+#   once moved (FleshCore.pieces.txt, empty until then, so this row stands on every load);
+#   lowering it clears down within seconds. A wound is cut to one piece only at twice the cap.
+#   maxLive 35 by default.
+LP	35	45	300
+# CL bladeAxis combatSeverMax cleaveHalf cleaveReach -- THE CLEAVE. A blow's slab
+#   is thin (cleaveHalf cells either side of the plane) and the longest blade's
+#   cut reaches cleaveReach UNITS from the impact in the plane of the swing, so one
+#   stroke is a cut through the part it struck, not an eight-row band across the whole body (a band that let one greatsword blow at the Gorefest preset take twelve named parts).
+#   A greatsword takes all of it, a battleaxe half, a sword 0.3, a war axe 0.25, a
+#   dagger 0.2. 0 = across the whole body. In units, not cells: in cells, at
+#   cell 8 the reach would be wider than the body.
+#   combatSeverMax bounds the severed sections one BLOW may make (spells keep D's).
+#   bladeAxis: which WEAPON-node axis is the blade's FLAT (the swing plane's
+#   normal): -1 = off (the plane stays horizontal, like a spell's slab),
+#   0/1/2 = that local axis. Read it from the "[HIT]   swing plane:"
+#   log lines, then set it here.
+CL	2	3	0.75	40
+# WD defer maxMs perFrame -- THE DEFERRED WOUND. A blow on a target whose lattice is
+#   cold (a Restore forgot them) or stale (FL_Watch just dressed them) would
+#   voxelise them ON THE BLOW'S FRAME -- a few hundred ms each, more with two targets hit
+#   in one frame. defer 1: such a blow, typed effect or drain hands them to
+#   the re-read worker and the wound is cut the moment their rebuild lands, off the
+#   frame; 2: every origin; 0: off (voxelise on the blow's frame). maxMs: a wound still waiting after
+#   this is dropped and says so. perFrame (WD 0 only, needs FP 1): synchronous
+#   voxelises one frame may run.
+WD	1	1500	1

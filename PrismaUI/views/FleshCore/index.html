@@ -1,0 +1,1400 @@
+<title>FleshCore Panel</title>
+<!-- No web fonts: Ultralight has no network stack, so the
+     request only stalls. The :root fallback stacks carry the typography. -->
+<style>
+/* FleshCore HQ (the panel).
+   One dark theme, because it draws over the game through
+   Ultralight. Every colour is set
+   explicitly. */
+:root{
+  --ground:#0D1317; --panel:#141D23; --raise:#1B262E; --sink:#0A1014;
+  --line:#27343D; --line-soft:#1E2A32;
+  --ink:#E8EAE5; --dim:#8B9AA4; --faint:#5C6B75;
+  --accent:#4FB3A8; --accent-dim:#2E6E68; --accent-ghost:rgba(79,179,168,.12);
+  --fatal:#8E2A1F; --survive:#7CDF3C; --warn:#C9973F; --unset:#3A4750;
+  --sans:"IBM Plex Sans",-apple-system,"Segoe UI",system-ui,sans-serif;
+  --mono:"IBM Plex Mono",ui-monospace,"Cascadia Mono",Consolas,monospace;
+  --serif:"Spectral",Georgia,"Times New Roman",serif;
+  --r:3px;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--ground);color:var(--ink);font:400 14px/1.55 var(--sans);
+     -webkit-font-smoothing:antialiased}
+button,input,select{font:inherit;color:inherit}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+@media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
+
+/* ---------- shell ---------- */
+.shell{display:grid;grid-template-columns:186px 1fr;min-height:100vh}
+.rail{background:var(--sink);border-right:1px solid var(--line);
+      display:flex;flex-direction:column;padding-block:18px}
+.brand{padding:0 18px 16px;border-bottom:1px solid var(--line-soft);margin-bottom:10px}
+.brand h1{margin:0;font:600 19px/1.1 var(--serif);letter-spacing:.01em}
+.brand .sub{margin-top:3px;font:400 10.5px/1.4 var(--mono);color:var(--faint);
+            letter-spacing:.08em;text-transform:uppercase}
+.nav{display:flex;flex-direction:column;gap:1px;padding:0 8px}
+.nav button{background:none;border:0;text-align:left;padding:9px 10px;border-radius:var(--r);
+            color:var(--dim);cursor:pointer;display:flex;justify-content:space-between;
+            align-items:center;gap:8px;transition:background .12s,color .12s}
+.nav button:hover{background:var(--raise);color:var(--ink)}
+.nav button[aria-current="true"]{background:var(--accent-ghost);color:var(--ink);
+            box-shadow:inset 2px 0 0 var(--accent)}
+.nav .n{font:500 10px/1 var(--mono);color:var(--faint)}
+.nav button[aria-current="true"] .n{color:var(--accent)}
+.railfoot{margin-top:auto;padding:14px 18px 0;border-top:1px solid var(--line-soft);
+          font:400 11px/1.5 var(--mono);color:var(--faint)}
+.railfoot .kbd{color:var(--dim)}
+
+.main{display:flex;flex-direction:column;min-width:0}
+.top{display:flex;align-items:center;gap:14px;padding:14px 26px;
+     border-bottom:1px solid var(--line);background:var(--panel)}
+.top h2{margin:0;font:400 17px/1.2 var(--serif);flex:1}
+.pill{display:inline-flex;align-items:center;gap:6px;padding:3px 9px;border-radius:99px;
+      font:500 11px/1.5 var(--mono);letter-spacing:.04em;border:1px solid}
+.pill .dot{width:6px;height:6px;border-radius:50%}
+.pill.ok{color:var(--survive);border-color:rgba(124,223,60,.45);background:rgba(124,223,60,.1)}
+.pill.ok .dot{background:var(--survive)}
+.pill.no{color:var(--fatal);border-color:rgba(142,42,31,.55);background:rgba(142,42,31,.14)}
+.pill.no .dot{background:var(--fatal)}
+.ver{font:400 11px/1.5 var(--mono);color:var(--faint)}
+.page{padding:22px 26px 40px;overflow-y:auto;flex:1}
+.page[hidden]{display:none!important}
+
+/* ---------- body page ---------- */
+.bodywrap{display:grid;grid-template-columns:minmax(300px,420px) 1fr;gap:28px;align-items:start}
+.figcol{position:sticky;top:0}
+.modes{display:flex;gap:1px;background:var(--line);border:1px solid var(--line);
+       border-radius:var(--r);overflow:hidden;margin-bottom:12px;width:fit-content}
+.modes button{background:var(--panel);border:0;padding:6px 14px;color:var(--dim);cursor:pointer;
+              font:500 12px/1.4 var(--sans);transition:background .12s,color .12s}
+.modes button[aria-pressed="true"]{background:var(--accent-ghost);color:var(--ink)}
+.figbox{position:relative;background:var(--sink);border:1px solid var(--line);
+        border-radius:var(--r);padding:10px}
+#fig{display:block;width:100%;height:auto;max-width:100%;touch-action:none}
+#regions path{stroke:var(--sink);stroke-width:1;stroke-linejoin:round;cursor:pointer;
+  vector-effect:non-scaling-stroke;transition:fill .14s,filter .14s}
+#regions path:hover{filter:brightness(1.35)}
+#regions path.sel{stroke:#FFFFFF;stroke-width:2.4;stroke-opacity:1;filter:brightness(1.25)}
+#regions path:focus{outline:none}   /* the UA focus ring is a teal bounding box; the white stroke above is the selection */
+#outline{stroke:var(--ink);stroke-width:1.6;stroke-opacity:.85;stroke-linejoin:round;
+  pointer-events:none;vector-effect:non-scaling-stroke}
+.sidetag{position:absolute;top:14px;font:400 10px/1 var(--mono);color:var(--faint);
+         letter-spacing:.1em;text-transform:uppercase}
+.sidetag.l{left:16px}.sidetag.r{right:16px}
+.legend{display:flex;flex-wrap:wrap;gap:14px;margin-top:12px;font:400 11.5px/1.4 var(--sans);
+        color:var(--dim)}
+.legend span{display:inline-flex;align-items:center;gap:6px}
+.legend i{width:11px;height:11px;border-radius:2px;display:inline-block}
+.hint{margin-top:10px;font:400 11.5px/1.5 var(--sans);color:var(--faint);max-width:42ch}
+
+/* ---------- controls ---------- */
+.stack{display:flex;flex-direction:column;gap:20px;min-width:0}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:var(--r);
+      padding:16px 18px}
+.card>h3{margin:0 0 3px;font:600 13px/1.3 var(--sans);letter-spacing:.02em}
+.card>.note{margin:0 0 14px;font:400 12px/1.5 var(--sans);color:var(--faint);max-width:62ch}
+.selname{font:400 20px/1.2 var(--serif);margin:0 0 2px}
+.selmeta{font:400 11px/1.4 var(--mono);color:var(--faint);margin:0 0 14px;letter-spacing:.03em}
+
+.row{display:flex;align-items:center;gap:14px;padding:9px 0;border-top:1px solid var(--line-soft)}
+.row:first-of-type{border-top:0}
+.row .lab{flex:1;min-width:0}
+.row .lab b{display:block;font:500 13px/1.4 var(--sans)}
+.row .lab small{display:block;font:400 11.5px/1.45 var(--sans);color:var(--faint);margin-top:1px}
+.row .ctl{flex:0 0 auto;display:flex;align-items:center;gap:10px}
+
+.seg{display:flex;gap:1px;background:var(--line);border:1px solid var(--line);
+     border-radius:var(--r);overflow:hidden}
+.seg button{background:var(--raise);border:0;padding:5px 12px;color:var(--dim);cursor:pointer;
+            font:500 12px/1.4 var(--sans);white-space:nowrap;transition:background .12s,color .12s,box-shadow .12s;
+            box-shadow:inset 0 -2px 0 rgba(0,0,0,.45),inset 0 1px 0 rgba(255,255,255,.04)}
+.seg button:hover{color:var(--ink);background:#223039}
+.seg button[aria-pressed="true"]{background:var(--accent);color:#0D1317;font-weight:600;
+            box-shadow:inset 0 2px 0 rgba(0,0,0,.35),inset 0 -1px 0 rgba(255,255,255,.22),0 0 0 1px rgba(0,0,0,.35)}
+.seg button[aria-pressed="true"]::before{content:"\2713\00a0";font-weight:700}
+.seg button.f[aria-pressed="true"]{background:var(--fatal);color:#FFF4F1}
+.seg button.s[aria-pressed="true"]{background:var(--survive);color:#0D1317}
+.row .ctl.seg{gap:1px}            /* .row .ctl sets gap:10px and outranks .seg: keep one chooser, not two pills */
+.modes button{box-shadow:inset 0 -2px 0 rgba(0,0,0,.45)}
+.modes button[aria-pressed="true"]{background:var(--accent);color:#0D1317;font-weight:600;
+            box-shadow:inset 0 2px 0 rgba(0,0,0,.35),inset 0 -1px 0 rgba(255,255,255,.22)}
+
+.sw{position:relative;width:38px;height:21px;border-radius:99px;background:var(--unset);
+    border:0;cursor:pointer;padding:0;transition:background .15s;flex:0 0 auto}
+.sw::after{content:"";position:absolute;top:3px;left:3px;width:15px;height:15px;border-radius:50%;
+           background:var(--ink);transition:transform .15s}
+.sw[aria-pressed="true"]{background:var(--accent-dim)}
+.sw[aria-pressed="true"]::after{transform:translateX(17px);background:var(--accent)}
+
+.num{display:flex;align-items:center;gap:8px}
+.num input[type=range]{width:150px;accent-color:var(--accent);background:transparent}
+.num output{font:500 13px/1 var(--mono);color:var(--ink);min-width:52px;text-align:right;
+            font-variant-numeric:tabular-nums}
+.num .unit{font:400 11px/1 var(--mono);color:var(--faint)}
+input[type=number]{width:74px;background:var(--sink);border:1px solid var(--line);
+  border-radius:var(--r);padding:5px 7px;font:500 13px/1.3 var(--mono);text-align:right;
+  font-variant-numeric:tabular-nums}
+select.pick{background:var(--sink);border:1px solid var(--line);border-radius:var(--r);
+  padding:5px 8px;font:500 12px/1.3 var(--sans);color:var(--ink);cursor:pointer;min-width:118px}
+select.pick:hover{border-color:var(--accent-dim)}
+
+/* ---------- combat: one row per weapon or magic type ---------- */
+.wrow{display:grid;grid-template-columns:1fr auto auto auto auto;align-items:center;gap:12px;
+      padding:9px 0;border-top:1px solid var(--line-soft)}
+.wrow:first-of-type{border-top:0}
+.wrow .lab b{display:block;font:500 13px/1.4 var(--sans)}
+.wrow .lab small{display:block;font:400 11.5px/1.45 var(--sans);color:var(--faint);margin-top:1px}
+.wrow .num input[type=range]{width:110px}
+.wrow .num output{min-width:34px}
+.wrow[data-off="1"] .pick,.wrow[data-off="1"] .num,.wrow[data-off="1"] .seg{opacity:.4;pointer-events:none}
+.trow{grid-template-columns:1fr;gap:6px}
+.trow .tctl{display:flex;align-items:center;gap:16px;flex-wrap:wrap}
+.trow .num output{min-width:44px}
+#p-combat .two{grid-template-columns:repeat(auto-fit,minmax(440px,1fr))}
+#p-combat .row{flex-wrap:wrap}
+#p-combat .row .lab{min-width:18ch}
+#p-combat .row .num input[type=range]{width:120px}
+.lethal-all{margin-top:12px;display:flex;gap:10px;align-items:center}
+.lethal-all small{font:400 11.5px/1.45 var(--sans);color:var(--faint)}
+/* the armour grid: three classes down, four kinds of harm across */
+.agrid{display:grid;grid-template-columns:minmax(150px,1.5fr) repeat(4,minmax(96px,1fr));gap:8px 10px;
+       align-items:center;margin-top:10px;padding-top:10px;border-top:1px solid var(--line-soft)}
+.agrid .ah{font:500 11px/1.3 var(--mono);color:var(--faint);text-transform:uppercase;letter-spacing:.06em}
+.agrid .al b{display:block;font:500 13px/1.4 var(--sans)}
+.agrid .al small{display:block;font:400 11.5px/1.45 var(--sans);color:var(--faint)}
+.agrid select.pick{min-width:0;width:100%}
+.agrid[data-off="1"] select.pick{opacity:.4;pointer-events:none}
+
+/* layered thresholds */
+.layers{display:flex;flex-direction:column;gap:2px;margin-top:4px}
+.layer{display:grid;grid-template-columns:74px 1fr 58px;align-items:center;gap:12px;
+       padding:7px 0}
+.layer .lname{font:500 12.5px/1.3 var(--sans)}
+.layer .lname em{display:block;font:italic 400 11px/1.3 var(--serif);color:var(--faint);
+                 font-style:italic}
+.bar{position:relative;height:8px;border-radius:2px;background:var(--sink);
+     border:1px solid var(--line-soft);overflow:hidden}
+.bar i{position:absolute;inset:0 auto 0 0;display:block;border-radius:1px}
+.layer input[type=range]{grid-column:2;width:100%;accent-color:var(--accent);margin:0;background:transparent}
+.layer .val{font:500 13px/1 var(--mono);text-align:right;font-variant-numeric:tabular-nums}
+
+/* ---------- spells ---------- */
+.spellhead{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:16px}
+.btn{background:var(--raise);border:1px solid var(--line);border-radius:var(--r);
+     padding:6px 13px;color:var(--ink);cursor:pointer;font:500 12.5px/1.4 var(--sans);
+     transition:border-color .12s,background .12s}
+.btn:hover{border-color:var(--accent-dim);background:var(--accent-ghost)}
+.btn.q{color:var(--dim)}
+.count{margin-left:auto;font:500 12px/1.4 var(--mono);color:var(--faint);
+       font-variant-numeric:tabular-nums}
+.grp{margin-bottom:18px}
+.grp h4{margin:0 0 8px;font:400 11px/1 var(--mono);color:var(--faint);letter-spacing:.1em;
+        text-transform:uppercase}
+.spells{display:grid;grid-template-columns:repeat(auto-fill,minmax(232px,1fr));gap:1px;
+        background:var(--line-soft);border:1px solid var(--line-soft);border-radius:var(--r)}
+.sp{display:flex;align-items:center;gap:10px;background:var(--panel);padding:8px 11px}
+.sp .nm{flex:1;min-width:0;font:500 12.5px/1.35 var(--sans);overflow:hidden;
+        text-overflow:ellipsis;white-space:nowrap}
+.sp .id{font:400 10.5px/1 var(--mono);color:var(--faint)}
+.sp .sw{width:32px;height:18px}
+.sp .sw::after{width:12px;height:12px}
+.sp .sw[aria-pressed="true"]::after{transform:translateX(14px)}
+
+/* ---------- diagnostics ---------- */
+.kv{display:grid;grid-template-columns:auto 1fr;gap:7px 18px;font:400 12.5px/1.6 var(--sans)}
+.kv dt{color:var(--faint)}
+.kv dd{margin:0;font-family:var(--mono);font-size:12px;overflow-wrap:anywhere}
+.log{background:var(--sink);border:1px solid var(--line);border-radius:var(--r);
+     padding:11px 13px;font:400 11.5px/1.65 var(--mono);color:var(--dim);
+     max-height:190px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere}
+.two{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:20px}
+
+/* ---------- stored, but not used by this build ---------- */
+/* Advisory only: the control still moves and the plugin still keeps the value.
+   Dimmed into the ground rather than recoloured, so it reads as deliberately
+   inactive instead of broken, and a longer applied list lights it back up. */
+.unwired{opacity:.45;cursor:not-allowed}
+.unwired input[type=range],.unwired button{cursor:not-allowed}
+
+@media (max-width:880px){
+  .shell{grid-template-columns:1fr}
+  .rail{flex-direction:row;align-items:center;overflow-x:auto;padding:10px 14px;gap:10px;
+        border-right:0;border-bottom:1px solid var(--line)}
+  .brand{border:0;margin:0;padding:0 10px 0 0;flex:0 0 auto}
+  .brand .sub{display:none}
+  .nav{flex-direction:row;padding:0}
+  .nav .n{display:none}
+  .railfoot{display:none}
+  .bodywrap{grid-template-columns:1fr}
+  .figcol{position:static}
+  .page{padding:18px 16px 36px}
+  .top{padding:12px 16px}
+}
+
+details.adv{grid-column:1/-1;background:var(--panel);border:1px solid var(--line);padding:14px 20px}
+details.adv > summary{cursor:pointer;font:600 12px/1 var(--sans);letter-spacing:.12em;text-transform:uppercase;color:var(--dim);list-style:none;display:flex;justify-content:space-between;align-items:center}
+details.adv > summary::-webkit-details-marker{display:none}
+details.adv > summary::after{content:"Show Advanced ▾";font:400 11px/1 var(--mono);text-transform:none;letter-spacing:0;color:var(--faint)}
+details.adv[open] > summary{margin-bottom:14px;padding-bottom:10px;border-bottom:1px solid var(--line2);color:var(--ink)}
+details.adv[open] > summary::after{content:"Hide Advanced ▴"}
+</style>
+
+<div class="shell">
+  <aside class="rail">
+    <div class="brand">
+      <h1>FleshCore</h1>
+      <div class="sub">HQ</div>
+    </div>
+    <nav class="nav" id="nav">
+      <button data-p="body"  aria-current="true">The Body <span class="n">01</span></button>
+      <button data-p="combat">Combat <span class="n">02</span></button>
+      <button data-p="spells">Spells <span class="n">03</span></button>
+      <button data-p="engine">Engine <span class="n">04</span></button>
+      <button data-p="diag">Diagnostics <span class="n">05</span></button>
+    </nav>
+    <div class="railfoot">
+      <span class="kbd">.&nbsp;.</span> opens and closes the HQ<br>
+      <span class="kbd">Esc</span> to close
+    </div>
+  </aside>
+
+  <div class="main">
+    <header class="top">
+      <h2 id="ptitle">The Body</h2>
+      <span class="pill ok" id="armed"><span class="dot"></span>ENGINE ARMED</span>
+      <span class="ver" id="banner">FleshCore v0.1 Beta</span>
+    </header>
+
+    <!-- ============================= THE BODY ============================= -->
+    <section class="page" id="p-body">
+      <div class="card" id="intensityCard" style="margin-bottom:22px">
+        <h3>Combat Intensity</h3>
+        <p class="note">Slide from <b>Disabled (0%)</b> through <b>Finishing Blows (50%)</b> up to <b>Gorefest (100%)</b>. Moving right makes combat progressively more likely to voxelise and makes more dismemberments non-survivable. Changing any individual setting below switches the profile to <b>Custom</b>.</p>
+        <div id="cbPresets" style="margin-top:12px"></div>
+      </div>
+      <div class="bodywrap">
+        <div class="figcol">
+          <div class="modes" role="group" aria-label="Figure mode">
+            <button id="mCfg" aria-pressed="true">Survivability Rules</button>
+            <button id="mLive" aria-pressed="false">Live Body State</button>
+          </div>
+          <div class="figbox">
+            <span class="sidetag l">Right Side</span>
+            <span class="sidetag r">Left Side</span>
+            <svg id="fig" viewBox="0.00 0.00 96.32 165.14" role="group" aria-label="Body diagram. Click a region to select it."><g id="regions"></g><path id="outline" d="M61.33 149.17 C61.22 149.17 60.89 149.24 60.67 149.17 C60.44 149.09 60.46 148.81 60.00 148.72 C59.54 148.63 58.31 148.68 57.89 148.61 C57.47 148.55 57.68 148.58 57.50 148.33 C57.32 148.08 56.94 147.50 56.83 147.11 C56.72 146.72 56.72 146.48 56.83 146.00 C56.94 145.52 57.39 144.74 57.50 144.22 C57.61 143.70 57.56 143.30 57.50 142.89 C57.44 142.48 57.20 142.56 57.17 141.78 C57.13 141.00 57.41 140.33 57.28 138.22 C57.15 136.11 56.67 131.11 56.39 129.11 C56.11 127.11 55.81 127.15 55.61 126.22 C55.41 125.30 55.26 125.35 55.17 123.56 C55.07 121.76 55.20 117.24 55.06 115.44 C54.91 113.65 54.54 113.81 54.28 112.78 C54.02 111.74 53.72 110.46 53.50 109.22 C53.28 107.98 53.26 106.81 52.94 105.33 C52.63 103.85 52.02 102.04 51.61 100.33 C51.20 98.63 50.85 97.00 50.50 95.11 C50.15 93.22 49.72 90.19 49.50 89.00 C49.28 87.81 49.29 88.25 49.17 88.00 C49.05 87.75 49.03 87.58 48.78 87.50 C48.53 87.42 47.95 87.32 47.67 87.50 C47.38 87.68 47.34 87.27 47.06 88.56 C46.77 89.84 46.31 93.24 45.94 95.22 C45.57 97.20 45.24 98.74 44.83 100.44 C44.43 102.15 43.78 104.17 43.50 105.44 C43.22 106.72 43.39 106.87 43.17 108.11 C42.94 109.35 42.46 111.65 42.17 112.89 C41.87 114.13 41.52 113.93 41.39 115.56 C41.26 117.19 41.44 121.06 41.39 122.67 C41.33 124.28 41.30 124.00 41.06 125.22 C40.81 126.44 40.26 127.74 39.94 130.00 C39.63 132.26 39.28 136.76 39.17 138.78 C39.06 140.80 39.31 141.22 39.28 142.11 C39.24 143.00 38.89 143.50 38.94 144.11 C39.00 144.72 39.50 145.26 39.61 145.78 C39.72 146.30 39.70 146.81 39.61 147.22 C39.52 147.63 39.25 147.99 39.06 148.22 C38.86 148.45 38.86 148.55 38.44 148.61 C38.03 148.68 36.98 148.54 36.56 148.61 C36.13 148.69 36.87 148.98 35.89 149.06 C34.91 149.13 31.69 149.09 30.67 149.06 C29.65 149.02 29.97 148.94 29.78 148.83 C29.58 148.73 29.55 148.66 29.50 148.44 C29.45 148.23 29.44 147.83 29.50 147.56 C29.56 147.28 29.54 147.07 29.83 146.78 C30.13 146.48 30.74 146.31 31.28 145.78 C31.81 145.24 32.76 144.09 33.06 143.56 C33.35 143.02 32.96 143.04 33.06 142.56 C33.15 142.07 33.56 141.78 33.61 140.67 C33.67 139.56 33.37 137.35 33.39 135.89 C33.41 134.43 33.67 133.13 33.72 131.89 C33.78 130.65 33.81 129.69 33.72 128.44 C33.63 127.20 33.26 125.50 33.17 124.44 C33.07 123.39 32.98 123.43 33.17 122.11 C33.35 120.80 33.98 117.85 34.28 116.56 C34.57 115.26 34.83 115.31 34.94 114.33 C35.06 113.35 34.91 111.52 34.94 110.67 C34.98 109.81 35.13 109.72 35.17 109.22 C35.20 108.72 35.30 108.70 35.17 107.67 C35.04 106.63 34.52 105.02 34.39 103.00 C34.26 100.98 34.33 97.69 34.39 95.56 C34.44 93.43 34.50 92.19 34.72 90.22 C34.94 88.26 35.37 85.57 35.72 83.78 C36.07 81.98 36.52 80.91 36.83 79.44 C37.15 77.98 37.39 76.00 37.61 75.00 C37.83 74.00 38.07 74.02 38.17 73.44 C38.26 72.87 38.09 72.11 38.17 71.56 C38.24 71.00 38.43 71.00 38.61 70.11 C38.80 69.22 39.17 67.04 39.28 66.22 C39.39 65.41 39.41 66.26 39.28 65.22 C39.15 64.19 38.76 61.22 38.50 60.00 C38.24 58.78 37.87 58.43 37.72 57.89 C37.57 57.35 37.74 57.24 37.61 56.78 C37.48 56.31 37.15 56.04 36.94 55.11 C36.74 54.19 36.55 51.95 36.39 51.22 C36.23 50.49 36.15 50.72 36.00 50.72 C35.85 50.72 35.68 50.81 35.50 51.22 C35.32 51.64 35.20 52.56 34.94 53.22 C34.69 53.89 34.91 53.72 33.94 55.22 C32.98 56.72 30.11 60.72 29.17 62.22 C28.22 63.72 28.48 63.63 28.28 64.22 C28.07 64.81 28.17 65.17 27.94 65.78 C27.72 66.39 27.96 66.30 26.94 67.89 C25.93 69.48 22.70 73.96 21.83 75.33 C20.96 76.70 21.67 75.65 21.72 76.11 C21.78 76.57 22.09 77.50 22.17 78.11 C22.24 78.72 22.06 78.89 22.17 79.78 C22.28 80.67 22.79 82.73 22.83 83.44 C22.88 84.16 22.66 83.94 22.44 84.06 C22.23 84.18 21.79 84.25 21.56 84.17 C21.32 84.08 21.21 83.95 21.06 83.56 C20.90 83.16 20.77 82.18 20.61 81.78 C20.45 81.38 20.26 81.22 20.11 81.17 C19.96 81.11 19.92 81.10 19.72 81.44 C19.53 81.79 19.09 82.63 18.94 83.22 C18.80 83.81 18.81 84.61 18.83 85.00 C18.85 85.39 18.91 85.35 19.06 85.56 C19.20 85.76 19.54 85.96 19.72 86.22 C19.91 86.48 19.98 86.83 20.17 87.11 C20.35 87.39 20.84 87.53 20.83 87.89 C20.82 88.25 20.60 89.27 20.11 89.28 C19.62 89.29 18.45 88.42 17.89 87.94 C17.32 87.47 16.95 86.75 16.72 86.44 C16.49 86.14 16.61 86.65 16.50 86.11 C16.39 85.57 16.13 83.89 16.06 83.22 C15.98 82.56 15.81 83.07 16.06 82.11 C16.30 81.15 16.96 79.50 17.50 77.44 C18.04 75.39 18.80 71.67 19.28 69.78 C19.76 67.89 19.87 67.46 20.39 66.11 C20.91 64.76 21.83 62.74 22.39 61.67 C22.94 60.59 23.20 60.35 23.72 59.67 C24.24 58.98 25.04 58.30 25.50 57.56 C25.96 56.81 25.93 56.35 26.50 55.22 C27.07 54.09 28.44 51.80 28.94 50.78 C29.44 49.76 29.35 49.74 29.50 49.11 C29.65 48.48 29.52 47.96 29.83 47.00 C30.15 46.04 30.83 44.37 31.39 43.33 C31.94 42.30 32.62 41.45 33.17 40.78 C33.71 40.10 33.58 39.97 34.67 39.28 C35.75 38.58 38.30 37.52 39.67 36.61 C41.04 35.70 42.13 34.31 42.89 33.83 C43.65 33.35 43.97 33.77 44.22 33.72 C44.47 33.68 44.60 34.10 44.39 33.56 C44.18 33.01 43.37 31.65 42.94 30.44 C42.52 29.24 42.04 27.69 41.83 26.33 C41.63 24.98 41.70 23.26 41.72 22.33 C41.74 21.41 41.83 21.26 41.94 20.78 C42.06 20.30 42.19 19.87 42.39 19.44 C42.59 19.02 42.92 18.55 43.17 18.22 C43.42 17.90 43.68 17.69 43.89 17.50 C44.10 17.31 44.07 17.24 44.44 17.06 C44.81 16.87 45.56 16.56 46.11 16.39 C46.67 16.22 47.33 16.11 47.78 16.06 C48.22 16.00 48.35 16.00 48.78 16.06 C49.20 16.11 49.80 16.22 50.33 16.39 C50.87 16.56 51.49 16.73 52.00 17.06 C52.51 17.38 53.05 17.94 53.39 18.33 C53.73 18.73 53.83 18.81 54.06 19.44 C54.28 20.07 54.63 20.94 54.72 22.11 C54.81 23.28 54.78 25.15 54.61 26.44 C54.44 27.74 54.15 28.70 53.72 29.89 C53.30 31.07 52.31 32.92 52.06 33.56 C51.81 34.19 51.94 33.66 52.22 33.72 C52.51 33.79 52.98 33.44 53.78 33.94 C54.57 34.44 55.69 35.85 57.00 36.72 C58.31 37.59 60.60 38.47 61.67 39.17 C62.73 39.86 62.86 40.27 63.39 40.89 C63.92 41.51 64.35 42.06 64.83 42.89 C65.31 43.72 65.85 44.63 66.28 45.89 C66.70 47.15 66.81 48.96 67.39 50.44 C67.96 51.93 69.15 53.63 69.72 54.78 C70.30 55.93 70.15 56.26 70.83 57.33 C71.52 58.41 72.94 59.72 73.83 61.22 C74.72 62.72 75.61 64.93 76.17 66.33 C76.72 67.74 76.81 68.26 77.17 69.67 C77.52 71.07 77.85 73.11 78.28 74.78 C78.70 76.44 79.43 78.50 79.72 79.67 C80.02 80.83 79.96 81.35 80.06 81.78 C80.15 82.20 80.31 81.50 80.28 82.22 C80.24 82.94 80.12 85.16 79.83 86.11 C79.55 87.06 79.06 87.44 78.56 87.94 C78.05 88.45 77.17 88.96 76.78 89.17 C76.39 89.37 76.40 89.38 76.22 89.17 C76.05 88.95 75.71 88.21 75.72 87.89 C75.73 87.56 76.13 87.46 76.28 87.22 C76.43 86.98 76.41 86.74 76.61 86.44 C76.81 86.15 77.33 85.91 77.50 85.44 C77.67 84.98 77.67 84.19 77.61 83.67 C77.56 83.15 77.36 82.75 77.17 82.33 C76.97 81.92 76.67 81.22 76.44 81.17 C76.22 81.11 75.99 81.60 75.83 82.00 C75.68 82.40 75.64 83.19 75.50 83.56 C75.36 83.92 75.23 84.08 75.00 84.17 C74.77 84.25 74.31 84.16 74.11 84.06 C73.92 83.95 73.86 83.90 73.83 83.56 C73.81 83.21 73.85 82.59 73.94 82.00 C74.04 81.41 74.31 80.74 74.39 80.00 C74.46 79.26 74.33 78.20 74.39 77.56 C74.44 76.91 74.69 76.48 74.72 76.11 C74.76 75.74 75.50 76.74 74.61 75.33 C73.72 73.93 70.37 69.17 69.39 67.67 C68.41 66.17 68.94 66.96 68.72 66.33 C68.50 65.70 68.30 64.57 68.06 63.89 C67.81 63.20 68.22 63.70 67.28 62.22 C66.33 60.74 63.37 56.56 62.39 55.00 C61.41 53.44 61.63 53.54 61.39 52.89 C61.15 52.24 61.10 51.47 60.94 51.11 C60.79 50.75 60.59 50.70 60.44 50.72 C60.30 50.74 60.19 50.56 60.06 51.22 C59.92 51.88 59.81 53.72 59.61 54.67 C59.41 55.61 58.98 56.33 58.83 56.89 C58.69 57.44 58.87 57.46 58.72 58.00 C58.57 58.54 58.20 58.78 57.94 60.11 C57.69 61.44 57.20 64.44 57.17 66.00 C57.13 67.56 57.54 68.54 57.72 69.44 C57.91 70.35 58.19 70.81 58.28 71.44 C58.37 72.07 58.17 72.57 58.28 73.22 C58.39 73.87 58.70 74.22 58.94 75.33 C59.19 76.44 59.43 78.50 59.72 79.89 C60.02 81.28 60.39 82.00 60.72 83.67 C61.06 85.33 61.50 88.00 61.72 89.89 C61.94 91.78 62.00 92.76 62.06 95.00 C62.11 97.24 62.17 101.31 62.06 103.33 C61.94 105.35 61.52 106.20 61.39 107.11 C61.26 108.02 61.26 108.28 61.28 108.78 C61.30 109.28 61.46 109.22 61.50 110.11 C61.54 111.00 61.39 113.06 61.50 114.11 C61.61 115.17 61.87 115.15 62.17 116.44 C62.46 117.74 63.09 120.52 63.28 121.89 C63.46 123.26 63.37 123.48 63.28 124.67 C63.19 125.85 62.80 127.50 62.72 129.00 C62.65 130.50 62.78 132.59 62.83 133.67 C62.89 134.74 63.04 134.24 63.06 135.44 C63.07 136.65 62.89 139.74 62.94 140.89 C63.00 142.04 63.31 141.87 63.39 142.33 C63.46 142.80 63.28 143.28 63.39 143.67 C63.50 144.06 63.79 144.34 64.06 144.67 C64.32 144.99 64.56 145.26 65.00 145.61 C65.44 145.96 66.38 146.44 66.72 146.78 C67.06 147.12 67.00 147.41 67.06 147.67 C67.11 147.93 67.14 148.14 67.06 148.33 C66.97 148.53 67.14 148.75 66.56 148.83 C65.97 148.92 64.43 148.78 63.56 148.83 C62.69 148.89 61.70 149.11 61.33 149.17 C60.96 149.22 61.44 149.17 61.33 149.17Z" fill="none"/></svg>
+          </div>
+          <div class="legend" id="legend">
+            <span><i style="background:var(--fatal)"></i>Fatal when severed</span>
+            <span><i style="background:var(--survive)"></i>Survivable</span>
+          </div>
+          <p class="hint">Click any body region to toggle whether losing that part is immediately fatal or survivable.</p>
+          <div class="lethal-all">
+            <button class="btn" id="lethalAll">Make every part survivable</button>
+            <small id="lethalAllNote">Toggles all 15 body regions at once.</small>
+          </div>
+        </div>
+
+        <div class="stack">
+          <div class="card" id="selcard">
+            <p class="selname" id="selname">Head</p>
+            <p class="selmeta" id="selmeta">Fatal when severed</p>
+            <div id="selbody"></div>
+          </div>
+
+          <div class="card">
+            <h3>Dismemberment Survivability</h3>
+            <p class="note">Controls how many non-fatal limb segments an actor can lose before dying, and whether head or torso loss is fatal.</p>
+            <div class="row">
+              <div class="lab"><b>Limbs lost before death</b>
+                <small>How many survivable limb segments can be severed before cumulative shock is fatal.</small></div>
+              <div class="ctl num">
+                <input type="range" id="lossLimb" min="1" max="12" step="1" value="4">
+                <output for="lossLimb" id="lossLimbV">4</output>
+              </div>
+            </div>
+            <div class="row">
+              <div class="lab"><b>Losing the torso is fatal</b>
+                <small>Bisecting the chest or abdomen kills the target immediately.</small></div>
+              <div class="ctl"><button class="sw" id="trunkFatal" aria-pressed="true" aria-label="Losing the torso is fatal"></button></div>
+            </div>
+            <div class="row">
+              <div class="lab"><b>Losing the head is fatal</b>
+                <small>Decapitation kills the target immediately.</small></div>
+              <div class="ctl"><button class="sw" id="headFatal" aria-pressed="true" aria-label="Losing the head is fatal"></button></div>
+            </div>
+          </div>
+
+          <div class="card">
+            <h3>Non-Lethal Mode Overrides</h3>
+            <p class="note">Allow wounds and dismemberments to strip flesh and sever limbs without killing the target.</p>
+            <div class="row"><div class="lab"><b>Non-lethal combat blows</b>
+              <small>When enabled, combat hits and dismemberments never kill the target.</small></div>
+              <div class="ctl"><button class="sw" id="nkHit" aria-pressed="false" aria-label="Blows never kill"></button></div></div>
+            <div class="row"><div class="lab"><b>Non-lethal hand-cast spells</b>
+              <small>When enabled, FleshCore spells cast by hand dismember without killing.</small></div>
+              <div class="ctl"><button class="sw" id="nkSpell" aria-pressed="false" aria-label="Spell wounds never kill"></button></div></div>
+            <div class="row"><div class="lab"><b>Apply non-lethal rules to the Player</b>
+              <small>Includes the player character when non-lethal overrides are active.</small></div>
+              <div class="ctl"><button class="sw" id="nkPlayer" aria-pressed="true" aria-label="Apply to the player too"></button></div></div>
+          </div>
+
+          <details class="adv">
+            <summary>Advanced Tissue Thresholds &amp; Scene Rules</summary>
+            <div class="stack" id="advBodyStack">
+              <div class="card">
+                <h3>Internal Origin Immunities</h3>
+                <div class="row"><div class="lab"><b>Scene wounds never kill</b>
+                  <small>Keeps scene targets (Knockout and external scene mods) alive until the scene finishes.</small></div>
+                  <div class="ctl"><button class="sw" id="nkScene" aria-pressed="true" aria-label="Scene wounds never kill"></button></div></div>
+                <div class="row"><div class="lab"><b>Mod API commands never kill</b>
+                  <small>External mod wounds do not trigger death.</small></div>
+                  <div class="ctl"><button class="sw" id="nkCommand" aria-pressed="false" aria-label="Command wounds never kill"></button></div></div>
+                <div class="row"><div class="lab"><b>Shredder vortexes never kill</b>
+                  <small>Area shredder spheres/runes do not trigger death.</small></div>
+                  <div class="ctl"><button class="sw" id="nkVortex" aria-pressed="false" aria-label="Vortex wounds never kill"></button></div></div>
+                <div class="row"><div class="lab"><b>Vampire drain never kills</b>
+                  <small>Gradual feeding wounds do not trigger death.</small></div>
+                  <div class="ctl"><button class="sw" id="nkDrain" aria-pressed="false" aria-label="Drain wounds never kill"></button></div></div>
+              </div>
+            </div>
+          </details>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============================== COMBAT ============================== -->
+    <section class="page" id="p-combat" hidden>
+      <div class="two">
+        <div class="card" style="grid-column:1/-1">
+          <h3>Combat Intensity</h3>
+          <p class="note">The Combat Intensity slider is at the top of <b>The Body</b> page, above the body map it previews.</p>
+        </div>
+
+        <div class="card">
+          <h3>Who Can Be Cut in Combat</h3>
+          <p class="note">Choose which actors can suffer voxel wounds from combat blows and hostile magic. Player layers unlock in strict order: <b>Skin &rarr; Flesh &rarr; Bones &rarr; Severing Limbs</b>.</p>
+          <div class="row"><div class="lab"><b>Enemies &amp; NPCs</b><small>Standard hostile and non-essential NPCs.</small></div>
+            <div class="ctl"><button class="sw cb" data-k="who.npc" aria-pressed="true" aria-label="Non-essential NPCs"></button></div></div>
+          <div class="row"><div class="lab"><b>Followers &amp; Companions</b><small>Active teammates and followers.</small></div>
+            <div class="ctl"><button class="sw cb" data-k="who.follower" aria-pressed="false" aria-label="Followers"></button></div></div>
+          <div class="row"><div class="lab"><b>Essential &amp; Protected NPCs</b><small>Quest-critical or protected NPCs.</small></div>
+            <div class="ctl"><button class="sw cb" data-k="who.essential" aria-pressed="false" aria-label="Essential and protected NPCs"></button></div></div>
+          <div class="row"><div class="lab"><b>Player Character (Master Toggle)</b><small>Allow combat hits to voxelise your character.</small></div>
+            <div class="ctl"><button class="sw cb" data-k="who.player" aria-pressed="false" aria-label="The player"></button></div></div>
+          <div class="row"><div class="lab"><b>1. Player: Skin</b><small>Outer layer — must be enabled before Flesh, Bones, or Severing.</small></div>
+            <div class="ctl"><button class="sw cb" data-k="player.skin" aria-pressed="false" aria-label="Player skin"></button></div></div>
+          <div class="row"><div class="lab"><b>2. Player: Flesh</b><small>Requires Player: Skin to be enabled first.</small></div>
+            <div class="ctl"><button class="sw cb" data-k="player.flesh" aria-pressed="false" aria-label="Player flesh"></button></div></div>
+          <div class="row"><div class="lab"><b>3. Player: Bones</b><small>Requires Player: Skin and Flesh to be enabled first.</small></div>
+            <div class="ctl"><button class="sw cb" data-k="player.bones" aria-pressed="false" aria-label="Player bones"></button></div></div>
+          <div class="row"><div class="lab"><b>4. Player: Severing Limbs</b><small>Requires Player: Skin, Flesh, and Bones to be enabled first.</small></div>
+            <div class="ctl"><button class="sw cb" data-k="player.sever" aria-pressed="false" aria-label="Player severing limbs"></button></div></div>
+        </div>
+
+        <div class="card">
+          <h3>Combat Behaviour &amp; Thresholds</h3>
+          <p class="note">How combat blows open wounds. Changing any setting here switches the intensity preset to <b>Custom</b>.</p>
+          <div class="row"><div class="lab"><b>Enable combat voxelisation</b>
+            <small>Master switch for weapon blows and hostile spells.</small></div>
+            <div class="ctl"><button class="sw cb" data-k="on" aria-pressed="false" aria-label="Enable combat voxelisation"></button></div></div>
+          <div class="row"><div class="lab"><b>Layer peeling speed</b>
+            <small>How many anatomical layers (Clothing &rarr; Skin &rarr; Flesh &rarr; Bone) a single strike peels at once.</small></div>
+            <div class="ctl seg cbseg" data-k="peel.stages" role="group" aria-label="Layer peeling speed">
+              <button data-v="1" aria-pressed="true">1 Layer</button>
+              <button data-v="2" aria-pressed="false">2 Layers</button>
+              <button data-v="3" aria-pressed="false">3 Layers</button>
+              <button data-v="4" aria-pressed="false">All 4 (To Bone)</button>
+            </div></div>
+          <div class="row"><div class="lab"><b>Qualifying attacks</b>
+            <small>Whether all weapon hits can voxelise, or only power and sneak attacks.</small></div>
+            <div class="ctl seg cbseg" data-k="blows" role="group" aria-label="Qualifying attacks">
+              <button data-v="0" aria-pressed="true">Every Attack</button>
+              <button data-v="1" aria-pressed="false">Power &amp; Sneak Only</button>
+            </div></div>
+          <div class="row"><div class="lab"><b>Only wound targets below HP%</b><small>0 means targets can be wounded at any health (100% HP).</small></div>
+            <div class="ctl num"><input type="range" id="cbVuln" min="0" max="100" step="5" value="0">
+            <output id="cbVulnV">always</output><span class="unit">% HP</span></div></div>
+          <div class="row"><div class="lab"><b>Player power scaling</b><small>Raises the damage your own blows and spells need to voxelise a target as you level, so a strong character needs a strong hit. At 20%, a level 50 character's hit counts for about a tenth of its damage. NPCs keep the thresholds as set. 0 turns it off. "Every blow" still means every blow.</small></div>
+            <div class="ctl num"><input type="range" class="cbr" data-k="power.perLevel" min="0" max="100" step="5" value="20">
+            <output>20</output><span class="unit">% a level</span></div></div>
+          <div class="row"><div class="lab"><b>Weapon wound size</b><small>Radius of a mace's or an arrow's wound, up to that weapon's own limit: 3 units for a bow, 7 for a mace, 10 for a warhammer. Blades stay a thin cut whatever this says.</small></div>
+            <div class="ctl num"><input type="range" class="cbr" data-k="w.weapon.size" min="2" max="20" step="1" value="6">
+            <output>6</output><span class="unit">units</span></div></div>
+          <div class="row"><div class="lab"><b>Cleave reach</b><small>How far a greatsword's cut extends from the impact, in the plane of the swing. Shorter blades take a share of it: a battleaxe half, a sword 0.3, a war axe 0.25, a dagger 0.2. The presets set it themselves (12 units at 1% to 40 at 100%); 0 hands it to the config's CL row, which is the longest any blade may cut (40 units).</small></div>
+            <div class="ctl num"><input type="range" class="cbr" data-k="w.weapon.reach" min="0" max="60" step="2" value="0">
+            <output>0</output><span class="unit">units</span></div></div>
+          <div class="row"><div class="lab"><b>Out-of-combat body healing</b><small>Seconds after combat before wounds regenerate (0 = never).</small></div>
+            <div class="ctl num"><input type="range" id="cbResetAfter" min="0" max="300" step="5" value="0">
+            <output id="cbResetAfterV">never</output><span class="unit">s</span></div></div>
+        </div>
+
+        <div class="card" style="grid-column:1/-1">
+          <h3>Hostile Magic</h3>
+          <p class="note">Layer stages each kind of hostile magic takes per hit, outermost first (Clothing &rarr; Skin &rarr; Flesh &rarr; Bone): <b>Fire</b> 1, <b>Frost</b> 2, <b>Shock</b> 3, <b>Shouts</b> 2, <b>Werewolf</b> claws all 4.</p>
+          <div id="cbMagic"></div>
+          <div class="wrow" id="cbDrainRow" style="grid-template-columns:minmax(180px,1.4fr) auto minmax(150px,1fr) minmax(130px,1fr)">
+            <div class="lab"><b>Vampire Drain</b><small>Gradually strips 1 layer at a time while feeding.</small></div>
+            <div class="ctl"><button class="sw cb" data-k="drain.on" aria-pressed="false" aria-label="Vampire drain"></button></div>
+            <div class="num"><input type="range" class="cbr" data-k="drain.rate" min="0.5" max="20" step="0.5" value="4"><output>4.0</output><span class="unit">cells/s</span></div>
+            <div class="num"><input type="range" class="cbr" data-k="drain.secs" min="0.5" max="60" step="0.5" value="8"><output>8.0</output><span class="unit">s</span></div>
+          </div>
+        </div>
+
+        <details class="adv">
+          <summary>Advanced Combat Triggers, Tester &amp; Fine Tuning</summary>
+          <div class="two" style="margin-top:8px">
+            <div class="card" style="grid-column:1/-1">
+              <h3>Out-of-Combat Layer &amp; Magic Progression Tester</h3>
+              <p class="note">Test progressive layer peeling (<b>Clothing/Armour &rarr; Skin &rarr; Flesh &rarr; Bone</b>) on the nearest NPC or yourself without starting combat or aggroing anyone.</p>
+              <div style="display:flex;flex-wrap:wrap;gap:14px;align-items:center;padding:8px 0">
+                <label style="display:flex;align-items:center;gap:8px;font:500 12.5px/1.3 var(--sans)">Target
+                  <select class="pick" id="tstTarget">
+                    <option value="0">Nearest / Crosshair NPC</option>
+                    <option value="1">Player (Self)</option>
+                  </select>
+                </label>
+                <label style="display:flex;align-items:center;gap:8px;font:500 12.5px/1.3 var(--sans)">Body Part
+                  <select class="pick" id="tstPart">
+                    <option value="chest">Chest</option>
+                    <option value="abdomen">Abdomen</option>
+                    <option value="head">Head</option>
+                    <option value="lupperarm">Left Upper Arm</option>
+                    <option value="lforearm">Left Forearm</option>
+                    <option value="lhand">Left Hand</option>
+                    <option value="rupperarm">Right Upper Arm</option>
+                    <option value="rforearm">Right Forearm</option>
+                    <option value="rhand">Right Hand</option>
+                    <option value="lthigh">Left Thigh</option>
+                    <option value="lcalf">Left Lower Leg</option>
+                    <option value="lfoot">Left Foot</option>
+                    <option value="rthigh">Right Thigh</option>
+                    <option value="rcalf">Right Lower Leg</option>
+                    <option value="rfoot">Right Foot</option>
+                  </select>
+                </label>
+                <label style="display:flex;align-items:center;gap:8px;font:500 12.5px/1.3 var(--sans)">Strike Type
+                  <select class="pick" id="tstFam">
+                    <option value="weapon">Physical Weapon (Any Melee / Bow)</option>
+                    <option value="fire">Fire Magic (Burns 1 layer per hit)</option>
+                    <option value="frost">Frost Magic (Shatters 2 layers per hit)</option>
+                    <option value="shock">Shock Magic (Arcs 3 layers deep)</option>
+                    <option value="shout">Shout (Blasts 2 outer layers)</option>
+                    <option value="werewolf">Werewolf (Mauls all 4 layers)</option>
+                  </select>
+                </label>
+                <div class="num" title="Patch radius in game units">
+                  <span class="unit">Radius</span>
+                  <input type="range" id="tstSize" min="4" max="16" step="0.5" value="8.5" style="width:90px">
+                  <output id="tstSizeV">8.5</output><span class="unit">u</span>
+                </div>
+                <button class="btn" id="tstStrike" style="border-color:var(--accent);color:var(--accent);font-weight:600">Test Strike on Patch</button>
+                <button class="btn q" id="tstRestore">Restore Target</button>
+              </div>
+              <div class="log" id="testReportLog" style="margin-top:8px;max-height:96px">Ready: choose a target, body part, and strike type, then click Test Strike on Patch.</div>
+            </div>
+
+            <div class="card" style="grid-column:1/-1">
+              <h3>Detailed Damage Triggers</h3>
+              <p class="note">Individual trigger conditions evaluated on each combat hit.</p>
+              <div id="cbTriggers"></div>
+            </div>
+
+            <div class="card">
+              <h3>Physical Weapon Geometry &amp; Cooldown</h3>
+              <div id="cbWeapons"></div>
+              <div class="row"><div class="lab"><b>Cooldown between wounds</b><small>Minimum time between wounds on the same actor.</small></div>
+                <div class="ctl num"><input type="range" id="hitCd" min="0" max="3000" step="50" value="250">
+                <output for="hitCd" id="hitCdV">250</output><span class="unit">ms</span></div></div>
+              <div class="row"><div class="lab"><b>Keep config file triggers</b><small>Evaluate FleshCore.cfg.txt T rows alongside these.</small></div>
+                <div class="ctl"><button class="sw cb" data-k="keepcfg" aria-pressed="false" aria-label="Keep config rows"></button></div></div>
+            </div>
+
+            <div class="card">
+              <h3>Advanced Regeneration Controls</h3>
+              <div class="row"><div class="lab"><b>Heal when HP returns above</b><small>0 = disabled.</small></div>
+                <div class="ctl num"><input type="range" id="cbResetHp" min="0" max="100" step="5" value="0">
+                <output id="cbResetHpV">never</output><span class="unit">%</span></div></div>
+              <div class="row"><div class="lab"><b>Regeneration speed</b><small>0 restores the whole body at once.</small></div>
+                <div class="ctl num"><input type="range" id="cbResetRate" min="0" max="60" step="1" value="0">
+                <output id="cbResetRateV">at once</output><span class="unit">cells/s</span></div></div>
+            </div>
+          </div>
+        </details>
+      </div>
+    </section>
+
+    <!-- ============================== SPELLS ============================== -->
+    <section class="page" id="p-spells" hidden>
+      <div class="spellhead">
+        <button class="btn" id="grantAll">Grant All Spells</button>
+        <button class="btn q" id="revokeAll">Revoke All Spells</button>
+        <span class="count" id="spCount">0 of 60 granted</span>
+      </div>
+      <p class="note" style="margin:-6px 0 18px;color:var(--faint);max-width:68ch;font-size:12px">
+        Toggle which FleshCore debug and wounding spells are present in your spellbook.
+      </p>
+      <div id="spellgroups"></div>
+    </section>
+
+    <!-- ============================== ENGINE ============================== -->
+    <section class="page" id="p-engine" hidden>
+      <div class="two">
+        <div class="card">
+          <h3>Core Engine Behaviour</h3>
+          <p class="note">Severed pieces, and building bodies before the first hit.</p>
+          <div class="row"><div class="lab"><b>Drop physical severed pieces</b>
+            <small>Forges severed limbs into physics objects. Off, the limb still leaves the body and the target still dies of it; only the object is not made (debris is never affected).</small></div>
+            <div class="ctl"><button class="sw" id="sever" aria-pressed="true" aria-label="Drop severed pieces"></button></div></div>
+          <div class="row"><div class="lab"><b>Pre-build nearby NPCs on load</b>
+            <small>Prepares nearby actors on a background thread so the first hit does not have to build them.</small></div>
+            <div class="ctl"><button class="sw" id="prewarm" aria-pressed="true" aria-label="Build on load"></button></div></div>
+          <div class="row"><div class="lab"><b>Update bodies when equipment changes</b>
+            <small>Automatically refreshes an actor's voxel body when outfits or armour change.</small></div>
+            <div class="ctl"><button class="sw" id="reread" aria-pressed="true" aria-label="Rebuild when 3D changes"></button></div></div>
+          <div class="row"><div class="lab"><b>Pre-build all actors seen this session</b>
+            <small>Uses idle background time to prepare every eligible actor seen this session.</small></div>
+            <div class="ctl"><button class="sw" id="roster" aria-pressed="true" aria-label="Offer everyone seen this session"></button></div></div>
+        </div>
+
+        <div class="card">
+          <h3>Voxel Resolution</h3>
+          <p class="note">Controls the size of each voxel cell. Default (4.0) balances visual detail and performance. Applies to bodies voxelised after the change: a standing lattice keeps the cell it was built with until the body is rebuilt (a load, a Restore, a re-dress).</p>
+          <div class="row"><div class="lab"><b>Cell size</b>
+            <small>Smaller values produce finer cuts but use more memory and CPU.</small></div>
+            <div class="ctl num"><input type="range" id="cell" min="2" max="8" step="0.5" value="4">
+            <output for="cell" id="cellV">4.0</output></div></div>
+        </div>
+
+        <div class="card">
+          <h3>Pieces on the Ground</h3>
+          <p class="note">How many cut-off pieces may lie around at once, every body's together, severed limbs included. When a new piece would go past this many, the oldest one is cleared. 0 = no limit: a piece then stays until its own lifetime ends.</p>
+          <div class="row"><div class="lab"><b>Pieces kept</b>
+            <small>Lower keeps long fights tidier and lighter on the frame rate.</small></div>
+            <div class="ctl num"><input type="range" id="maxPieces" min="0" max="300" step="5" value="35">
+            <output for="maxPieces" id="maxPiecesV">35</output></div></div>
+        </div>
+
+        <details class="adv">
+          <summary>Advanced Lattice &amp; Chunk Tuning</summary>
+          <div class="two" style="margin-top:8px">
+            <div class="card">
+              <h3>Fragment Merging</h3>
+              <div class="row"><div class="lab"><b>Merge small scraps below</b>
+                <small>Merges tiny detached fragments into adjacent parts instead of dropping them.</small></div>
+                <div class="ctl num"><input type="range" id="coalesce" min="0" max="60" step="2" value="24">
+                <output for="coalesce" id="coalesceV">24</output><span class="unit">cells</span></div></div>
+              <div class="row"><div class="lab"><b>Merge distance</b>
+                <small>Maximum gap in cells to merge a small fragment across.</small></div>
+                <div class="ctl num"><input type="range" id="cgap" min="0" max="12" step="1" value="4">
+                <output for="cgap" id="cgapV">4</output><span class="unit">cells</span></div></div>
+              <div class="row"><div class="lab"><b>Part span</b>
+                <small>How many joints a severed piece may span before it is split.</small></div>
+                <div class="ctl num"><input type="range" id="partSpan" min="1" max="6" step="1" value="2">
+                <output for="partSpan" id="partSpanV">2</output></div></div>
+            </div>
+            <div class="card">
+              <h3>Chunk Pool &amp; Polling</h3>
+              <div class="row"><div class="lab"><b>3D change check interval</b></div>
+                <div class="ctl num"><input type="range" id="pollMs" min="100" max="1500" step="50" value="500">
+                <output for="pollMs" id="pollMsV">500</output><span class="unit">ms</span></div></div>
+              <div class="row"><div class="lab"><b>Cells per piece</b></div>
+                <div class="ctl num"><input type="range" id="maxcells" min="8" max="80" step="2" value="34">
+                <output for="maxcells" id="maxcellsV">34</output></div></div>
+              <div class="row"><div class="lab"><b>Max pieces per wound</b></div>
+                <div class="ctl num"><input type="range" id="budget" min="1" max="20" step="1" value="12">
+                <output for="budget" id="budgetV">12</output></div></div>
+            </div>
+          </div>
+        </details>
+      </div>
+    </section>
+
+    <!-- =========================== DIAGNOSTICS =========================== -->
+    <section class="page" id="p-diag" hidden>
+      <div class="two">
+        <div class="card">
+          <h3>Engine Status</h3>
+          <dl class="kv">
+            <dt>Version</dt><dd id="dBanner">FleshCore v0.1 Beta</dd>
+            <dt>Armed</dt><dd id="dArmed">yes — form lookups validated</dd>
+            <dt>Co-save</dt><dd id="dCosave">armed · serialization v4 · id FCWS</dd>
+            <dt>Plugin</dt><dd id="dPlugin">FleshCore.esp</dd>
+            <dt>Bodies held</dt><dd id="dBodies">active</dd>
+            <dt>Panel view</dt><dd id="dView">PrismaUI · focused</dd>
+          </dl>
+        </div>
+
+        <div class="card">
+          <h3>Target Eligibility Check</h3>
+          <p class="note">Check whether your current crosshair target (or player) can be voxelised right now.</p>
+          <div class="row"><div class="lab"><b>Inspect crosshair target</b></div>
+            <div class="ctl"><button class="btn" id="askWhy">Check Target</button></div></div>
+          <div class="log" id="whyLog">Click Check Target to inspect eligibility.</div>
+        </div>
+
+        <div class="card" style="grid-column:1/-1">
+          <h3>Last Wound Report</h3>
+          <div class="log" id="lastWound">No wounds recorded yet this session.</div>
+        </div>
+      </div>
+    </section>
+  </div>
+</div>
+
+<script>
+"use strict";
+const SEND = (verb, payload) => {
+  const msg = JSON.stringify({ v: verb, d: payload });
+  if (typeof window.fcSet === "function") { try { window.fcSet(msg); } catch (e) {} }
+  trace(verb + "  " + JSON.stringify(payload));
+};
+const traceBuf = [];
+function trace(line) {
+  traceBuf.unshift(line);
+  if (traceBuf.length > 40) traceBuf.pop();
+}
+
+let applied = null;
+const UNWIRED_TIP = "Stored, but this build's engine does not read it yet.";
+const wired = [];
+function markApplied() {
+  if (!applied) return;
+  const mark = (el, verb) => {
+    if (!el) return;
+    if (applied.indexOf(verb) !== -1) { el.classList.remove("unwired"); el.removeAttribute("title"); }
+    else { el.classList.add("unwired"); el.setAttribute("title", UNWIRED_TIP); }
+  };
+  wired.forEach(([el, verb]) => mark(el, verb));
+  document.querySelectorAll(".sw").forEach(b => {
+    if (b.classList.contains("cb")) return;
+    mark(b, b.closest(".sp") ? "grant" : (b.id || "toggle"));
+  });
+  mark(document.querySelector("#selbody .seg"), "lethal");
+  mark(document.getElementById("grantAll"), "grantAll");
+  mark(document.getElementById("revokeAll"), "grantAll");
+  mark(document.getElementById("mLive"), "state");
+  mark(document.getElementById("askWhy"), "whynot");
+}
+
+const PARTS = ["head","upper torso","abdomen",
+  "left upper arm","left forearm","left hand",
+  "right upper arm","right forearm","right hand",
+  "left thigh","left lower leg","left foot",
+  "right thigh","right lower leg","right foot"];
+const PARTNAME = {"head":"Head","upper torso":"Chest","abdomen":"Abdomen",
+  "left upper arm":"LUpperArm","left forearm":"LForearm","left hand":"LHand",
+  "right upper arm":"RUpperArm","right forearm":"RForearm","right hand":"RHand",
+  "left thigh":"LThigh","left lower leg":"LCalf","left foot":"LFoot",
+  "right thigh":"RThigh","right lower leg":"RCalf","right foot":"RFoot"};
+
+const state = {
+  fatal: { "head":true, "upper torso":true, "abdomen":true,
+    "left upper arm":false,"left forearm":false,"left hand":false,
+    "right upper arm":false,"right forearm":false,"right hand":false,
+    "left thigh":false,"left lower leg":false,"left foot":false,
+    "right thigh":false,"right lower leg":false,"right foot":false },
+  body: { skin: 20, flesh: 35, bone: 15 },
+  head: { skin: 40, bone: 15, brain: 25 },
+  live: { "head":100,"upper torso":100,"abdomen":100,
+    "left upper arm":100,"left forearm":100,"left hand":100,
+    "right upper arm":100,"right forearm":100,"right hand":100,
+    "left thigh":100,"left lower leg":100,"left foot":100,
+    "right thigh":100,"right lower leg":100,"right foot":100 },
+  sel: "head", mode: "cfg", previewFatal: null,
+  spells: {}
+};
+
+const SPELLS = [
+  ["Body Cuts", [[0x819,"Nick (Small Bite)"],[0x81B,"Bite (Flense)"],[0x81D,"Deep Bite (Maul)"],[0x81F,"Excavate (Huge Bite)"],
+    [0x821,"Shatter"],[0x823,"Rend"],[0x825,"Flay"],[0x827,"Cleave"],[0x829,"Bisect"],
+    [0x82B,"Sunder"],[0x82D,"Skewer"],[0x82F,"Impale"],[0x831,"Shred"],[0x833,"Unmake"],
+    [0x83C,"Thin Cut"],[0x83E,"Halve"],[0x862,"Slash"],[0x864,"Rake"]]],
+  ["Head Cuts", [[0x866,"Cleave Skull"],[0x868,"Bisect Skull"],[0x86A,"Sunder Skull"],
+    [0x86C,"Slash Skull"],[0x86E,"Rake Skull"],[0x870,"Level"],[0x872,"Trepan"],
+    [0x874,"Unmask"],[0x876,"Crown"],[0x878,"Hollow"],[0x87A,"Decapitate"]]],
+  ["Whole Body & Detonation", [[0x84A,"Excarnate"],[0x880,"Detonate"]]],
+  ["Surface Marks", [[0x842,"Splatter"]]],
+  ["Grinding", [[0x85A,"Grind Down"],[0x85C,"Grind Player"]]],
+  ["Restoration", [[0x87C,"Restore Target"],[0x87E,"Restore Self"]]],
+  ["Knockout", [[0x88F,"Knockout"],[0x891,"Knockout Cure"]]],
+  ["Sever a Specific Limb", [[0x8AB,"Take Left Arm"],[0x8AD,"Take Right Arm"],
+    [0x8AF,"Take Left Forearm"],[0x8B1,"Take Right Forearm"],
+    [0x8B3,"Take Left Hand"],[0x8B5,"Take Right Hand"],
+    [0x8B7,"Take Left Leg"],[0x8B9,"Take Right Leg"],
+    [0x8BB,"Take Left Lower Leg"],[0x8BD,"Take Right Lower Leg"],
+    [0x8BF,"Take Left Foot"],[0x8C1,"Take Right Foot"],
+    [0x8A0,"Take Left Arm (Self)"],[0x8A2,"Take Right Arm (Self)"],
+    [0x8A4,"Take Left Leg (Self)"],[0x8A6,"Take Right Leg (Self)"]]],
+  ["Area Hazards", [[0x899,"Shredder Sphere"],[0x89C,"Shredder Rune"]]],
+  ["Self-Targeted", [[0x84F,"Splatter (Self)"],
+    [0x856,"Bisect (Self)"],[0x896,"Decapitate (Self)"]]],
+  ["Feeding", [[0x94C,"Voxel Drain"]]]
+];
+SPELLS.forEach(g => g[1].forEach(s => { state.spells[s[0]] = false; }));
+
+const FIG = {"regions": {"head": "M50.56 39.50 C49.78 39.50 46.91 39.56 45.89 39.50 C44.87 39.44 44.86 39.31 44.44 39.17 C44.03 39.03 43.79 39.18 43.39 38.67 C42.99 38.16 42.28 36.61 42.06 36.11 C41.83 35.61 41.67 36.11 42.06 35.67 C42.44 35.22 44.24 34.31 44.39 33.44 C44.54 32.57 43.37 31.63 42.94 30.44 C42.52 29.26 42.04 27.69 41.83 26.33 C41.63 24.98 41.70 23.26 41.72 22.33 C41.74 21.41 41.83 21.26 41.94 20.78 C42.06 20.30 42.06 19.99 42.39 19.44 C42.71 18.90 43.27 18.01 43.89 17.50 C44.51 16.99 45.46 16.63 46.11 16.39 C46.76 16.15 47.07 16.06 47.78 16.06 C48.48 16.06 49.57 16.19 50.33 16.39 C51.09 16.59 51.82 16.95 52.33 17.28 C52.84 17.60 53.10 17.97 53.39 18.33 C53.68 18.69 53.83 18.81 54.06 19.44 C54.28 20.07 54.61 21.11 54.72 22.11 C54.83 23.11 54.78 24.54 54.72 25.44 C54.67 26.35 54.61 26.67 54.39 27.56 C54.17 28.44 53.78 29.80 53.39 30.78 C53.00 31.76 52.06 32.77 52.06 33.44 C52.05 34.12 52.93 34.46 53.33 34.83 C53.74 35.20 54.32 35.44 54.50 35.67 C54.68 35.90 54.64 35.71 54.39 36.22 C54.14 36.73 53.64 38.18 53.00 38.72 C52.36 39.27 50.96 39.37 50.56 39.50 C50.15 39.63 51.33 39.50 50.56 39.50Z", "upper torso": "M52.33 72.83 C52.26 72.78 52.02 72.50 51.89 72.50 C51.76 72.50 51.63 72.83 51.56 72.83 C51.48 72.83 51.65 72.61 51.44 72.50 C51.24 72.39 50.54 72.28 50.33 72.17 C50.13 72.06 50.31 71.91 50.22 71.83 C50.13 71.76 49.89 71.70 49.78 71.72 C49.67 71.74 49.65 71.98 49.56 71.94 C49.46 71.91 49.37 71.61 49.22 71.50 C49.07 71.39 48.98 71.28 48.67 71.28 C48.35 71.28 47.63 71.39 47.33 71.50 C47.04 71.61 47.00 71.93 46.89 71.94 C46.78 71.96 46.80 71.57 46.67 71.61 C46.54 71.65 46.39 72.02 46.11 72.17 C45.83 72.31 45.20 72.39 45.00 72.50 C44.80 72.61 44.96 72.83 44.89 72.83 C44.81 72.83 44.69 72.50 44.56 72.50 C44.43 72.50 44.31 72.86 44.11 72.83 C43.92 72.81 43.52 72.48 43.39 72.33 C43.26 72.19 43.40 71.94 43.33 71.94 C43.27 71.95 43.06 72.38 43.00 72.39 C42.94 72.40 43.02 72.07 42.94 72.00 C42.87 71.93 42.77 72.12 42.56 71.94 C42.34 71.77 41.87 71.06 41.67 70.94 C41.46 70.83 41.43 71.31 41.33 71.28 C41.24 71.24 41.20 70.76 41.11 70.72 C41.02 70.69 40.91 71.15 40.78 71.06 C40.65 70.96 40.47 70.29 40.33 70.17 C40.19 70.05 39.99 70.34 39.94 70.33 C39.90 70.32 40.09 70.19 40.06 70.11 C40.02 70.04 39.79 70.01 39.72 69.89 C39.66 69.77 39.71 69.42 39.67 69.39 C39.62 69.36 39.50 69.74 39.44 69.72 C39.39 69.70 39.39 69.28 39.33 69.28 C39.28 69.28 39.16 69.69 39.11 69.72 C39.06 69.75 39.09 69.46 39.06 69.44 C39.02 69.43 38.94 69.63 38.89 69.61 C38.83 69.59 38.71 69.40 38.72 69.33 C38.73 69.27 38.93 69.35 38.94 69.22 C38.96 69.09 38.78 69.22 38.83 68.56 C38.89 67.89 39.33 66.65 39.28 65.22 C39.22 63.80 38.89 61.69 38.50 60.00 C38.11 58.31 37.33 56.78 36.94 55.11 C36.56 53.44 36.24 50.89 36.17 50.00 C36.09 49.11 36.44 49.92 36.50 49.78 C36.56 49.64 36.48 49.24 36.56 49.17 C36.63 49.09 36.94 49.42 36.94 49.33 C36.95 49.25 36.61 48.76 36.61 48.67 C36.61 48.57 36.96 48.85 36.94 48.78 C36.93 48.70 36.54 48.33 36.50 48.22 C36.46 48.11 36.72 48.19 36.72 48.11 C36.72 48.04 36.48 47.85 36.50 47.78 C36.52 47.70 36.83 47.72 36.83 47.67 C36.83 47.61 36.48 47.52 36.50 47.44 C36.52 47.37 36.94 47.30 36.94 47.22 C36.94 47.15 36.50 47.07 36.50 47.00 C36.50 46.93 36.93 46.85 36.94 46.78 C36.96 46.70 36.59 46.65 36.61 46.56 C36.63 46.46 37.02 46.31 37.06 46.22 C37.09 46.13 36.81 46.09 36.83 46.00 C36.85 45.91 37.15 45.74 37.17 45.67 C37.19 45.59 36.96 45.67 36.94 45.56 C36.93 45.44 37.09 45.13 37.06 45.00 C37.02 44.87 36.69 44.87 36.72 44.78 C36.76 44.69 37.24 44.56 37.28 44.44 C37.31 44.33 36.91 44.20 36.94 44.11 C36.98 44.02 37.46 43.96 37.50 43.89 C37.54 43.81 37.19 43.80 37.17 43.67 C37.15 43.54 37.43 43.26 37.39 43.11 C37.35 42.96 36.96 42.91 36.94 42.78 C36.93 42.65 37.28 42.46 37.28 42.33 C37.28 42.20 36.91 42.09 36.94 42.00 C36.98 41.91 37.44 41.87 37.50 41.78 C37.56 41.69 37.28 41.57 37.28 41.44 C37.28 41.31 37.52 41.13 37.50 41.00 C37.48 40.87 37.19 40.76 37.17 40.67 C37.15 40.57 37.41 40.70 37.39 40.44 C37.37 40.19 37.07 39.41 37.06 39.11 C37.04 38.81 37.30 38.74 37.28 38.67 C37.26 38.59 36.94 38.81 36.94 38.67 C36.95 38.53 36.82 38.21 37.33 37.83 C37.84 37.45 39.07 37.06 40.00 36.39 C40.93 35.72 42.19 34.27 42.89 33.83 C43.58 33.40 44.31 33.47 44.17 33.78 C44.03 34.08 42.39 35.20 42.06 35.67 C41.72 36.13 41.94 36.06 42.17 36.56 C42.39 37.06 42.95 38.21 43.39 38.67 C43.82 39.12 44.36 39.14 44.78 39.28 C45.19 39.42 44.93 39.46 45.89 39.50 C46.85 39.54 49.37 39.63 50.56 39.50 C51.74 39.37 52.38 39.21 53.00 38.72 C53.62 38.23 54.03 37.06 54.28 36.56 C54.53 36.05 54.66 35.95 54.50 35.67 C54.34 35.38 53.69 35.16 53.33 34.83 C52.97 34.51 52.30 33.89 52.33 33.72 C52.37 33.56 53.26 33.76 53.56 33.83 C53.85 33.91 53.59 33.72 54.11 34.17 C54.63 34.61 55.83 35.89 56.67 36.50 C57.50 37.11 58.64 37.47 59.11 37.83 C59.58 38.19 59.49 38.53 59.50 38.67 C59.51 38.81 59.19 38.61 59.17 38.67 C59.15 38.72 59.37 38.78 59.39 39.00 C59.41 39.22 59.33 39.80 59.28 40.00 C59.22 40.20 59.06 40.11 59.06 40.22 C59.06 40.33 59.30 40.54 59.28 40.67 C59.26 40.80 58.96 40.89 58.94 41.00 C58.93 41.11 59.17 41.20 59.17 41.33 C59.17 41.46 58.89 41.67 58.94 41.78 C59.00 41.89 59.46 41.93 59.50 42.00 C59.54 42.07 59.17 42.09 59.17 42.22 C59.17 42.35 59.50 42.65 59.50 42.78 C59.50 42.91 59.19 42.87 59.17 43.00 C59.15 43.13 59.43 43.41 59.39 43.56 C59.35 43.70 58.93 43.80 58.94 43.89 C58.96 43.98 59.46 44.02 59.50 44.11 C59.54 44.20 59.13 44.33 59.17 44.44 C59.20 44.56 59.69 44.69 59.72 44.78 C59.76 44.87 59.43 44.87 59.39 45.00 C59.35 45.13 59.52 45.43 59.50 45.56 C59.48 45.69 59.26 45.70 59.28 45.78 C59.30 45.85 59.59 45.93 59.61 46.00 C59.63 46.07 59.35 46.13 59.39 46.22 C59.43 46.31 59.81 46.46 59.83 46.56 C59.85 46.65 59.48 46.70 59.50 46.78 C59.52 46.85 59.94 46.93 59.94 47.00 C59.94 47.07 59.50 47.15 59.50 47.22 C59.50 47.30 59.93 47.37 59.94 47.44 C59.96 47.52 59.59 47.61 59.61 47.67 C59.63 47.72 60.04 47.72 60.06 47.78 C60.07 47.83 59.74 47.93 59.72 48.00 C59.70 48.07 59.98 48.09 59.94 48.22 C59.91 48.35 59.52 48.69 59.50 48.78 C59.48 48.87 59.83 48.69 59.83 48.78 C59.83 48.87 59.49 49.27 59.50 49.33 C59.51 49.40 59.81 49.11 59.89 49.17 C59.96 49.22 59.88 49.53 59.94 49.67 C60.01 49.81 60.33 49.17 60.28 50.00 C60.22 50.83 60.00 52.98 59.61 54.67 C59.22 56.35 58.35 58.33 57.94 60.11 C57.54 61.89 57.20 63.80 57.17 65.33 C57.13 66.87 57.66 68.64 57.72 69.33 C57.79 70.03 57.60 69.51 57.56 69.50 C57.51 69.49 57.47 69.27 57.44 69.28 C57.42 69.29 57.46 69.48 57.39 69.56 C57.31 69.63 57.10 69.73 57.00 69.72 C56.90 69.71 56.87 69.39 56.78 69.50 C56.69 69.61 56.54 70.28 56.44 70.39 C56.35 70.50 56.30 70.13 56.22 70.17 C56.15 70.20 56.09 70.59 56.00 70.61 C55.91 70.63 55.71 70.27 55.67 70.28 C55.62 70.29 55.76 70.59 55.72 70.67 C55.69 70.74 55.55 70.62 55.44 70.72 C55.34 70.82 55.22 71.24 55.11 71.28 C55.00 71.31 54.84 70.94 54.78 70.94 C54.71 70.95 54.93 71.17 54.72 71.33 C54.52 71.50 53.77 71.77 53.56 71.94 C53.34 72.12 53.50 72.37 53.44 72.39 C53.39 72.41 53.28 72.06 53.22 72.06 C53.17 72.06 53.19 72.33 53.11 72.39 C53.04 72.44 52.91 72.31 52.78 72.39 C52.65 72.46 52.41 72.76 52.33 72.83 C52.26 72.91 52.41 72.89 52.33 72.83Z", "abdomen": "M46.22 90.94 C46.18 90.66 46.09 89.48 45.94 89.22 C45.80 88.96 45.55 89.55 45.33 89.39 C45.12 89.23 44.88 88.47 44.67 88.28 C44.45 88.08 44.05 88.40 44.06 88.22 C44.06 88.05 44.75 87.38 44.72 87.22 C44.69 87.06 44.00 87.41 43.89 87.28 C43.78 87.15 44.11 86.59 44.06 86.44 C44.00 86.30 43.69 86.54 43.56 86.39 C43.43 86.24 43.42 85.71 43.28 85.56 C43.14 85.40 42.80 85.61 42.72 85.44 C42.65 85.28 42.89 84.72 42.83 84.56 C42.78 84.39 42.43 84.61 42.39 84.44 C42.35 84.28 42.67 83.70 42.61 83.56 C42.56 83.41 42.11 83.69 42.06 83.56 C42.00 83.43 42.31 82.93 42.28 82.78 C42.24 82.63 41.89 82.80 41.83 82.67 C41.78 82.54 42.13 82.35 41.94 82.00 C41.76 81.65 40.89 80.85 40.72 80.56 C40.56 80.26 40.98 80.33 40.94 80.22 C40.91 80.11 40.56 80.02 40.50 79.89 C40.44 79.76 40.68 79.62 40.61 79.44 C40.55 79.27 40.23 78.92 40.11 78.83 C39.99 78.75 40.02 79.06 39.89 78.94 C39.76 78.83 39.46 78.26 39.33 78.17 C39.20 78.07 39.24 78.44 39.11 78.39 C38.98 78.33 38.69 77.89 38.56 77.83 C38.43 77.78 38.46 78.02 38.33 78.06 C38.20 78.09 37.89 78.09 37.78 78.06 C37.67 78.02 37.76 77.80 37.67 77.83 C37.57 77.87 37.32 78.23 37.22 78.28 C37.12 78.32 36.99 78.66 37.06 78.11 C37.12 77.56 37.43 75.78 37.61 75.00 C37.80 74.22 38.07 74.02 38.17 73.44 C38.26 72.87 38.07 72.22 38.17 71.56 C38.26 70.89 38.60 69.77 38.72 69.44 C38.84 69.12 38.84 69.62 38.89 69.61 C38.94 69.60 38.96 69.37 39.00 69.39 C39.04 69.41 39.06 69.74 39.11 69.72 C39.17 69.70 39.28 69.28 39.33 69.28 C39.39 69.28 39.39 69.70 39.44 69.72 C39.50 69.74 39.62 69.36 39.67 69.39 C39.71 69.42 39.66 69.77 39.72 69.89 C39.79 70.01 40.02 70.04 40.06 70.11 C40.09 70.19 39.90 70.32 39.94 70.33 C39.99 70.34 40.19 70.05 40.33 70.17 C40.47 70.29 40.65 70.96 40.78 71.06 C40.91 71.15 41.02 70.69 41.11 70.72 C41.20 70.76 41.24 71.24 41.33 71.28 C41.43 71.31 41.46 70.83 41.67 70.94 C41.87 71.06 42.34 71.77 42.56 71.94 C42.77 72.12 42.87 71.93 42.94 72.00 C43.02 72.07 42.94 72.40 43.00 72.39 C43.06 72.38 43.27 71.95 43.33 71.94 C43.40 71.94 43.26 72.19 43.39 72.33 C43.52 72.48 43.92 72.81 44.11 72.83 C44.31 72.86 44.43 72.50 44.56 72.50 C44.69 72.50 44.81 72.83 44.89 72.83 C44.96 72.83 44.80 72.61 45.00 72.50 C45.20 72.39 45.83 72.31 46.11 72.17 C46.39 72.02 46.54 71.65 46.67 71.61 C46.80 71.57 46.67 72.00 46.89 71.94 C47.11 71.89 47.61 71.35 48.00 71.28 C48.39 71.20 48.96 71.39 49.22 71.50 C49.48 71.61 49.46 71.91 49.56 71.94 C49.65 71.98 49.67 71.74 49.78 71.72 C49.89 71.70 50.13 71.76 50.22 71.83 C50.31 71.91 50.13 72.06 50.33 72.17 C50.54 72.28 51.24 72.39 51.44 72.50 C51.65 72.61 51.48 72.83 51.56 72.83 C51.63 72.83 51.76 72.50 51.89 72.50 C52.02 72.50 52.19 72.85 52.33 72.83 C52.48 72.81 52.65 72.46 52.78 72.39 C52.91 72.31 53.04 72.44 53.11 72.39 C53.19 72.33 53.17 72.06 53.22 72.06 C53.28 72.06 53.40 72.40 53.44 72.39 C53.49 72.38 53.30 72.17 53.50 72.00 C53.70 71.83 54.45 71.56 54.67 71.39 C54.88 71.21 54.70 70.96 54.78 70.94 C54.85 70.93 55.03 71.29 55.11 71.28 C55.19 71.27 55.18 70.99 55.28 70.89 C55.38 70.79 55.66 70.77 55.72 70.67 C55.79 70.56 55.62 70.29 55.67 70.28 C55.71 70.27 55.91 70.63 56.00 70.61 C56.09 70.59 56.15 70.20 56.22 70.17 C56.30 70.13 56.35 70.50 56.44 70.39 C56.54 70.28 56.69 69.61 56.78 69.50 C56.87 69.39 56.91 69.70 57.00 69.72 C57.09 69.74 57.26 69.69 57.33 69.61 C57.41 69.54 57.39 69.31 57.44 69.28 C57.50 69.24 57.53 69.03 57.67 69.39 C57.81 69.75 58.18 70.81 58.28 71.44 C58.38 72.08 58.17 72.57 58.28 73.22 C58.39 73.87 58.76 74.61 58.94 75.33 C59.13 76.06 59.33 77.07 59.39 77.56 C59.44 78.04 59.38 78.18 59.28 78.22 C59.18 78.27 58.88 77.86 58.78 77.83 C58.68 77.81 58.72 78.06 58.67 78.06 C58.61 78.06 58.52 77.83 58.44 77.83 C58.37 77.83 58.31 78.04 58.22 78.06 C58.13 78.07 58.07 77.89 57.89 77.94 C57.70 78.00 57.26 78.26 57.11 78.39 C56.96 78.52 57.06 78.69 57.00 78.72 C56.94 78.76 56.92 78.49 56.78 78.61 C56.64 78.73 56.32 79.29 56.17 79.44 C56.01 79.60 55.87 79.48 55.83 79.56 C55.80 79.63 55.98 79.80 55.94 79.89 C55.91 79.98 55.65 80.00 55.61 80.11 C55.57 80.22 55.78 80.43 55.72 80.56 C55.67 80.69 55.33 80.78 55.28 80.89 C55.22 81.00 55.52 81.04 55.39 81.22 C55.26 81.41 54.61 81.76 54.50 82.00 C54.39 82.24 54.78 82.54 54.72 82.67 C54.67 82.80 54.22 82.63 54.17 82.78 C54.11 82.93 54.43 83.41 54.39 83.56 C54.35 83.70 54.00 83.52 53.94 83.67 C53.89 83.81 54.13 84.28 54.06 84.44 C53.98 84.61 53.64 84.49 53.50 84.67 C53.36 84.84 53.33 85.37 53.22 85.50 C53.11 85.63 52.88 85.31 52.83 85.44 C52.79 85.58 53.02 86.17 52.94 86.33 C52.87 86.50 52.44 86.30 52.39 86.44 C52.33 86.59 52.72 87.09 52.61 87.22 C52.50 87.35 51.74 87.06 51.72 87.22 C51.70 87.39 52.49 88.05 52.50 88.22 C52.51 88.40 52.01 88.08 51.78 88.28 C51.55 88.47 51.32 89.23 51.11 89.39 C50.90 89.55 50.65 88.98 50.50 89.22 C50.35 89.46 50.30 90.85 50.22 90.83 C50.15 90.81 50.13 89.13 50.06 89.11 C49.98 89.09 49.83 90.69 49.78 90.72 C49.72 90.76 49.77 89.55 49.72 89.33 C49.68 89.12 49.61 89.70 49.50 89.44 C49.39 89.19 49.18 88.10 49.06 87.78 C48.94 87.45 49.01 87.55 48.78 87.50 C48.55 87.45 47.95 87.32 47.67 87.50 C47.38 87.68 47.18 88.21 47.06 88.56 C46.94 88.90 47.00 89.41 46.94 89.56 C46.89 89.70 46.74 89.33 46.72 89.44 C46.70 89.56 46.85 90.09 46.83 90.22 C46.81 90.35 46.66 90.12 46.61 90.22 C46.56 90.32 46.59 90.98 46.56 90.83 C46.52 90.69 46.44 89.31 46.39 89.33 C46.33 89.35 46.25 90.68 46.22 90.94 C46.19 91.21 46.27 91.23 46.22 90.94Z", "left upper arm": "M67.44 62.50 C66.60 61.25 63.40 56.60 62.39 55.00 C61.38 53.40 61.63 53.54 61.39 52.89 C61.15 52.24 61.08 51.47 60.94 51.11 C60.81 50.75 60.70 50.74 60.56 50.72 C60.41 50.70 60.10 51.12 60.06 51.00 C60.01 50.88 60.30 50.22 60.28 50.00 C60.26 49.78 60.00 49.80 59.94 49.67 C59.89 49.54 60.00 49.30 59.94 49.22 C59.89 49.15 59.61 49.31 59.61 49.22 C59.61 49.13 59.94 48.76 59.94 48.67 C59.94 48.57 59.61 48.74 59.61 48.67 C59.61 48.59 59.93 48.33 59.94 48.22 C59.96 48.11 59.70 48.07 59.72 48.00 C59.74 47.93 60.06 47.82 60.06 47.78 C60.05 47.73 59.69 47.78 59.67 47.72 C59.65 47.67 59.97 47.53 59.94 47.44 C59.92 47.36 59.50 47.30 59.50 47.22 C59.50 47.15 59.94 47.07 59.94 47.00 C59.94 46.93 59.52 46.85 59.50 46.78 C59.48 46.70 59.85 46.65 59.83 46.56 C59.81 46.46 59.43 46.31 59.39 46.22 C59.35 46.13 59.63 46.07 59.61 46.00 C59.59 45.93 59.30 45.85 59.28 45.78 C59.26 45.70 59.48 45.69 59.50 45.56 C59.52 45.43 59.35 45.13 59.39 45.00 C59.43 44.87 59.76 44.87 59.72 44.78 C59.69 44.69 59.20 44.56 59.17 44.44 C59.13 44.33 59.54 44.20 59.50 44.11 C59.46 44.02 58.96 43.98 58.94 43.89 C58.93 43.80 59.35 43.70 59.39 43.56 C59.43 43.41 59.15 43.13 59.17 43.00 C59.19 42.87 59.50 42.89 59.50 42.78 C59.50 42.67 59.17 42.46 59.17 42.33 C59.17 42.20 59.54 42.09 59.50 42.00 C59.46 41.91 59.00 41.87 58.94 41.78 C58.89 41.69 59.17 41.57 59.17 41.44 C59.17 41.31 58.93 41.13 58.94 41.00 C58.96 40.87 59.26 40.78 59.28 40.67 C59.30 40.56 59.06 40.44 59.06 40.33 C59.06 40.22 59.24 40.26 59.28 40.00 C59.31 39.74 59.24 39.00 59.28 38.78 C59.31 38.56 59.50 38.72 59.50 38.67 C59.50 38.61 59.31 38.56 59.28 38.44 C59.25 38.32 58.94 37.82 59.33 37.94 C59.73 38.06 60.99 38.68 61.67 39.17 C62.34 39.66 62.86 40.27 63.39 40.89 C63.92 41.51 64.35 42.06 64.83 42.89 C65.31 43.72 65.85 44.63 66.28 45.89 C66.70 47.15 66.63 48.54 67.39 50.44 C68.15 52.35 69.94 55.80 70.83 57.33 C71.72 58.87 72.48 59.26 72.72 59.67 C72.96 60.07 72.32 59.71 72.28 59.78 C72.23 59.84 72.51 60.05 72.44 60.06 C72.38 60.06 72.00 59.78 71.89 59.83 C71.78 59.89 71.87 60.35 71.78 60.39 C71.69 60.43 71.43 60.02 71.33 60.06 C71.24 60.09 71.30 60.59 71.22 60.61 C71.15 60.63 70.97 60.14 70.89 60.17 C70.81 60.19 70.85 60.63 70.72 60.78 C70.59 60.93 70.29 60.88 70.11 61.06 C69.94 61.23 69.80 61.78 69.67 61.83 C69.54 61.89 69.44 61.33 69.33 61.39 C69.22 61.44 69.11 62.13 69.00 62.17 C68.89 62.20 68.80 61.65 68.67 61.61 C68.54 61.57 68.35 61.98 68.22 61.94 C68.09 61.91 67.95 61.36 67.89 61.39 C67.82 61.42 67.90 62.03 67.83 62.11 C67.77 62.19 67.56 61.82 67.50 61.89 C67.44 61.95 67.45 62.40 67.44 62.50 C67.44 62.60 68.29 63.75 67.44 62.50Z", "left forearm": "M74.67 75.61 C74.62 75.49 75.27 76.21 74.39 74.89 C73.51 73.56 70.56 69.72 69.39 67.67 C68.22 65.61 67.70 63.52 67.39 62.56 C67.07 61.59 67.43 61.96 67.50 61.89 C67.57 61.81 67.77 62.19 67.83 62.11 C67.90 62.03 67.82 61.42 67.89 61.39 C67.95 61.36 68.09 61.91 68.22 61.94 C68.35 61.98 68.54 61.57 68.67 61.61 C68.80 61.65 68.89 62.20 69.00 62.17 C69.11 62.13 69.22 61.44 69.33 61.39 C69.44 61.33 69.56 61.86 69.67 61.83 C69.77 61.81 69.77 61.40 69.94 61.22 C70.12 61.05 70.56 60.95 70.72 60.78 C70.88 60.60 70.81 60.19 70.89 60.17 C70.97 60.14 71.16 60.62 71.22 60.61 C71.29 60.60 71.19 60.15 71.28 60.11 C71.37 60.07 71.68 60.44 71.78 60.39 C71.88 60.34 71.80 59.89 71.89 59.83 C71.98 59.78 72.22 60.06 72.33 60.06 C72.44 60.06 72.42 59.81 72.56 59.83 C72.69 59.86 72.73 59.55 73.17 60.22 C73.60 60.90 74.63 62.76 75.17 63.89 C75.70 65.02 75.89 65.35 76.39 67.00 C76.89 68.65 77.92 72.49 78.17 73.78 C78.42 75.06 77.97 74.77 77.89 74.72 C77.81 74.68 77.80 73.57 77.67 73.50 C77.54 73.43 77.39 74.15 77.11 74.28 C76.83 74.41 76.26 74.17 76.00 74.28 C75.74 74.39 75.69 74.93 75.56 74.94 C75.43 74.96 75.31 74.37 75.22 74.39 C75.13 74.41 75.08 74.99 75.00 75.06 C74.92 75.12 74.78 74.69 74.72 74.78 C74.67 74.87 74.68 75.47 74.67 75.61 C74.66 75.75 74.71 75.73 74.67 75.61Z", "left hand": "M76.56 89.28 C76.49 89.25 76.31 89.34 76.17 89.11 C76.03 88.88 75.48 88.56 75.72 87.89 C75.96 87.22 77.30 85.81 77.61 85.11 C77.93 84.41 77.69 84.13 77.61 83.67 C77.54 83.20 77.36 82.75 77.17 82.33 C76.97 81.92 76.67 81.22 76.44 81.17 C76.22 81.11 75.99 81.60 75.83 82.00 C75.68 82.40 75.64 83.19 75.50 83.56 C75.36 83.92 75.24 84.09 75.00 84.17 C74.76 84.24 74.25 84.21 74.06 84.00 C73.86 83.79 73.78 83.56 73.83 82.89 C73.89 82.22 74.30 80.89 74.39 80.00 C74.48 79.11 74.31 78.26 74.39 77.56 C74.46 76.85 74.78 76.24 74.83 75.78 C74.89 75.31 74.69 74.90 74.72 74.78 C74.75 74.66 74.92 75.12 75.00 75.06 C75.08 74.99 75.13 74.41 75.22 74.39 C75.31 74.37 75.43 74.96 75.56 74.94 C75.69 74.93 75.74 74.39 76.00 74.28 C76.26 74.17 76.83 74.41 77.11 74.28 C77.39 74.15 77.54 73.43 77.67 73.50 C77.80 73.57 77.79 74.60 77.89 74.72 C77.99 74.84 78.14 73.92 78.28 74.22 C78.42 74.53 78.44 75.50 78.72 76.56 C79.00 77.61 79.69 79.44 79.94 80.56 C80.20 81.67 80.30 82.30 80.28 83.22 C80.26 84.15 80.12 85.32 79.83 86.11 C79.55 86.90 79.10 87.42 78.56 87.94 C78.01 88.47 76.89 89.06 76.56 89.28 C76.22 89.50 76.62 89.31 76.56 89.28Z", "right upper arm": "M29.00 62.61 C28.99 62.49 29.00 61.96 28.94 61.89 C28.89 61.81 28.73 62.23 28.67 62.17 C28.60 62.10 28.63 61.54 28.56 61.50 C28.48 61.46 28.35 61.93 28.22 61.94 C28.09 61.96 27.91 61.59 27.78 61.61 C27.65 61.63 27.56 62.09 27.44 62.06 C27.33 62.02 27.22 61.43 27.11 61.39 C27.00 61.35 26.88 61.88 26.78 61.83 C26.68 61.79 26.63 61.26 26.50 61.11 C26.37 60.96 26.14 61.08 26.00 60.94 C25.86 60.81 25.80 60.35 25.67 60.28 C25.54 60.20 25.31 60.54 25.22 60.50 C25.13 60.46 25.20 60.07 25.11 60.06 C25.02 60.04 24.76 60.43 24.67 60.39 C24.57 60.35 24.65 59.89 24.56 59.83 C24.46 59.78 24.21 60.03 24.11 60.06 C24.01 60.08 23.94 60.06 23.94 60.00 C23.94 59.94 24.16 59.71 24.11 59.72 C24.06 59.73 23.75 60.03 23.67 60.06 C23.58 60.08 23.31 60.31 23.61 59.89 C23.92 59.47 25.02 58.33 25.50 57.56 C25.98 56.78 25.93 56.35 26.50 55.22 C27.07 54.09 28.31 52.37 28.94 50.78 C29.57 49.19 29.76 47.09 30.28 45.67 C30.80 44.24 31.32 43.29 32.06 42.22 C32.79 41.16 33.81 39.99 34.67 39.28 C35.53 38.56 36.84 38.05 37.22 37.94 C37.60 37.84 36.95 38.53 36.94 38.67 C36.94 38.81 37.13 38.56 37.17 38.78 C37.20 39.00 37.13 39.76 37.17 40.00 C37.20 40.24 37.39 40.11 37.39 40.22 C37.39 40.33 37.15 40.54 37.17 40.67 C37.19 40.80 37.48 40.89 37.50 41.00 C37.52 41.11 37.28 41.20 37.28 41.33 C37.28 41.46 37.56 41.67 37.50 41.78 C37.44 41.89 36.98 41.93 36.94 42.00 C36.91 42.07 37.28 42.09 37.28 42.22 C37.28 42.35 36.93 42.63 36.94 42.78 C36.96 42.93 37.35 42.96 37.39 43.11 C37.43 43.26 37.15 43.54 37.17 43.67 C37.19 43.80 37.54 43.81 37.50 43.89 C37.46 43.96 36.98 44.02 36.94 44.11 C36.91 44.20 37.31 44.33 37.28 44.44 C37.24 44.56 36.76 44.69 36.72 44.78 C36.69 44.87 37.02 44.87 37.06 45.00 C37.09 45.13 36.93 45.43 36.94 45.56 C36.96 45.69 37.19 45.70 37.17 45.78 C37.15 45.85 36.85 45.93 36.83 46.00 C36.81 46.07 37.09 46.13 37.06 46.22 C37.02 46.31 36.63 46.46 36.61 46.56 C36.59 46.65 36.96 46.70 36.94 46.78 C36.93 46.85 36.50 46.93 36.50 47.00 C36.50 47.07 36.94 47.15 36.94 47.22 C36.94 47.30 36.52 47.37 36.50 47.44 C36.48 47.52 36.83 47.61 36.83 47.67 C36.83 47.72 36.52 47.72 36.50 47.78 C36.48 47.83 36.72 47.93 36.72 48.00 C36.72 48.07 36.46 48.00 36.50 48.22 C36.54 48.44 36.94 49.17 36.94 49.33 C36.94 49.50 36.57 49.15 36.50 49.22 C36.43 49.30 36.56 49.65 36.50 49.78 C36.44 49.91 36.19 49.80 36.17 50.00 C36.15 50.20 36.42 50.88 36.39 51.00 C36.36 51.12 36.13 50.72 36.00 50.72 C35.87 50.72 35.79 50.58 35.61 51.00 C35.44 51.42 35.22 52.52 34.94 53.22 C34.67 53.93 34.94 53.66 33.94 55.22 C32.95 56.79 29.82 61.38 29.00 62.61 C28.18 63.84 29.01 62.73 29.00 62.61Z", "right forearm": "M21.78 75.72 C21.78 75.52 21.81 74.61 21.78 74.50 C21.74 74.39 21.65 75.07 21.56 75.06 C21.46 75.04 21.33 74.41 21.22 74.39 C21.11 74.37 21.02 74.96 20.89 74.94 C20.76 74.93 20.69 74.39 20.44 74.28 C20.20 74.17 19.72 74.39 19.44 74.28 C19.17 74.17 18.93 73.54 18.78 73.61 C18.63 73.69 18.62 74.73 18.56 74.72 C18.49 74.71 18.16 74.77 18.39 73.56 C18.62 72.34 19.43 69.13 19.94 67.44 C20.46 65.76 20.93 64.67 21.50 63.44 C22.07 62.22 22.99 60.69 23.39 60.11 C23.79 59.53 23.81 59.94 23.89 59.94 C23.97 59.95 23.78 60.19 23.89 60.17 C24.00 60.15 24.43 59.80 24.56 59.83 C24.69 59.87 24.57 60.35 24.67 60.39 C24.76 60.43 25.02 60.04 25.11 60.06 C25.20 60.07 25.13 60.46 25.22 60.50 C25.31 60.54 25.58 60.25 25.67 60.28 C25.75 60.31 25.58 60.53 25.72 60.67 C25.86 60.81 26.32 60.92 26.50 61.11 C26.68 61.31 26.68 61.79 26.78 61.83 C26.88 61.88 27.00 61.35 27.11 61.39 C27.22 61.43 27.33 62.02 27.44 62.06 C27.56 62.09 27.65 61.63 27.78 61.61 C27.91 61.59 28.09 61.96 28.22 61.94 C28.35 61.93 28.49 61.47 28.56 61.50 C28.62 61.53 28.55 62.05 28.61 62.11 C28.68 62.18 28.89 61.78 28.94 61.89 C29.00 62.00 29.20 61.91 28.94 62.78 C28.69 63.65 28.56 65.06 27.39 67.11 C26.22 69.17 22.88 73.68 21.94 75.11 C21.01 76.55 21.81 75.62 21.78 75.72 C21.75 75.82 21.78 75.93 21.78 75.72Z", "right hand": "M20.11 89.28 C19.74 89.06 18.45 88.42 17.89 87.94 C17.32 87.47 17.03 87.23 16.72 86.44 C16.42 85.66 16.17 83.94 16.06 83.22 C15.94 82.50 15.72 83.50 16.06 82.11 C16.39 80.72 17.68 76.23 18.06 74.89 C18.44 73.55 18.24 74.09 18.33 74.06 C18.43 74.02 18.54 74.74 18.61 74.67 C18.69 74.59 18.64 73.68 18.78 73.61 C18.92 73.55 19.17 74.17 19.44 74.28 C19.72 74.39 20.20 74.17 20.44 74.28 C20.69 74.39 20.76 74.93 20.89 74.94 C21.02 74.96 21.11 74.37 21.22 74.39 C21.33 74.41 21.45 75.03 21.56 75.06 C21.66 75.08 21.81 74.38 21.83 74.56 C21.86 74.73 21.56 74.67 21.72 76.11 C21.89 77.56 22.71 81.90 22.83 83.22 C22.95 84.55 22.66 83.90 22.44 84.06 C22.23 84.21 21.79 84.25 21.56 84.17 C21.32 84.08 21.21 83.95 21.06 83.56 C20.90 83.16 20.74 82.15 20.61 81.78 C20.48 81.41 20.40 81.42 20.28 81.33 C20.16 81.25 20.02 81.19 19.89 81.28 C19.76 81.37 19.68 81.49 19.50 81.89 C19.32 82.29 18.94 83.15 18.83 83.67 C18.72 84.19 18.50 84.30 18.83 85.00 C19.17 85.70 20.62 87.18 20.83 87.89 C21.05 88.60 20.23 89.05 20.11 89.28 C19.99 89.51 20.48 89.50 20.11 89.28Z", "left thigh": "M55.22 115.61 C55.06 115.14 54.66 114.49 54.28 112.78 C53.90 111.06 53.59 108.37 52.94 105.33 C52.30 102.30 50.91 96.89 50.39 94.56 C49.87 92.22 49.91 92.24 49.83 91.33 C49.76 90.43 49.88 89.19 49.94 89.11 C50.01 89.03 50.13 90.81 50.22 90.83 C50.31 90.85 50.35 89.46 50.50 89.22 C50.65 88.98 50.90 89.55 51.11 89.39 C51.32 89.23 51.55 88.47 51.78 88.28 C52.01 88.08 52.49 88.38 52.50 88.22 C52.51 88.06 51.81 87.50 51.83 87.33 C51.85 87.17 52.52 87.37 52.61 87.22 C52.70 87.07 52.33 86.59 52.39 86.44 C52.44 86.30 52.87 86.50 52.94 86.33 C53.02 86.17 52.79 85.58 52.83 85.44 C52.88 85.31 53.11 85.63 53.22 85.50 C53.33 85.37 53.36 84.84 53.50 84.67 C53.64 84.49 53.98 84.61 54.06 84.44 C54.13 84.28 53.89 83.81 53.94 83.67 C54.00 83.52 54.35 83.70 54.39 83.56 C54.43 83.41 54.11 82.93 54.17 82.78 C54.22 82.63 54.67 82.80 54.72 82.67 C54.78 82.54 54.39 82.24 54.50 82.00 C54.61 81.76 55.26 81.41 55.39 81.22 C55.52 81.04 55.22 81.00 55.28 80.89 C55.33 80.78 55.67 80.69 55.72 80.56 C55.78 80.43 55.57 80.22 55.61 80.11 C55.65 80.00 55.91 79.98 55.94 79.89 C55.98 79.80 55.58 79.84 55.83 79.56 C56.08 79.27 57.01 78.45 57.44 78.17 C57.88 77.88 58.24 77.85 58.44 77.83 C58.65 77.81 58.61 78.06 58.67 78.06 C58.72 78.06 58.64 77.79 58.78 77.83 C58.92 77.88 59.10 76.99 59.50 78.33 C59.90 79.68 60.80 83.96 61.17 85.89 C61.54 87.81 61.57 88.37 61.72 89.89 C61.87 91.41 62.00 92.76 62.06 95.00 C62.11 97.24 62.19 101.17 62.06 103.33 C61.93 105.50 61.37 106.20 61.28 108.00 C61.19 109.80 61.50 113.11 61.50 114.11 C61.50 115.11 61.36 113.90 61.28 114.00 C61.19 114.10 61.08 114.64 61.00 114.72 C60.92 114.81 60.87 114.50 60.78 114.50 C60.69 114.50 60.56 114.76 60.44 114.72 C60.33 114.69 60.22 114.26 60.11 114.28 C60.00 114.30 59.85 114.81 59.78 114.83 C59.70 114.85 59.76 114.39 59.67 114.39 C59.57 114.39 59.39 114.78 59.22 114.83 C59.06 114.89 58.83 114.65 58.67 114.72 C58.50 114.80 58.35 115.31 58.22 115.28 C58.09 115.24 58.02 114.52 57.89 114.50 C57.76 114.48 57.61 115.07 57.44 115.17 C57.28 115.26 57.02 115.04 56.89 115.06 C56.76 115.07 56.81 115.31 56.67 115.28 C56.52 115.24 56.09 114.80 56.00 114.83 C55.91 114.87 56.20 115.50 56.11 115.50 C56.02 115.50 55.59 114.81 55.44 114.83 C55.30 114.85 55.26 115.48 55.22 115.61 C55.19 115.74 55.38 116.08 55.22 115.61Z", "left lower leg": "M57.44 141.50 C57.40 141.40 57.19 141.44 57.17 140.89 C57.14 140.34 57.39 140.06 57.28 138.22 C57.17 136.39 56.85 132.33 56.50 129.89 C56.15 127.44 55.41 125.96 55.17 123.56 C54.93 121.15 55.04 116.78 55.06 115.44 C55.07 114.11 55.21 115.66 55.28 115.56 C55.34 115.45 55.31 114.84 55.44 114.83 C55.58 114.82 56.02 115.50 56.11 115.50 C56.20 115.50 55.91 114.87 56.00 114.83 C56.09 114.80 56.52 115.24 56.67 115.28 C56.81 115.31 56.76 115.07 56.89 115.06 C57.02 115.04 57.28 115.26 57.44 115.17 C57.61 115.07 57.76 114.48 57.89 114.50 C58.02 114.52 58.09 115.24 58.22 115.28 C58.35 115.31 58.50 114.80 58.67 114.72 C58.83 114.65 59.06 114.89 59.22 114.83 C59.39 114.78 59.57 114.39 59.67 114.39 C59.76 114.39 59.70 114.85 59.78 114.83 C59.85 114.81 60.00 114.30 60.11 114.28 C60.22 114.26 60.33 114.69 60.44 114.72 C60.56 114.76 60.69 114.50 60.78 114.50 C60.87 114.50 60.91 114.81 61.00 114.72 C61.09 114.63 61.23 114.03 61.33 113.94 C61.44 113.86 61.58 114.14 61.61 114.22 C61.64 114.31 61.41 114.07 61.50 114.44 C61.59 114.81 61.87 115.20 62.17 116.44 C62.46 117.69 63.09 120.52 63.28 121.89 C63.46 123.26 63.37 123.48 63.28 124.67 C63.19 125.85 62.76 127.20 62.72 129.00 C62.69 130.80 63.02 133.57 63.06 135.44 C63.09 137.31 62.99 139.38 62.94 140.22 C62.90 141.06 62.81 140.92 62.78 140.50 C62.75 140.08 62.87 137.76 62.78 137.72 C62.69 137.69 62.43 139.89 62.22 140.28 C62.02 140.67 61.76 139.96 61.56 140.06 C61.35 140.15 61.19 140.85 61.00 140.83 C60.81 140.81 60.56 139.93 60.44 139.94 C60.33 139.96 60.50 140.96 60.33 140.94 C60.17 140.93 59.67 139.81 59.44 139.83 C59.22 139.85 59.20 140.96 59.00 141.06 C58.80 141.15 58.39 140.41 58.22 140.39 C58.06 140.37 58.12 140.86 58.00 140.94 C57.88 141.03 57.59 140.80 57.50 140.89 C57.41 140.98 57.45 141.40 57.44 141.50 C57.44 141.60 57.49 141.60 57.44 141.50Z", "left foot": "M61.33 149.17 C61.22 149.17 60.89 149.24 60.67 149.17 C60.44 149.09 60.46 148.81 60.00 148.72 C59.54 148.63 58.38 148.79 57.89 148.61 C57.40 148.44 57.23 148.10 57.06 147.67 C56.88 147.23 56.76 146.57 56.83 146.00 C56.91 145.43 57.44 145.06 57.50 144.22 C57.56 143.39 57.18 141.45 57.17 141.00 C57.16 140.55 57.39 141.52 57.44 141.50 C57.50 141.48 57.41 140.98 57.50 140.89 C57.59 140.80 57.88 141.03 58.00 140.94 C58.12 140.86 58.06 140.37 58.22 140.39 C58.39 140.41 58.80 141.15 59.00 141.06 C59.20 140.96 59.22 139.85 59.44 139.83 C59.67 139.81 60.17 140.93 60.33 140.94 C60.50 140.96 60.33 139.96 60.44 139.94 C60.56 139.93 60.81 140.81 61.00 140.83 C61.19 140.85 61.35 140.15 61.56 140.06 C61.76 139.96 62.02 140.67 62.22 140.28 C62.43 139.89 62.69 137.69 62.78 137.72 C62.86 137.75 62.69 140.01 62.72 140.44 C62.75 140.88 62.85 140.11 62.94 140.33 C63.04 140.56 63.20 141.22 63.28 141.78 C63.35 142.33 63.10 143.03 63.39 143.67 C63.68 144.31 64.44 145.09 65.00 145.61 C65.56 146.13 66.38 146.32 66.72 146.78 C67.06 147.23 67.08 147.99 67.06 148.33 C67.03 148.68 66.69 148.77 66.56 148.83 C66.42 148.90 66.33 148.70 66.22 148.72 C66.11 148.74 66.33 148.93 65.89 148.94 C65.44 148.96 64.31 148.80 63.56 148.83 C62.80 148.87 61.70 149.11 61.33 149.17 C60.96 149.22 61.44 149.17 61.33 149.17Z", "right thigh": "M41.22 115.50 C41.19 115.39 41.14 114.86 41.00 114.83 C40.86 114.81 40.46 115.35 40.39 115.33 C40.31 115.31 40.66 114.73 40.56 114.72 C40.45 114.71 39.94 115.22 39.78 115.28 C39.61 115.33 39.67 115.07 39.56 115.06 C39.44 115.04 39.28 115.24 39.11 115.17 C38.94 115.09 38.70 114.59 38.56 114.61 C38.41 114.63 38.35 115.26 38.22 115.28 C38.09 115.30 37.94 114.80 37.78 114.72 C37.61 114.65 37.39 114.91 37.22 114.83 C37.06 114.76 36.87 114.28 36.78 114.28 C36.69 114.28 36.74 114.83 36.67 114.83 C36.59 114.83 36.44 114.28 36.33 114.28 C36.22 114.28 36.11 114.80 36.00 114.83 C35.89 114.87 35.76 114.50 35.67 114.50 C35.57 114.50 35.54 114.94 35.44 114.83 C35.35 114.72 35.19 113.95 35.11 113.83 C35.03 113.71 34.94 115.14 34.94 114.11 C34.95 113.08 35.26 109.52 35.17 107.67 C35.07 105.81 34.52 105.02 34.39 103.00 C34.26 100.98 34.33 97.69 34.39 95.56 C34.44 93.43 34.57 91.81 34.72 90.22 C34.87 88.63 34.91 87.96 35.28 86.00 C35.65 84.04 36.55 79.81 36.94 78.44 C37.34 77.08 37.53 77.90 37.67 77.83 C37.81 77.77 37.63 78.06 37.78 78.06 C37.93 78.06 38.33 77.78 38.56 77.83 C38.78 77.89 38.98 78.33 39.11 78.39 C39.24 78.44 39.26 78.13 39.33 78.17 C39.41 78.20 39.48 78.54 39.56 78.61 C39.63 78.69 39.72 78.56 39.78 78.61 C39.83 78.67 39.83 78.91 39.89 78.94 C39.94 78.98 39.99 78.75 40.11 78.83 C40.23 78.92 40.55 79.27 40.61 79.44 C40.68 79.62 40.44 79.76 40.50 79.89 C40.56 80.02 40.91 80.11 40.94 80.22 C40.98 80.33 40.56 80.26 40.72 80.56 C40.89 80.85 41.76 81.65 41.94 82.00 C42.13 82.35 41.78 82.54 41.83 82.67 C41.89 82.80 42.24 82.63 42.28 82.78 C42.31 82.93 42.02 83.41 42.06 83.56 C42.09 83.70 42.44 83.52 42.50 83.67 C42.56 83.81 42.33 84.30 42.39 84.44 C42.44 84.59 42.78 84.39 42.83 84.56 C42.89 84.72 42.65 85.28 42.72 85.44 C42.80 85.61 43.14 85.40 43.28 85.56 C43.42 85.71 43.43 86.24 43.56 86.39 C43.69 86.54 44.01 86.31 44.06 86.44 C44.10 86.58 43.74 87.07 43.83 87.22 C43.93 87.37 44.57 87.17 44.61 87.33 C44.65 87.50 44.05 88.06 44.06 88.22 C44.06 88.38 44.45 88.08 44.67 88.28 C44.88 88.47 45.12 89.23 45.33 89.39 C45.55 89.55 45.80 88.96 45.94 89.22 C46.09 89.48 46.13 90.93 46.22 90.94 C46.31 90.96 46.44 89.23 46.50 89.33 C46.56 89.44 46.70 90.57 46.61 91.56 C46.52 92.54 46.46 92.91 45.94 95.22 C45.43 97.54 44.13 102.50 43.50 105.44 C42.87 108.39 42.55 111.21 42.17 112.89 C41.79 114.56 41.38 115.06 41.22 115.50 C41.06 115.94 41.26 115.61 41.22 115.50Z", "right lower leg": "M39.11 141.39 C39.10 141.29 39.17 140.85 39.06 140.78 C38.94 140.70 38.56 141.01 38.44 140.94 C38.32 140.88 38.48 140.35 38.33 140.39 C38.19 140.43 37.78 141.26 37.56 141.17 C37.33 141.07 37.22 139.89 37.00 139.83 C36.78 139.78 36.39 140.81 36.22 140.83 C36.06 140.85 36.13 139.93 36.00 139.94 C35.87 139.96 35.63 140.93 35.44 140.94 C35.26 140.96 35.09 140.17 34.89 140.06 C34.69 139.94 34.43 140.70 34.22 140.28 C34.02 139.85 33.77 137.49 33.67 137.50 C33.56 137.51 33.66 140.60 33.61 140.33 C33.56 140.06 33.37 137.87 33.39 135.89 C33.41 133.91 33.76 130.35 33.72 128.44 C33.69 126.54 33.26 125.50 33.17 124.44 C33.07 123.39 32.98 123.43 33.17 122.11 C33.35 120.80 33.95 117.94 34.28 116.56 C34.60 115.18 34.92 114.12 35.11 113.83 C35.31 113.55 35.35 114.72 35.44 114.83 C35.54 114.94 35.57 114.50 35.67 114.50 C35.76 114.50 35.89 114.87 36.00 114.83 C36.11 114.80 36.22 114.28 36.33 114.28 C36.44 114.28 36.59 114.83 36.67 114.83 C36.74 114.83 36.69 114.28 36.78 114.28 C36.87 114.28 37.06 114.76 37.22 114.83 C37.39 114.91 37.61 114.65 37.78 114.72 C37.94 114.80 38.09 115.30 38.22 115.28 C38.35 115.26 38.41 114.63 38.56 114.61 C38.70 114.59 38.94 115.09 39.11 115.17 C39.28 115.24 39.44 115.04 39.56 115.06 C39.67 115.07 39.63 115.31 39.78 115.28 C39.93 115.24 40.35 114.80 40.44 114.83 C40.54 114.87 40.24 115.50 40.33 115.50 C40.43 115.50 40.85 114.83 41.00 114.83 C41.15 114.83 41.14 115.44 41.22 115.50 C41.31 115.56 41.47 114.03 41.50 115.22 C41.53 116.42 41.46 121.00 41.39 122.67 C41.31 124.33 41.30 124.00 41.06 125.22 C40.81 126.44 40.27 127.31 39.94 130.00 C39.62 132.69 39.25 139.49 39.11 141.39 C38.97 143.29 39.12 141.49 39.11 141.39Z", "right foot": "M35.89 149.06 C35.02 149.06 31.69 149.09 30.67 149.06 C29.65 149.02 29.97 148.94 29.78 148.83 C29.58 148.73 29.55 148.66 29.50 148.44 C29.45 148.23 29.44 147.83 29.50 147.56 C29.56 147.28 29.41 147.20 29.83 146.78 C30.26 146.35 31.50 145.57 32.06 145.00 C32.61 144.43 33.00 143.74 33.17 143.33 C33.33 142.93 32.96 143.06 33.06 142.56 C33.15 142.06 33.62 141.18 33.72 140.33 C33.82 139.49 33.58 137.51 33.67 137.50 C33.75 137.49 34.02 139.85 34.22 140.28 C34.43 140.70 34.69 139.94 34.89 140.06 C35.09 140.17 35.26 140.96 35.44 140.94 C35.63 140.93 35.87 139.96 36.00 139.94 C36.13 139.93 36.06 140.85 36.22 140.83 C36.39 140.81 36.78 139.78 37.00 139.83 C37.22 139.89 37.33 141.07 37.56 141.17 C37.78 141.26 38.19 140.43 38.33 140.39 C38.48 140.35 38.33 140.89 38.44 140.94 C38.56 141.00 38.89 140.65 39.00 140.72 C39.11 140.80 39.06 141.32 39.11 141.39 C39.16 141.45 39.31 140.66 39.28 141.11 C39.25 141.56 38.89 143.33 38.94 144.11 C39.00 144.89 39.52 145.20 39.61 145.78 C39.70 146.35 39.59 147.15 39.50 147.56 C39.41 147.96 39.23 148.05 39.06 148.22 C38.88 148.40 38.86 148.55 38.44 148.61 C38.03 148.68 36.98 148.54 36.56 148.61 C36.13 148.69 36.00 148.98 35.89 149.06 C35.78 149.13 36.76 149.06 35.89 149.06Z"}};
+const gReg = document.getElementById("regions");
+const node = {};
+
+const C = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+
+function mix(hex, t) {
+  const s = hex.replace("#", "");
+  const r = parseInt(s.slice(0,2),16), g = parseInt(s.slice(2,4),16), b = parseInt(s.slice(4,6),16);
+  const gr = [13,19,23];
+  return "rgb(" + Math.round(r+(gr[0]-r)*t) + "," + Math.round(g+(gr[1]-g)*t) + "," +
+                  Math.round(b+(gr[2]-b)*t) + ")";
+}
+
+function partColour(name) {
+  if (state.mode === "cfg" && state.previewFatal) {
+    return state.previewFatal[name] ? mix(C("--fatal"), .30) : mix(C("--survive"), .22);
+  }
+  if (state.mode === "live") {
+    const pct = state.live[name];
+    if (pct <= 0)   return mix(C("--fatal"), .45);
+    if (pct >= 100) return mix(C("--survive"), .62);
+    return mix(C("--warn"), .30 + (pct / 100) * .35);
+  }
+  return state.fatal[name] ? mix(C("--fatal"), .30) : mix(C("--survive"), .22);
+}
+
+function buildFigure() {
+  const NS = "http://www.w3.org/2000/svg";
+  PARTS.forEach(n => {
+    const p = document.createElementNS(NS, "path");
+    p.setAttribute("d", FIG.regions[n]);
+    p.setAttribute("tabindex", "0");
+    p.setAttribute("role", "button");
+    p.setAttribute("aria-label", n);
+    p.addEventListener("click", () => select(n));
+    p.addEventListener("keydown", e => {
+      if (e.key === "Enter" || e.key === " ") { e.preventDefault(); select(n); }
+    });
+    gReg.appendChild(p);
+    node[n] = p;
+  });
+  draw();
+}
+
+function draw() {
+  PARTS.forEach(n => {
+    const p = node[n]; if (!p) return;
+    p.setAttribute("fill", partColour(n));
+    p.classList.toggle("sel", n === state.sel);
+  });
+  const hf = document.getElementById("headFatal");
+  if (hf) hf.setAttribute("aria-pressed", state.fatal["head"] ? "true" : "false");
+  const tf = document.getElementById("trunkFatal");
+  if (tf) tf.setAttribute("aria-pressed", (state.fatal["upper torso"] || state.fatal["abdomen"]) ? "true" : "false");
+}
+
+function select(n) {
+  state.sel = n;
+  // The selected part is drawn last so its white outline is not covered by a neighbour.
+  if (node[n] && node[n].parentNode === gReg) gReg.appendChild(node[n]);
+  draw(); renderSel();
+}
+
+// Mirrors ApplyCombatPreset() in flesh.cpp: the fatal set and the limb limit a preset level applies.
+function presetFatalMap(lvl) {
+  lvl = Math.max(0, Math.min(100, lvl | 0));
+  const f = {};
+  PARTS.forEach(n => { f[n] = false; });
+  f["head"] = f["upper torso"] = f["abdomen"] = true;
+  if (lvl >= 20) { f["left thigh"] = f["right thigh"] = true; }
+  if (lvl >= 35) { f["left lower leg"] = f["right lower leg"] = true; }
+  if (lvl >= 50) { f["left upper arm"] = f["right upper arm"] = true; }
+  if (lvl >= 55) { f["left forearm"] = f["right forearm"] = true; }
+  if (lvl >= 70) { f["left foot"] = f["right foot"] = true; }
+  if (lvl >= 85) { f["left hand"] = f["right hand"] = true; }
+  return f;
+}
+function presetLossLimb(lvl) {
+  if (lvl <= 0) return 6;
+  if (lvl < 10) return 5;
+  if (lvl < 28) return 4;
+  if (lvl < 45) return 3;
+  if (lvl < 65) return 2;
+  return 1;
+}
+
+const TITLE = n => n.replace(/\b\w/g, c => c.toUpperCase());
+function markCustomPreset() {
+  if (CB["preset.id"] >= 0) {
+    CB["preset.base"] = CB["preset.id"];
+    CB["preset.id"] = -1;
+    renderPresets();
+  }
+}
+
+function renderSel() {
+  const n = state.sel;
+  document.getElementById("selname").textContent = TITLE(n);
+  document.getElementById("selmeta").textContent = state.fatal[n]
+    ? "Immediately fatal when severed"
+    : "Survivable when severed (counts toward cumulative limb limit)";
+  const isTrunk = n === "upper torso" || n === "abdomen";
+  const body = document.getElementById("selbody");
+  body.innerHTML =
+    '<div class="row"><div class="lab"><b>When this part is severed</b><small>' +
+      (n === "head"
+        ? "Decapitation lethality."
+        : isTrunk
+        ? "Torso bisection lethality."
+        : "Whether losing this single limb kills immediately or is survivable.") +
+    '</small></div><div class="ctl seg" role="group" aria-label="Lethality">' +
+      '<button class="f" id="selFatal" aria-pressed="' + (state.fatal[n] ? "true" : "false") + '">Fatal</button>' +
+      '<button class="s" id="selSurv" aria-pressed="' + (state.fatal[n] ? "false" : "true") + '">Survivable</button>' +
+    '</div></div>' +
+    '<div class="row"><div class="lab"><b>Remaining tissue (Live State)</b><small>Percentage of this region currently attached.</small></div>' +
+      '<div class="ctl num"><output>' + state.live[n] + '</output><span class="unit">%</span></div></div>';
+  document.getElementById("selFatal").onclick = () => setFatal(n, true);
+  document.getElementById("selSurv").onclick  = () => setFatal(n, false);
+  markApplied();
+}
+function setFatal(n, v) {
+  state.fatal[n] = v;
+  markCustomPreset();
+  draw(); renderSel(); lethalAllRefresh();
+  SEND("lethal", { part: n, fatal: v });
+}
+
+function layerCard(title, note, key, layers) {
+  const c = document.createElement("div");
+  c.className = "card";
+  c.innerHTML = "<h3>" + title + "</h3><p class='note'>" + note + "</p><div class='layers'></div>";
+  const box = c.querySelector(".layers");
+  layers.forEach(([id, label, gloss]) => {
+    const row = document.createElement("div");
+    row.className = "layer";
+    const v = state[key][id];
+    row.innerHTML =
+      "<div class='lname'>" + label + "<em>" + gloss + "</em></div>" +
+      "<input type='range' id='" + key + "-" + id + "' min='0' max='100' step='5' value='" + v + "' " +
+        "aria-label='" + title + " " + label + "'>" +
+      "<div class='val'><span>" + v + "</span>%</div>";
+    const inp = row.querySelector("input"), out = row.querySelector(".val span");
+    inp.oninput = () => { out.textContent = inp.value; };
+    inp.onchange = () => {
+      state[key][id] = +inp.value;
+      markCustomPreset();
+      SEND("threshold", { set: key, layer: id, pct: +inp.value });
+    };
+    wired.push([inp, key + "." + id]);
+    box.appendChild(row);
+  });
+  return c;
+}
+const advBodyStack = document.getElementById("advBodyStack");
+if (advBodyStack) {
+  advBodyStack.insertBefore(
+    layerCard("Head Layer Thresholds", "Minimum percentage of each head layer that must remain attached before death (0% = any loss is fatal).", "head",
+      [["skin","Skin","face and scalp"],["bone","Bone","skull"],["brain","Brain","brain tissue"]]),
+    advBodyStack.firstChild);
+  advBodyStack.insertBefore(
+    layerCard("Body Layer Thresholds", "Minimum percentage of each body layer below the neck that must remain attached.", "body",
+      [["skin","Skin","outer layer"],["flesh","Flesh","muscle and fat"],["bone","Bone","skeleton"]]),
+    advBodyStack.firstChild.nextSibling);
+}
+
+const mCfg = document.getElementById("mCfg"), mLive = document.getElementById("mLive");
+function setMode(m) {
+  state.mode = m;
+  mCfg.setAttribute("aria-pressed", m === "cfg");
+  mLive.setAttribute("aria-pressed", m === "live");
+  document.getElementById("legend").innerHTML = m === "cfg"
+    ? '<span><i style="background:var(--fatal)"></i>Fatal when severed</span>' +
+      '<span><i style="background:var(--survive)"></i>Survivable</span>'
+    : '<span><i style="background:var(--survive)"></i>Intact</span>' +
+      '<span><i style="background:var(--warn)"></i>Damaged</span>' +
+      '<span><i style="background:var(--fatal)"></i>Severed</span>';
+  draw();
+  if (m === "live") SEND("state", { target: "player" });
+}
+mCfg.onclick = () => setMode("cfg");
+mLive.onclick = () => setMode("live");
+
+function renderSpells() {
+  const host = document.getElementById("spellgroups");
+  host.innerHTML = "";
+  SPELLS.forEach(([name, list]) => {
+    const g = document.createElement("div");
+    g.className = "grp";
+    g.innerHTML = "<div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:8px'>" +
+      "<h4 style='margin:0'>" + name + "</h4>" +
+      "<button class='btn q grp-tog' style='padding:3px 9px;font-size:11px'>Toggle Group</button></div><div class='spells'></div>";
+    const box = g.querySelector(".spells");
+    g.querySelector(".grp-tog").onclick = () => {
+      const anyOff = list.some(([id]) => !state.spells[id]);
+      list.forEach(([id]) => {
+        state.spells[id] = anyOff;
+        const hex = "0x" + id.toString(16).toUpperCase();
+        SEND("grant", { id: hex, on: anyOff });
+      });
+      renderSpells();
+    };
+    list.forEach(([id, label]) => {
+      const el = document.createElement("div");
+      el.className = "sp";
+      const hex = "0x" + id.toString(16).toUpperCase();
+      el.innerHTML = "<span class='nm'>" + label + "</span>" +
+        "<button class='sw' aria-pressed='" + (state.spells[id] ? "true" : "false") +
+        "' aria-label='Grant " + label + "'></button>";
+      el.querySelector("button").onclick = e => {
+        const on = !state.spells[id];
+        state.spells[id] = on;
+        e.currentTarget.setAttribute("aria-pressed", on);
+        countSpells();
+        SEND("grant", { id: hex, on });
+      };
+      box.appendChild(el);
+    });
+    host.appendChild(g);
+  });
+  countSpells();
+  markApplied();
+}
+function countSpells() {
+  const ids = Object.keys(state.spells);
+  const on = ids.filter(k => state.spells[k]).length;
+  document.getElementById("spCount").textContent = on + " of " + ids.length + " granted";
+}
+document.getElementById("grantAll").onclick = () => {
+  Object.keys(state.spells).forEach(k => state.spells[k] = true);
+  renderSpells(); SEND("grantAll", { on: true,  ids: SPELLS.flatMap(g => g[1].map(s => s[0])) });
+};
+document.getElementById("revokeAll").onclick = () => {
+  Object.keys(state.spells).forEach(k => state.spells[k] = false);
+  renderSpells(); SEND("grantAll", { on: false, ids: [] });
+};
+
+function bindRange(id, fmt, verb) {
+  const el = document.getElementById(id); if (!el) return;
+  const out = document.getElementById(id + "V");
+  const show = () => { if (out) out.textContent = fmt ? fmt(+el.value) : el.value; };
+  el.oninput = show;
+  el.onchange = () => {
+    const v = verb || id;
+    if (v === "lossLimb" || v === "hitCd") markCustomPreset();
+    SEND(v, { value: +el.value });
+  };
+  wired.push([el, verb || id]);
+  show();
+}
+const f2 = v => v.toFixed(2), f1 = v => v.toFixed(1), f0 = v => String(v);
+[["lossLimb",f0],["coalesce",f0],["cgap",f0],["partSpan",f0],
+ ["pollMs",f0],["hitCd",f0],["cell",f1],["maxcells",f0],["budget",f0],
+ ["maxPieces", v => v > 0 ? String(v) : "no limit"]]
+  .forEach(([id, fmt]) => bindRange(id, fmt));
+
+document.querySelectorAll(".sw").forEach(b => {
+  if (b.closest(".sp") || b.classList.contains("cb")) return;
+  b.addEventListener("click", () => {
+    const on = b.getAttribute("aria-pressed") !== "true";
+    b.setAttribute("aria-pressed", on);
+    const id = b.id || "toggle";
+    if (id === "headFatal") { state.fatal["head"] = on; draw(); renderSel(); lethalAllRefresh(); markCustomPreset(); }
+    else if (id === "trunkFatal") { state.fatal["upper torso"] = on; state.fatal["abdomen"] = on; draw(); renderSel(); lethalAllRefresh(); markCustomPreset(); }
+    else if (id === "nkHit" || id === "nkSpell" || id === "nkPlayer" || id === "sever") { markCustomPreset(); }
+    SEND(id, { on });
+  });
+});
+
+const lethalAllBtn = document.getElementById("lethalAll");
+function lethalAllRefresh() {
+  const anySurv = PARTS.some(n => !state.fatal[n]);
+  lethalAllBtn.textContent = anySurv ? "Make every part fatal" : "Make every part survivable";
+}
+lethalAllBtn.onclick = () => {
+  const fatal = PARTS.some(n => !state.fatal[n]);
+  PARTS.forEach(n => { state.fatal[n] = fatal; });
+  markCustomPreset();
+  draw(); renderSel(); lethalAllRefresh();
+  SEND("lethalAll", { fatal });
+};
+wired.push([lethalAllBtn, "lethalAll"]);
+
+const CB_FORMS = ["bite","slabz","slabx","slaby","borey","borex","borez","scatter","diagf","diags"];
+const CB_FORM_LABEL = { bite:"Bite", slabz:"Cut across", slabx:"Cut down (front)", slaby:"Cut down (side)",
+  borey:"Bore, front to back", borex:"Bore, side to side", borez:"Bore, top to bottom", scatter:"Scatter",
+  diagf:"Diagonal (front)", diags:"Diagonal (side)" };
+const CB_WEAPONS = [
+  ["weapon","All Physical Weapons","swords, axes, maces, daggers, greatswords, battleaxes, warhammers, bows, crossbows, and bashes, each within its own limit. Unarmed blows never voxelise.",1,-1,6,3]];
+const CB_MAGIC = [
+  ["fire","Fire","burns 1 layer at a time (Clothing → Skin → Flesh → Bone)",0,7,4,3],
+  ["frost","Frost","freezes and shatters up to 2 outer layers per hit",0,0,6,2],
+  ["shock","Shock","arcs 3 stages deep through attire, skin, and muscle",0,4,5,3],
+  ["shout","Shout","blasts 2 outer stages away across a wide radius",0,7,6,2],
+  ["werewolf","Werewolf","mauls all 4 stages at once down to the bone",0,0,10,3]];
+const CB_TRIGS = [
+  ["any","Every blow","Triggers a wound on every hit regardless of damage dealt.",0,0,0,"",false],
+  ["per","Scale wound size by damage","Scales wound radius by damage dealt (units per point of damage). For weapons it needs a hit threshold below to open the wound.",0.05,1,0.05,"units/pt",false],
+  ["pct","Single hit ≥ % of max HP","Triggers when a single blow deals at least this % of max health.",1,100,1,"% HP",false],
+  ["abs","Single hit ≥ raw points","Triggers when a single blow deals at least this many damage points.",1,200,1,"pts",false],
+  ["winpct","Cumulative % HP over time","Triggers when damage within the time window reaches this % of max health.",1,100,1,"% HP",true],
+  ["winabs","Cumulative points over time","Triggers when damage within the time window reaches this many points.",1,200,1,"pts",true]];
+const CB_TRIG_DEF = { any:[0,0], per:[1,0.25], pct:[0,25], abs:[0,30], winpct:[0,25], winabs:[0,30] };
+
+function describeIntensity(lvl) {
+  if (lvl < 0) {
+    const stages = CB["peel.stages"] || 1;
+    const vhp = CB.vulnhp | 0;
+    const fatalCount = PARTS.filter(p => state.fatal[p]).length;
+    return {
+      title: "Custom",
+      vox: CB.on
+        ? ("Custom combat rules active: peels <b>" + stages + " layer stage" + (stages > 1 ? "s" : "") + "</b> per qualifying hit" +
+           (vhp > 0 ? " on targets &le; <b>" + vhp + "% HP</b>." : " at <b>any HP</b>."))
+        : "Combat voxelisation is currently turned off in Custom settings.",
+      surv: "Custom survivability: <b>" + fatalCount + " of 15 body parts</b> are immediately fatal when severed (<b>" + (CB.lossLimb || 4) + "</b> survivable limbs lost before death)."
+    };
+  }
+  lvl = Math.max(0, Math.min(100, lvl | 0));
+  if (lvl <= 0) {
+    return {
+      title: "Disabled",
+      vox: "Combat blows and hostile spells do not open voxel wounds (spells cast by hand and scenes still work).",
+      surv: "Only Head and Trunk (Upper Torso / Abdomen) loss are immediately fatal; all 12 limb segments are survivable individually (6 limbs lost before death)."
+    };
+  }
+  let title = "Finishing Blows";
+  if (lvl < 20) title = "Subtle Scars";
+  else if (lvl < 35) title = "Skirmish Cuts";
+  else if (lvl < 48) title = "Heavy Skirmish";
+  else if (lvl <= 52) title = "Finishing Blows";
+  else if (lvl < 70) title = "Brutal Cleave";
+  else if (lvl < 85) title = "Visceral Carnage";
+  else title = "Gorefest";
+
+  let vox = "";
+  if (lvl <= 50) {
+    const u = lvl / 50.0;
+    const vhp = Math.round(20 + 30 * u);
+    const pct = Math.round(35 - 19 * u);
+    const abs = Math.round(50 - 28 * u);
+    const stages = lvl < 40 ? 1 : 2;
+    const blowMode = lvl <= 15 ? "Power &amp; sneak attacks only" : "Any qualifying blow";
+    vox = blowMode + " on targets at or below <b>" + vhp + "% HP</b> dealing &ge; <b>" + pct + "% HP</b> (or <b>" + abs + " pts</b>) peels <b>" + stages + " layer stage" + (stages > 1 ? "s" : "") + "</b> per hit.";
+  } else {
+    const v = (lvl - 50) / 50.0;
+    const vhp = lvl < 70 ? Math.round(50 + ((lvl - 50) / 20.0) * 45) : 0;
+    const pct = Math.max(2, Math.round(16 - 13 * v));
+    const abs = Math.max(3, Math.round(22 - 17 * v));
+    const stages = lvl < 65 ? 2 : (lvl < 85 ? 3 : 4);
+    if (lvl >= 85) {
+      vox = "<b>Every weapon hit and spell</b> voxelises at any HP, through <b>all 4 layer stages (to the bone)</b>, with larger wounds.";
+    } else {
+      vox = "Every hit" + (vhp > 0 ? " on targets &le; <b>" + vhp + "% HP</b>" : " at <b>any HP (100%)</b>") +
+            " dealing &ge; <b>" + pct + "% HP</b> (or <b>" + abs + " pts</b>" + (lvl >= 65 ? ", plus damage-scaled wounds on every hit" : "") +
+            ") peels <b>" + stages + " layer stages</b> per hit.";
+    }
+  }
+
+  const lossLimb = presetLossLimb(lvl);   // one ladder for the prose, the figure and the DLL
+
+  let fatalParts = "Head &amp; Trunk only";
+  if (lvl >= 85) fatalParts = "<b>All 15 body parts</b> (Head, Trunk, Arms, Forearms, Thighs, Lower Legs, Hands &amp; Feet &mdash; no dismemberment is survivable)";
+  else if (lvl >= 70) fatalParts = "<b>Head, Trunk, Thighs, Lower Legs, Upper Arms, Forearms &amp; Feet</b> (only Hands are survivable on a single loss)";
+  else if (lvl >= 55) fatalParts = "<b>Head, Trunk, Thighs, Lower Legs, Upper Arms &amp; Forearms</b> (Hands &amp; Feet survivable up to " + lossLimb + " limbs)";
+  else if (lvl >= 50) fatalParts = "<b>Head, Trunk, Thighs, Lower Legs &amp; Upper Arms</b> (Forearms, Hands &amp; Feet survivable; " + lossLimb + " limbs lost is fatal)";
+  else if (lvl >= 35) fatalParts = "<b>Head, Trunk, Thighs &amp; Lower Legs</b> (Arms, Forearms, Hands &amp; Feet survivable; " + lossLimb + " limbs lost is fatal)";
+  else if (lvl >= 20) fatalParts = "<b>Head, Trunk &amp; Thighs</b> (Lower Legs, Arms, Hands &amp; Feet survivable; " + lossLimb + " limbs lost is fatal)";
+  else fatalParts = "<b>Head &amp; Trunk only</b> (all 12 limb parts survivable individually; " + lossLimb + " limbs lost is fatal)";
+
+  return { title, vox, surv: "Non-survivable dismemberments: " + fatalParts + "." };
+}
+
+const CB = { on:0, blows:0, vulnhp:0, keepcfg:0, "peel.stages":1, "preset.id":0, "preset.base":50, lossLimb:4,
+  "who.npc":1, "who.essential":0, "who.follower":0, "who.player":0,
+  "player.skin":0, "player.flesh":0, "player.bones":0, "player.sever":0,
+  "reset.after":0, "reset.rate":0, "reset.hp":0, "drain.on":0, "drain.rate":4, "drain.secs":8, hitCd:250,
+  maxPieces:35 };   // the live-piece cap the DLL has in force, shown on the Engine page
+CB_WEAPONS.concat(CB_MAGIC).forEach(w => {
+  CB["w."+w[0]+".on"] = w[3]; CB["w."+w[0]+".form"] = w[4]; CB["w."+w[0]+".size"] = w[5]; CB["w."+w[0]+".depth"] = w[6];
+});
+CB["w.weapon.reach"] = 0;   // a blade's cut reach along the swing plane (0 = the config's CL reach)
+CB["power.perLevel"] = 20;  // % a level the damage the player's hits need rises; no part of a preset
+CB_TRIGS.forEach(t => { CB["t."+t[0]+".on"] = CB_TRIG_DEF[t[0]][0]; CB["t."+t[0]+".thr"] = CB_TRIG_DEF[t[0]][1]; CB["t."+t[0]+".window"] = 6; });
+
+function cbSet(key, val) {
+  CB[key] = val;
+  if (key !== "preset.id" && key !== "preset.base") {
+    markCustomPreset();
+  }
+  SEND("combat", { key, val });
+}
+function syncPlayerLayerHierarchy(pushChanges) {
+  const order = ["player.skin", "player.flesh", "player.bones", "player.sever"];
+  let prevAllowed = true;
+  for (let i = 0; i < order.length; i++) {
+    const k = order[i];
+    const btn = document.querySelector("#p-combat .sw.cb[data-k='" + k + "']");
+    const row = btn ? btn.closest(".row") : null;
+    if (!prevAllowed) {
+      if (CB[k]) {
+        CB[k] = 0;
+        if (pushChanges) SEND("combat", { key: k, val: 0 });
+      }
+      if (btn) {
+        btn.setAttribute("aria-pressed", "false");
+        btn.disabled = true;
+      }
+      if (row) row.style.opacity = "0.45";
+    } else {
+      if (btn) {
+        btn.disabled = false;
+        btn.setAttribute("aria-pressed", CB[k] ? "true" : "false");
+      }
+      if (row) row.style.opacity = "";
+    }
+    prevAllowed = prevAllowed && !!CB[k];
+  }
+}
+function cbFmt(inp, v) { const st = String(inp.step || "1"); const d = st.indexOf(".") >= 0 ? st.length - st.indexOf(".") - 1 : 0; return (+v).toFixed(d); }
+function cbTrigRowHtml(t) {
+  const key = t[0], on = CB["t."+key+".on"] ? "true" : "false", thr = +CB["t."+key+".thr"], win = +CB["t."+key+".window"];
+  let h = "<div class='wrow trow' data-t='"+key+"' data-off='"+(on==="true"?"0":"1")+"'>" +
+    "<div class='lab'><b>"+t[1]+"</b><small>"+t[2]+"</small></div>" +
+    "<div class='tctl'><div class='ctl'><button class='sw cb' data-k='t."+key+".on' aria-pressed='"+on+"' aria-label='"+t[1]+"'></button></div>";
+  if (t[5] > 0) h += "<div class='num'><input type='range' class='cbr' data-k='t."+key+".thr' min='"+t[3]+"' max='"+t[4]+"' step='"+t[5]+"' value='"+thr+"' aria-label='"+t[1]+" threshold'><output>"+thr+"</output><span class='unit'>"+t[6]+"</span></div>";
+  if (t[7]) h += "<div class='num'><span class='unit'>over</span><input type='range' class='cbr' data-k='t."+key+".window' min='0.5' max='60' step='0.5' value='"+win+"' aria-label='"+t[1]+" window'><output>"+win+"</output><span class='unit'>s</span></div>";
+  return h + "</div></div>";
+}
+function cbRowHtml(t, label, gloss, magic) {
+  const on = CB["w."+t+".on"] ? "true" : "false";
+  const form = CB["w."+t+".form"] | 0, size = +CB["w."+t+".size"], depth = CB["w."+t+".depth"] | 0;
+  if (magic) {
+    return "<div class='wrow' data-t='"+t+"' data-off='"+(on==="true"?"0":"1")+"' style='grid-template-columns:minmax(180px,1.4fr) auto minmax(160px,1fr)'>" +
+      "<div class='lab'><b>"+label+"</b>"+(gloss?"<small>"+gloss+"</small>":"")+"</div>" +
+      "<div class='ctl'><button class='sw cb' data-k='w."+t+".on' aria-pressed='"+on+"' aria-label='"+label+"'></button></div>" +
+      "<div class='num'><span class='unit'>Radius</span><input type='range' class='cbr' data-k='w."+t+".size' min='2' max='25' step='1' value='"+size+"' aria-label='"+label+" size'><output>"+size+"</output><span class='unit'>units</span></div></div>";
+  }
+  // -1: a blade cuts, a mace crushes, an arrow bores. Any other choice puts that form on every weapon.
+  const opts = "<option value='-1'"+(form<0?" selected":"")+">By weapon</option>" +
+    CB_FORMS.map((f, i) => "<option value='"+i+"'"+(i===form?" selected":"")+">"+CB_FORM_LABEL[f]+"</option>").join("");
+  return "<div class='wrow' data-t='"+t+"' data-off='"+(on==="true"?"0":"1")+"'>" +
+    "<div class='lab'><b>"+label+"</b>"+(gloss?"<small>"+gloss+"</small>":"")+"</div>" +
+    "<div class='ctl'><button class='sw cb' data-k='w."+t+".on' aria-pressed='"+on+"' aria-label='"+label+"'></button></div>" +
+    "<select class='pick cbsel' data-k='w."+t+".form' aria-label='"+label+" wound form'>"+opts+"</select>" +
+    "<div class='num'><input type='range' class='cbr' data-k='w."+t+".size' min='1' max='40' step='1' value='"+size+"' aria-label='"+label+" size'><output>"+size+"</output><span class='unit'>units</span></div>" +
+    "<div class='seg cbseg' data-k='w."+t+".depth' role='group' aria-label='"+label+" depth'>" +
+      "<button data-v='1' aria-pressed='"+(depth===1)+"'>Skin</button><button data-v='2' aria-pressed='"+(depth===2)+"'>Flesh</button><button data-v='3' aria-pressed='"+(depth===3)+"'>Bone</button></div></div>";
+}
+function cbBindWithin(root) {
+  root.querySelectorAll(".sw.cb").forEach(b => {
+    if (b.dataset.bound) return; b.dataset.bound = "1";
+    b.addEventListener("click", () => {
+      if (b.disabled) return;
+      const on = b.getAttribute("aria-pressed") !== "true";
+      b.setAttribute("aria-pressed", on);
+      cbSet(b.dataset.k, on ? 1 : 0);
+      const row = b.closest(".wrow"); if (row) row.dataset.off = on ? "0" : "1";
+      if (b.dataset.k && b.dataset.k.indexOf("player.") === 0) syncPlayerLayerHierarchy(true);
+    });
+    wired.push([b, "combat"]);
+  });
+  root.querySelectorAll(".cbseg").forEach(g => {
+    if (g.dataset.bound) return; g.dataset.bound = "1";
+    g.querySelectorAll("button").forEach(b => {
+      b.onclick = () => {
+        g.querySelectorAll("button").forEach(o => o.setAttribute("aria-pressed", o === b));
+        cbSet(g.dataset.k, +b.dataset.v);
+      };
+    });
+    wired.push([g, "combat"]);
+  });
+  root.querySelectorAll(".cbsel").forEach(sel => {
+    if (sel.dataset.bound) return; sel.dataset.bound = "1";
+    sel.onchange = () => { cbSet(sel.dataset.k, +sel.value); };
+    wired.push([sel, "combat"]);
+  });
+  root.querySelectorAll("input.cbr").forEach(inp => {
+    if (inp.dataset.bound) return; inp.dataset.bound = "1";
+    const out = inp.parentElement.querySelector("output");
+    const show = () => { if (out) out.textContent = cbFmt(inp, inp.value); };
+    inp.oninput = show; inp.onchange = () => cbSet(inp.dataset.k, +inp.value); show();
+    wired.push([inp, "combat"]);
+  });
+}
+function renderPresets() {
+  const host = document.getElementById("cbPresets");
+  if (!host) return;
+  const rawPid = CB["preset.id"] !== undefined ? (CB["preset.id"] | 0) : (CB.on ? 50 : 0);
+  const isCustom = rawPid < 0;
+  const sliderVal = isCustom
+    ? Math.max(0, Math.min(100, (CB["preset.base"] !== undefined ? CB["preset.base"] : 50) | 0))
+    : (CB.on ? Math.max(0, Math.min(100, rawPid)) : 0);
+  const info = describeIntensity(isCustom ? -1 : sliderVal);
+  const titleHtml = isCustom
+    ? "Custom <span style='font:500 11px/1 var(--mono);padding:3px 7px;margin-left:6px;border:1px solid var(--warn);color:var(--warn)'>MODIFIED OUTSIDE PRESET</span>"
+    : (sliderVal + "% &middot; " + info.title);
+
+  host.innerHTML =
+    "<div style='display:flex;flex-direction:column;gap:12px'>" +
+      "<div style='display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px'>" +
+        "<span id='cbIntTitle' style='font:600 15px/1.3 var(--sans);color:" + (isCustom ? "var(--warn)" : "var(--accent)") + "'>" + titleHtml + "</span>" +
+        (isCustom
+          ? "<button class='btn q' id='cbReapplyPreset' style='padding:4px 10px;font-size:11.5px'>Re-apply " + sliderVal + "% Preset</button>"
+          : "<span style='font:400 11.5px/1.3 var(--mono);color:var(--dim)'>0% Disabled &rarr; 50% Finishing Blows &rarr; 100% Gorefest</span>") +
+      "</div>" +
+      "<input type='range' id='cbIntensitySlider' min='0' max='100' step='1' value='" + sliderVal + "' style='width:100%' aria-label='Combat Intensity'>" +
+      "<div style='display:flex;justify-content:space-between;gap:8px'>" +
+        "<button class='btn cbmark' data-v='0' style='flex:1;text-align:left;padding:6px 10px'><b>0% &middot; Disabled</b><br><small style='color:var(--dim)'>Combat blows do not voxelise</small></button>" +
+        "<button class='btn cbmark' data-v='50' style='flex:1;text-align:center;padding:6px 10px'><b>50% &middot; Finishing Blows</b><br><small style='color:var(--dim)'>Wounds &amp; lethal severs below 50% HP</small></button>" +
+        "<button class='btn cbmark' data-v='100' style='flex:1;text-align:right;padding:6px 10px'><b>100% &middot; Gorefest</b><br><small style='color:var(--dim)'>Every hit cleaves to bone; all severs fatal</small></button>" +
+      "</div>" +
+      "<div style='background:var(--bg);border:1px solid var(--line);padding:11px 14px;display:flex;flex-direction:column;gap:6px;font:400 12px/1.55 var(--sans)'>" +
+        "<div id='cbIntVox'><span style='color:var(--ink);font-weight:600'>Voxelisation Likelihood:</span> <span style='color:var(--dim)'>" + info.vox + "</span></div>" +
+        "<div id='cbIntSurv'><span style='color:var(--ink);font-weight:600'>Dismemberment Survivability:</span> <span style='color:var(--dim)'>" + info.surv + "</span></div>" +
+      "</div>" +
+    "</div>";
+
+  const sl = document.getElementById("cbIntensitySlider");
+  const updatePreview = (v) => {
+    // Live body preview: paint the map this level would apply, without committing it.
+    if (state.mode !== "cfg") setMode("cfg");   // the slider previews survivability rules; Live Body State would hide them
+    state.previewFatal = presetFatalMap(v);
+    draw();
+    const llV = document.getElementById("lossLimbV"), ll = document.getElementById("lossLimb");
+    if (llV) llV.textContent = String(presetLossLimb(v));
+    if (ll) ll.value = presetLossLimb(v);
+    const inf = describeIntensity(v);
+    const tEl = document.getElementById("cbIntTitle");
+    const vEl = document.getElementById("cbIntVox");
+    const sEl = document.getElementById("cbIntSurv");
+    if (tEl) { tEl.style.color = "var(--accent)"; tEl.innerHTML = v + "% &middot; " + inf.title; }
+    if (vEl) vEl.innerHTML = "<span style='color:var(--ink);font-weight:600'>Voxelisation Likelihood:</span> <span style='color:var(--dim)'>" + inf.vox + "</span>";
+    if (sEl) sEl.innerHTML = "<span style='color:var(--ink);font-weight:600'>Dismemberment Survivability:</span> <span style='color:var(--dim)'>" + inf.surv + "</span>";
+  };
+  const commitIntensity = (v) => {
+    v = Math.max(0, Math.min(100, v | 0));
+    // The DLL answers with the authoritative fatal map; until it does, show the one it will apply.
+    Object.assign(state.fatal, presetFatalMap(v));
+    state.previewFatal = null;
+    CB.lossLimb = presetLossLimb(v);
+    draw(); renderSel(); lethalAllRefresh();
+    CB["preset.id"] = v;
+    CB["preset.base"] = v;
+    CB.on = v > 0 ? 1 : 0;
+    if (sl) sl.value = v;
+    renderPresets();
+    SEND("preset", { id: v });
+  };
+  if (sl) {
+    sl.oninput = () => updatePreview(+sl.value);
+    sl.onchange = () => commitIntensity(+sl.value);
+    wired.push([sl, "preset"]);
+  }
+  const reapply = document.getElementById("cbReapplyPreset");
+  if (reapply) {
+    reapply.onclick = () => commitIntensity(sliderVal);
+  }
+  host.querySelectorAll("button.cbmark").forEach(b => {
+    b.onclick = () => commitIntensity(+b.dataset.v);
+    wired.push([b, "preset"]);
+  });
+}
+function renderCombat() {
+  renderPresets();
+  if (CB.lossLimb !== undefined) {
+    const ll = document.getElementById("lossLimb"), llV = document.getElementById("lossLimbV");
+    if (ll) ll.value = CB.lossLimb;
+    if (llV) llV.textContent = String(CB.lossLimb);
+  }
+  document.getElementById("cbTriggers").innerHTML = CB_TRIGS.map(cbTrigRowHtml).join("");
+  document.getElementById("cbWeapons").innerHTML = CB_WEAPONS.map(w => cbRowHtml(w[0], w[1], w[2], false)).join("");
+  document.getElementById("cbMagic").innerHTML   = CB_MAGIC.map(w => cbRowHtml(w[0], w[1], w[2], true)).join("");
+  document.querySelectorAll("#p-combat .sw.cb").forEach(b => { if (b.dataset.k in CB) b.setAttribute("aria-pressed", CB[b.dataset.k] ? "true" : "false"); });
+  document.querySelectorAll("#p-combat .cbseg").forEach(g => { if (g.dataset.k in CB) g.querySelectorAll("button").forEach(o => o.setAttribute("aria-pressed", (+o.dataset.v) === (CB[g.dataset.k] | 0))); });
+  document.querySelectorAll("#p-combat select.cbsel").forEach(sel => { if (sel.dataset.k in CB) sel.value = String(CB[sel.dataset.k] | 0); });
+  document.querySelectorAll("#p-combat input.cbr").forEach(inp => { if (inp.dataset.k in CB) { inp.value = CB[inp.dataset.k]; const o = inp.parentElement.querySelector("output"); if (o) o.textContent = cbFmt(inp, CB[inp.dataset.k]); } });
+  document.getElementById("cbDrainRow").dataset.off = CB["drain.on"] ? "0" : "1";
+  const vul = document.getElementById("cbVuln"); vul.value = CB.vulnhp; document.getElementById("cbVulnV").textContent = CB.vulnhp > 0 ? String(CB.vulnhp) : "always";
+  const ra = document.getElementById("cbResetAfter"); ra.value = CB["reset.after"]; document.getElementById("cbResetAfterV").textContent = CB["reset.after"] > 0 ? String(CB["reset.after"]) : "never";
+  const rh = document.getElementById("cbResetHp"); rh.value = CB["reset.hp"]; document.getElementById("cbResetHpV").textContent = CB["reset.hp"] > 0 ? String(CB["reset.hp"]) : "never";
+  const rr = document.getElementById("cbResetRate"); rr.value = CB["reset.rate"]; document.getElementById("cbResetRateV").textContent = CB["reset.rate"] > 0 ? String(CB["reset.rate"]) : "at once";
+  const cd = document.getElementById("hitCd"); if (cd && CB.hitCd !== undefined) { cd.value = CB.hitCd; const o = document.getElementById("hitCdV"); if (o) o.textContent = String(CB.hitCd); }
+  const mp = document.getElementById("maxPieces"); if (mp && CB.maxPieces !== undefined) { mp.value = CB.maxPieces; const o = document.getElementById("maxPiecesV"); if (o) o.textContent = CB.maxPieces > 0 ? String(CB.maxPieces) : "no limit"; }
+  cbBindWithin(document.getElementById("p-combat"));
+  syncPlayerLayerHierarchy(false);
+  markApplied();
+}
+(function () {
+  const bind = (id, key, fmt) => {
+    const inp = document.getElementById(id), out = document.getElementById(id + "V");
+    inp.oninput = () => { out.textContent = fmt(+inp.value); };
+    inp.onchange = () => { cbSet(key, +inp.value); out.textContent = fmt(+inp.value); };
+    wired.push([inp, "combat"]);
+  };
+  bind("cbVuln", "vulnhp", v => v > 0 ? String(v) : "always");
+  bind("cbResetAfter", "reset.after", v => v > 0 ? String(v) : "never");
+  bind("cbResetHp", "reset.hp", v => v > 0 ? String(v) : "never");
+  bind("cbResetRate", "reset.rate", v => v > 0 ? String(v) : "at once");
+  const ts = document.getElementById("tstSize"), tsV = document.getElementById("tstSizeV");
+  if (ts && tsV) { ts.oninput = () => { tsV.textContent = (+ts.value).toFixed(1); }; }
+  const btnStrike = document.getElementById("tstStrike"), btnRest = document.getElementById("tstRestore");
+  if (btnStrike) {
+    btnStrike.onclick = () => {
+      const target = +(document.getElementById("tstTarget").value || 0);
+      const part   = document.getElementById("tstPart").value || "chest";
+      const fam    = document.getElementById("tstFam").value || "weapon";
+      const size   = +(document.getElementById("tstSize").value || 8.5);
+      document.getElementById("testReportLog").textContent = "Executing test strike on " + part + " (" + fam + ")...";
+      SEND("testStrike", { target, part, fam, size });
+    };
+    wired.push([btnStrike, "testStrike"]);
+  }
+  if (btnRest) {
+    btnRest.onclick = () => {
+      const target = +(document.getElementById("tstTarget").value || 0);
+      document.getElementById("testReportLog").textContent = "Restoring target body and armour...";
+      SEND("testRestore", { target });
+    };
+    wired.push([btnRest, "testRestore"]);
+  }
+})();
+
+const TITLES = { body:"The Body", combat:"Combat", spells:"Spells", engine:"Engine", diag:"Diagnostics" };
+document.querySelectorAll("#nav button").forEach(b => {
+  b.onclick = () => {
+    document.querySelectorAll("#nav button").forEach(o => o.setAttribute("aria-current", o === b));
+    Object.keys(TITLES).forEach(k => document.getElementById("p-" + k).hidden = (k !== b.dataset.p));
+    document.getElementById("ptitle").textContent = TITLES[b.dataset.p];
+  };
+});
+document.getElementById("askWhy").onclick = () => SEND("whynot", { target: "crosshair" });
+document.addEventListener("keydown", e => { if (e.key === "Escape") SEND("close", {}); });
+
+window.fcApply = function (json) {
+  let d; try { d = typeof json === "string" ? JSON.parse(json) : json; } catch (e) { return; }
+  if (Array.isArray(d.applied)) { applied = d.applied; markApplied(); }
+  if (d.live)   { Object.assign(state.live, d.live); draw(); renderSel(); }
+  if (d.fatal)  { state.previewFatal = null; Object.assign(state.fatal, d.fatal); draw(); renderSel(); lethalAllRefresh(); }
+  if (d.combat) { Object.assign(CB, d.combat); renderCombat(); }
+  // The DLL pushes every GRANTED id (PanelPush walks g_panel.grant); an id it does not name is not granted.
+  // Known ids only: an id the panel does not know is neither merged nor counted.
+  if (d.spells) { for (const k of Object.keys(state.spells)) state.spells[k] = !!d.spells[k]; renderSpells(); }
+  if (d.armed !== undefined) {
+    const p = document.getElementById("armed");
+    p.className = "pill " + (d.armed ? "ok" : "no");
+    p.innerHTML = '<span class="dot"></span>' + (d.armed ? "ENGINE ARMED" : "NOT ARMED");
+  }
+  if (d.banner) {
+    document.getElementById("banner").textContent = d.banner;
+    const db = document.getElementById("dBanner"); if (db) db.textContent = d.banner;
+  }
+  if (d.whynot)   document.getElementById("whyLog").textContent = d.whynot;
+  if (d.lastWound) document.getElementById("lastWound").textContent = d.lastWound;
+  if (d.testReport) {
+    const tr = document.getElementById("testReportLog");
+    if (tr) tr.textContent = d.testReport;
+  }
+};
+
+buildFigure(); renderSel(); renderSpells(); countSpells(); lethalAllRefresh(); renderCombat();
+(function ready(tries) {
+  if (typeof window.fcSet === "function") { SEND("ready", {}); return; }
+  if (tries > 0) setTimeout(function () { ready(tries - 1); }, 200);
+})(50);
+</script>
