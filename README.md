@@ -8,9 +8,9 @@
 
 ---
 
-[![FleshCore Announcement Trailer](docs/images/fleshcore_trailer_preview.gif)](https://tacticalcoconut.github.io/FleshCore/trailer.html)
-
 ## Overview & How FleshCore Works
+
+[![FleshCore Announcement Trailer](docs/images/fleshcore_trailer_preview.gif)](https://tacticalcoconut.github.io/FleshCore/trailer.html)
 
 Unlike traditional dismemberment mods that swap pre-made limb stumps at fixed skeleton joints, **FleshCore** turns playable-race characters into a live 3D anatomical volume built directly from their equipped body and armor meshes when they load or take a hit.
 
