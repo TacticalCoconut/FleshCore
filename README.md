@@ -12,8 +12,6 @@
 
 [![FleshCore Announcement Trailer](docs/images/fleshcore_trailer_preview.gif)](https://tacticalcoconut.github.io/FleshCore/trailer.html)
 
-**[▶ Watch the Full 1080p60 Announcement Trailer with Audio](https://tacticalcoconut.github.io/FleshCore/trailer.html)** · **[Download Full-Bitrate Trailer (.mp4)](https://github.com/TacticalCoconut/FleshCore/releases/download/v0.1-beta/FleshCore_Announcement_Trailer.mp4)**
-
 ---
 
 ## Overview & How FleshCore Works
