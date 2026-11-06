@@ -8,6 +8,14 @@
 
 ---
 
+## Announcement Trailer
+
+[![FleshCore Announcement Trailer](docs/images/fleshcore_trailer_preview.gif)](https://tacticalcoconut.github.io/FleshCore/trailer.html)
+
+**[▶ Watch the Full 1080p60 Announcement Trailer with Audio](https://tacticalcoconut.github.io/FleshCore/trailer.html)** · **[Download Full-Bitrate Trailer (.mp4)](https://github.com/TacticalCoconut/FleshCore/releases/download/v0.1-beta/FleshCore_Announcement_Trailer.mp4)**
+
+---
+
 ## Overview & How FleshCore Works
 
 Unlike traditional dismemberment mods that swap pre-made limb stumps at fixed skeleton joints, **FleshCore** turns playable-race characters into a live 3D anatomical volume built directly from their equipped body and armor meshes when they load or take a hit.
