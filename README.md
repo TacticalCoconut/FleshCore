@@ -129,6 +129,8 @@ FleshCore hooks hit events passively through SKSE without editing vanilla weapon
 
 ## Documentation for Modders (`FL_Api`)
 
+> **Disclaimer: This Mod was used with the assistance of AI Code Generation.
+
 Other mods can trigger wounds, sever limbs, restore actors, query anatomical state, and subscribe to real-time dismemberment ModEvents through a single global script — **`FL_Api`** — with **no master file (`FleshCore.esp` is not required as a master)** and **no hard dependency**.
 
 - **Full Developer Reference**: See **[FleshCore-API.md](FleshCore-API.md)** for the complete reference covering every function, wound form, body-part token, ModEvent signature, and configuration command.
