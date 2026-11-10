@@ -6,7 +6,7 @@
 >
 > **Beta Release (`Beta v0.1`):** This is the first public beta release of FleshCore. Expect rough edges as edge cases across custom outfits and load orders are refined.
 
-> **Disclaimer: This Mod was used with the assistance of AI Code Generation.
+> **Disclaimer: This Mod was made with the assistance of AI Code Generation.
 
 ---
 
@@ -131,7 +131,7 @@ FleshCore hooks hit events passively through SKSE without editing vanilla weapon
 
 ## Documentation for Modders (`FL_Api`)
 
-> **Disclaimer: This Mod was used with the assistance of AI Code Generation.
+> **Disclaimer: This Mod was made with the assistance of AI Code Generation.
 
 Other mods can trigger wounds, sever limbs, restore actors, query anatomical state, and subscribe to real-time dismemberment ModEvents through a single global script — **`FL_Api`** — with **no master file (`FleshCore.esp` is not required as a master)** and **no hard dependency**.
 
