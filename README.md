@@ -1,6 +1,6 @@
 # FleshCore (Beta v0.1)
 
-**Real-time volumetric dismemberment, layered anatomical wounds, and physics-enabled severed body parts for Skyrim Special Edition (1.6.1170), with full in-game customization and a zero-dependency Papyrus API (`FL_Api`) for other modders.**
+**Real-time volumetric dismemberment, layered anatomical wounds, and physics-enabled severed body parts for Skyrim Special Edition (Steam 1.6.1170 only), with full in-game customization and a Papyrus API (`FL_Api`) that other mods can call without making `FleshCore.esp` a master.**
 
 > **Content Warning (18+ Gore):** FleshCore renders graphic anatomical gore (skin, subcutaneous fat, muscle, and bone excavation).
 >
@@ -91,13 +91,26 @@ FleshCore includes both a dedicated **PrismaUI HQ Panel** (opened anytime in-gam
 ## Requirements & Mod Compatibility
 
 ### Hard Requirements
-- **Skyrim Special Edition / Anniversary Edition `1.6.1170`** *(FleshCore's SKSE DLL verifies runtime `1.6.1170` at load and refuses other versions)*
-- **[SKSE64](https://skse.silverlock.org/)** (`2.2.6` or newer)
+- **Skyrim Special Edition / Anniversary Edition `1.6.1170`, Steam version only** — FleshCore's SKSE plugin is made for this one game version and does not run on any other: not Skyrim `1.7.x`, not older `1.6` builds, not the GOG version, and not SE `1.5.97`. There is no build for `1.7.x`; if Steam has updated your game past `1.6.1170`, FleshCore will not run until the game is back on `1.6.1170`.
+- **[SKSE64](https://skse.silverlock.org/) `2.2.6`, Steam build** — The build FleshCore is tested with. Get the Steam build of `2.2.6` from the SKSE site's archived builds or from [GitHub](https://github.com/ianpatt/skse64/releases/tag/v2.2.6), not the newest SKSE and not the GOG build of `2.2.6`: SKSE `2.3.x` is for Skyrim `1.7.x` and will not start `1.6.1170`, and the GOG build is made for the GOG version of the game, not the Steam one.
+- **[Address Library for SKSE Plugins](https://www.nexusmods.com/skyrimspecialedition/mods/32444)** (All in one, Anniversary Edition) — powerofthree's Papyrus Extender and PrismaUI need it. FleshCore's own DLL does not use it: its engine addresses are hard-coded for `1.6.1170`, so Address Library cannot make FleshCore run on another game version.
+- **[XP32 Maximum Skeleton Special Extended (XPMSSE)](https://www.nexusmods.com/skyrimspecialedition/mods/1988)** — FleshCore's included bodies are rigged to its extended bones.
 - **[PapyrusUtil SE](https://www.nexusmods.com/skyrimspecialedition/mods/13048)**
 - **[powerofthree's Papyrus Extender](https://www.nexusmods.com/skyrimspecialedition/mods/22854)**
-- **[PrismaUI](https://www.nexusmods.com/skyrimspecialedition/mods/140844)** — Powers the interactive in-game **FleshCore HQ** control panel (double-tap `.` in game)
+- **[PrismaUI](https://www.nexusmods.com/skyrimspecialedition/mods/148718)** — Powers the interactive in-game **FleshCore HQ** control panel (double-tap `.` in game)
 - **[SkyUI](https://www.nexusmods.com/skyrimspecialedition/mods/12604)** — For the SkyUI MCM configuration pages
 - **[RaceMenu](https://www.nexusmods.com/skyrimspecialedition/mods/19080)** — For surface blood/decal overlay support (`DC_Api`)
+
+If a requirement's page offers separate files for different game versions, take the one for Skyrim `1.6.1170`.
+
+### Body Mods (Read Before Installing)
+
+FleshCore includes its own bodies with muscle and bone built in: a female body built from a BodySlide set that comes with a **CBBE 3BA** add-on (not with CBBE 3BA itself) and a male body built from a **HIMBO** BodySlide set. Their hands and feet are included too, with muscle but no bone. FleshCore's bodies are nude: they carry no underwear shapes.
+
+- **They replace your body meshes.** These 12 files (body, hands, and feet, in both weights) replace the ones from your body mod and from your BodySlide output, so whichever mod wins those files decides which body your characters use. For FleshCore's built-in anatomy, FleshCore has to win: in MO2, place FleshCore below your body mod and your BodySlide output in the left pane (files in MO2's Overwrite folder always win, so move a BodySlide output there into its own mod first); in Vortex, set FleshCore to load after your body mod in the Mods tab, and because Vortex has no Overwrite folder, set BodySlide's output path to a folder you install as a mod and set FleshCore to load after that mod too. Plugin order does not decide this. After any later BodySlide build, check that FleshCore still wins these files.
+- **Body presets.** FleshCore includes no `.tri` morph files, so OBody and RaceMenu body presets use the ones in your install, and those only fit FleshCore's bodies if they were built in BodySlide, with Build Morphs on, from the same two sets as FleshCore's bodies. The `.tri` files from the stock CBBE 3BA and HIMBO bodies, or from any other set, do not match. Presets reshape the skin only; the anatomy inside keeps FleshCore's own shape.
+- **If your body mod wins instead,** bodies are still cut, but naked NPCs have nothing drawn inside them, so their wounds look hollow.
+- **Other bodies (`BHUNP`, `UNP`, and others)** have no anatomy made for them and are untested. If FleshCore wins the file conflict, your characters use FleshCore's CBBE 3BA- and HIMBO-based bodies instead of yours.
 
 ### Combat, Animation & Body Mod Compatibility
 
@@ -110,7 +123,8 @@ FleshCore hooks hit events passively through SKSE without editing vanilla weapon
 | **Attack Animation Frameworks (`MCO / ADXP`, `BFCO`, `SCAR`, `OAR`, `DAR`)** | **Compatible** | Custom attack animations fire standard hit events and update the weapon node transform normally, so dynamic blade angles and cuts work seamlessly. |
 | **Combat Overhauls (`Valhalla Combat`, `Wildcat`, `Smilodon`, `Blade & Blunt`)** | **Compatible** | FleshCore never alters weapon damage, stamina costs, timed blocks, or stagger; it reads final hit damage after your combat mods calculate it. |
 | **Custom Weapon Packs (`Animated Armoury`, `Heavy Armory`, etc.)** | **Compatible** | Weapons are classified automatically by their weapon animation type (dagger, sword, war axe, greatsword, battleaxe, mace, warhammer, bow, crossbow). |
-| **Skeletons, Body Replacers & Outfits (`XPMSSE`, `CBBE 3BA`, `BHUNP`, `HIMBO`)** | **Compatible** | FleshCore builds its 3D lattice directly from the actor's live skinned body and outfit meshes. |
+| **Body Replacers (`CBBE 3BA`, `HIMBO`)** | **Built For** | FleshCore's own bodies are built from BodySlide sets for these (the female set comes with a CBBE 3BA add-on) and replace their body, hands, and feet meshes. See **Body Mods** above. |
+| **Other Body Replacers (`BHUNP`, `UNP`, etc.)** | **Untested** | No anatomy is made for them, and FleshCore's bodies replace theirs when FleshCore wins the file conflict. See **Body Mods** above. |
 | **Acheron & Frozen Electrocuted Combustion (`FEC`)** | **Compatible** | Explicitly detected at runtime so defeat states and elemental death effects do not conflict with FleshCore wounds. |
 | **Dismembering Framework (`DF`)** | **Soft-Compatible (Caveat)** | Can coexist in the same load order, *provided* both mods do not attempt to dismember the exact same human NPC on the same hit (DF swaps limbs with stump armor pieces, which conflicts if applied to a limb FleshCore is actively carving). |
 | **Maximum Carnage (`MC`) / Next-Gen Decapitations** | **Incompatible on Same Target** | Maximum Carnage replaces the victim's entire 3D body with pre-made gore meshes on death, which overwrites FleshCore's live mesh wounds on that actor. |
@@ -121,8 +135,9 @@ FleshCore hooks hit events passively through SKSE without editing vanilla weapon
 
 1. Download **`FleshCore.zip`** from the **Releases** page.
 2. Open your Mod Manager of choice (**Mod Organizer 2** or **Vortex**), choose **Install from Archive**, and select **`FleshCore.zip`**.
-3. Enable **FleshCore** in your mod list and ensure both **`FleshCore.esp`** and **`FleshCore - Skin Fill.esp`** are enabled in your plugin load order.
-4. **In-Game Controls**:
+3. **Decide which body meshes win:** FleshCore's bodies must win the file conflict with your body mod and your BodySlide output for its built-in anatomy to show (see **Body Mods** above).
+4. Enable **FleshCore** in your mod list and ensure both **`FleshCore.esp`** and **`FleshCore - Skin Fill.esp`** are enabled in your plugin load order.
+5. **In-Game Controls**:
    - **Double-tap `.` (Period key)** at any time in game to open the **FleshCore HQ** panel (requires PrismaUI) — drag the **Combat Intensity** preset slider or customize per-part survivability, weapon triggers, actor restoration, and optional test spells.
    - Or open **Pause Menu -> Mod Configuration -> FleshCore** (requires SkyUI).
    - *Note:* No debug spells are added to the player's spellbook automatically; you can grant or revoke any of the test spells from the HQ panel or MCM.
