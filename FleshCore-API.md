@@ -11,8 +11,8 @@ spells for testing, and other mods call `FL_Api`.
 
 | | |
 |---|---|
-| **Required** | Skyrim SE/AE 1.6.1170, Steam version only (not 1.7.x, older 1.6 builds, GOG or SE 1.5.97) · SKSE64 2.2.6, Steam build (not 2.3.x, which is for 1.7.x, and not the GOG build) · Address Library for SKSE Plugins (for powerofthree's Papyrus Extender and PrismaUI; FleshCore's DLL does not use it) · XPMSSE (FleshCore's bodies use its bones) · PapyrusUtil · powerofthree's Papyrus Extender · PrismaUI (the HQ, the mod's own menu) · SkyUI (the MCM) · RaceMenu (marks on skin) |
-| **Body meshes** | FleshCore ships its own CBBE 3BA- and HIMBO-based body, hands and feet meshes. They replace the body, hands and feet meshes from the installed body mod and BodySlide output, and must win both file conflicts for the built-in anatomy to show; see the README's **Body Mods** section. |
+| **Required** | Skyrim SE/AE 1.6.1170, Steam version only (not 1.7.x, older 1.6 builds, GOG or SE 1.5.97) · SKSE64 2.2.6, Steam build (not 2.3.x, which is for 1.7.x, and not the GOG build) · Address Library for SKSE Plugins (for PapyrusUtil, powerofthree's Papyrus Extender and PrismaUI; FleshCore's DLL does not use it) · XPMSSE (FleshCore's bodies use its bones) · PapyrusUtil · powerofthree's Papyrus Extender · PrismaUI (the HQ, the mod's own menu) · SkyUI (the MCM) · RaceMenu (marks on skin) |
+| **Body meshes** | FleshCore ships its own body, hands and feet meshes, built for CBBE 3BA and HIMBO; the female body also uses textures from CBBE 3BA and from a CBBE 3BA add-on that FleshCore does not include. Where these meshes win the file conflicts with the installed body mod and BodySlide output, they replace those meshes; naked bodies need them to win for the built-in anatomy to show. See the README's **Body Mods** section. |
 | **Detected, optional** | Acheron · Dismembering Framework |
 | **Masters** | `Skyrim.esm` only. FleshCore is not ESL-flagged. |
 
