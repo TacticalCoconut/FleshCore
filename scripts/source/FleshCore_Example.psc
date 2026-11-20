@@ -2,8 +2,8 @@ Scriptname FleshCore_Example extends Quest
 {THE EXAMPLE CONSUMER. Two hundred lines that do one useful thing end to end, and
  the thing every developer copies before reading a word of documentation.
 
- This is a consumer's pattern -- the only third-party-shaped consumer FleshCore has
- ever had -- written down against FL_Api: gate on presence, gate on armed,
+ This is the pattern a mod that uses FleshCore follows, written down against
+ FL_Api: gate on presence, gate on armed,
  gate on eligibility, act, listen for the answer, fall back at every step.
  It compiles beside the reference so it cannot rot.
 
@@ -75,7 +75,7 @@ Function ProtectMyCompanion(Actor target, Bool on)
     {THE REGISTRY. A rule is a line any mod may write: a key, a value,
      your caller id, a priority. `immune` is any-true-wins, so no other mod can
      un-protect them; scalar keys go to the highest prio. Rules live for the
-     session -- set them when your scene starts, clear them when it ends.}
+     session -- set them when your encounter starts, clear them when it ends.}
     If !Game.IsPluginInstalled("FleshCore.esp") || !FL_Api.Has("registry")
         Return
     EndIf
@@ -105,7 +105,7 @@ Function MakeThemFragile(Actor target, Bool on)
 EndFunction
 
 Function SayWhy(Actor target)
-    {WhyNot: one word for a log line, so a scene that fell back can
+    {WhyNot: one word for a log line, so a mod that fell back can
      say why without a debugger. `ok` is the only word that means yes.}
     If Game.IsPluginInstalled("FleshCore.esp") && FL_Api.Has("whynot")
         Debug.Trace("[Example] FleshCore on " + target + ": " + FL_Api.WhyNot(target))
@@ -157,17 +157,8 @@ Event OnFLWounded(String eventName, String strArg, Float numArg, Form sender)
         + FL_Api.PartRemaining(remain, "lthigh") + "%")
 EndEvent
 
-Function WhenTheSceneEnds()
-    {A SCENE RULE: when a the scene framework scene with a creature ends,
-     detonate the victim. One line, no listener of your own.}
-    If Game.IsPluginInstalled("FleshCore.esp") && FL_Api.Has("scenes")
-        Int id = FL_Api.AddSceneRule("Example", "end", "creature", "", "victim", "detonate")
-        Debug.Trace("[Example] scene rule " + id)
-    EndIf
-EndFunction
-
 Function Fallback(Actor target)
-    {Whatever your mod did before FleshCore existed. a consumer hands them to the
-     Dismembering Framework here; a simpler mod just kills them.}
+    {Whatever your mod did before FleshCore existed. A mod might hand them to
+     another dismemberment mod here; a simpler mod just kills them.}
     target.Kill(None)
 EndFunction

@@ -123,6 +123,7 @@ void Lattice::Build(const std::vector<ShapeData>& shapes,
     boneSeed.clear();
     bridge.clear();
     severed.clear();
+    bareLinks = 0;
     shapeLayer.clear();
     triCell.assign(tris.size(), std::vector<std::uint16_t>());
     cellCount = 0;
@@ -1255,7 +1256,7 @@ static constexpr const char* const kFormNames[] = {
     "borex", "borey", "borez",
     "scatter", "all", "layerz", "halve", "grind",
     "diagf", "diags", "neck", "midhead", "crown", "restore",
-    "layerx", "layery", "detonate",
+    "layerx", "layery", "detonate", "cutx",
 };
 
 // AND THE CHECK IS PER NAME, NOT A COUNT.
@@ -1285,7 +1286,7 @@ FC_PIN(DiagF,      "diagf");   FC_PIN(DiagS,  "diags");
 FC_PIN(Neck,       "neck");    FC_PIN(MidHead, "midhead");
 FC_PIN(Crown,      "crown");   FC_PIN(Restore, "restore");
 FC_PIN(LayerX,     "layerx");  FC_PIN(LayerY, "layery");
-FC_PIN(Detonate,   "detonate");
+FC_PIN(Detonate,   "detonate"); FC_PIN(CutX,  "cutx");
 #undef FC_PIN
 static_assert(sizeof(kFormNames) / sizeof(*kFormNames)
                   == static_cast<std::size_t>(Lattice::Form::Count),
@@ -1417,7 +1418,6 @@ bool Lattice::FormFromName(const std::string& s, Form& out)
 {
     for (int i = 0; i < int(Form::Count); ++i)
         if (_stricmp(s.c_str(), kFormNames[i]) == 0) { out = Form(i); return true; }
-    if (_stricmp(s.c_str(), "detonatealt") == 0) { out = Form::Detonate; return true; }
     return false;
 }
 
@@ -1487,6 +1487,7 @@ std::vector<Key> Lattice::SelectPlane(const float p[3], const float nIn[3], floa
     lastPlaneParts = parts;
     lastPlaneReach = (reach > 0.0f) ? reach : 0.0f;
     lastPlaneHalf = a;                                 // the fallback below widens it
+    lastPlaneOnColumn = false;                         // a plane with a normal is sided by centroid
     haveLastPlane = true;
     const float r2 = lastPlaneReach * lastPlaneReach;
     // Signed distance to the plane, and the squared distance from the impact
@@ -1549,6 +1550,7 @@ std::vector<Key> Lattice::Select(Form f, const float p[3], float a, int count,
     if (maxTotal < 1) maxTotal = 1;
     haveLastPlane = false;
     lastPlaneReach = 0.0f;   // a reach belongs to ONE plane; Layer/Halve/Neck/MidHead/Crown set none
+    lastPlaneOnColumn = false;   // and so does a column: CutX alone sets one
 
     switch (f) {
     case Form::Bite:
@@ -2065,6 +2067,46 @@ std::vector<Key> Lattice::Select(Form f, const float p[3], float a, int count,
         return out;
     }
 
+    case Form::CutX: {
+        // A PLANE AND NO CELL. See the enum for why nothing is selected.
+        //
+        // WHICH COLUMNS THEY STILL HAVE. The plane has to lie between two of
+        // them, so the extent is taken over what is alive -- in the wound's
+        // own layers and parts, the way every other form reads "alive".
+        bool any = false;
+        std::int32_t xlo = 0, xhi = 0;
+        for (const auto& [k, C] : cells) {
+            if (!C.Alive(mask, parts)) continue;
+            if (!any) { xlo = xhi = k.x; any = true; }
+            else { if (k.x < xlo) xlo = k.x; if (k.x > xhi) xhi = k.x; }
+        }
+        // Nothing alive, or a single column of it: no boundary has anything
+        // on both sides. No plane is recorded, and the caller says so.
+        if (!any || xlo == xhi) return {};
+        // THE BOUNDARY NEAREST THE SEED, named by the column that begins its
+        // +x side. A slab's plane passes through the seed and takes whatever
+        // column its centroids fall in; this one is moved to the nearest
+        // column boundary instead, so no cell straddles it. It is held
+        // strictly inside what is alive -- a seed past their outermost
+        // column parts that column from the rest, and both sides always hold
+        // a living cell. The comparison is made on the float: a seed that is
+        // not a number, or is far off the body, never reaches the integer
+        // conversion.
+        const float want = std::floor(p[0] / cell + 0.5f);
+        std::int32_t col = 0;
+        if (!(want > float(xlo)))      col = xlo + 1;
+        else if (!(want < float(xhi))) col = xhi;
+        else                           col = std::int32_t(want);
+        lastPlaneP[0] = float(col) * cell; lastPlaneP[1] = p[1]; lastPlaneP[2] = p[2];
+        lastPlaneN[0] = 1.0f; lastPlaneN[1] = 0.0f; lastPlaneN[2] = 0.0f;
+        lastPlaneParts = parts;
+        lastPlaneReach = 0.0f;                 // a cut in half goes all the way through them
+        lastPlaneColumn = col;
+        lastPlaneOnColumn = true;
+        haveLastPlane = true;
+        return {};
+    }
+
     // Dispatched long before this in flesh.cpp; here so the switch is total.
     case Form::Restore: return {};
 
@@ -2143,6 +2185,16 @@ std::size_t Lattice::SeverPlane()
     lastPlaneReach = 0.0f;
     const float rr = (reach > 0.0f) ? reach + cell : 0.0f;
     const float r2 = rr * rr;
+    // A PLANE ON A COLUMN BOUNDARY SIDES BY KEY. Form::CutX removes no cell,
+    // so the cells either side of its plane are still there and each has to
+    // fall on exactly one side. A centroid cannot promise that: it is the
+    // mean of what is in the cell, a surface-only cell's can lie on its own
+    // low face, and the test below parts a cell at distance zero from both
+    // sides at once. The column a cell is IN is never on the boundary. Read
+    // once and cleared with the plane, like the reach.
+    const bool onColumn = lastPlaneOnColumn;
+    const std::int32_t column = lastPlaneColumn;
+    lastPlaneOnColumn = false;
 
     auto packKey = [](const Key& k) -> std::uint64_t {
         return (std::uint64_t(std::uint32_t(k.x) & 0x1FFFFFu))
@@ -2168,7 +2220,8 @@ std::size_t Lattice::SeverPlane()
     std::unordered_map<std::uint64_t, float> sideMap;
     sideMap.reserve(cells.size() * 2 + 16);
     for (const auto& [k, C] : cells) {
-        if (inScope(C) && inReach(C)) sideMap.emplace(packKey(k), sideOf(C));
+        if (inScope(C) && inReach(C))
+            sideMap.emplace(packKey(k), onColumn ? (k.x < column ? -1.0f : 1.0f) : sideOf(C));
     }
 
     std::size_t cut = 0;
@@ -2183,7 +2236,8 @@ std::size_t Lattice::SeverPlane()
                     const float dv = cv->second;
                     if ((du < 0.0f && dv > 0.0f) || (du > 0.0f && dv < 0.0f) ||
                         (du == 0.0f && dv != 0.0f) || (du != 0.0f && dv == 0.0f)) {
-                        severed.push_back(SeveredLink{ u, *it, isBridge });
+                        severed.push_back(SeveredLink{ u, *it, isBridge, onColumn });
+                        if (onColumn) ++bareLinks;
                         it = nbrs.erase(it);
                         ++cut;
                         continue;
@@ -2202,6 +2256,21 @@ void Lattice::Rejoin()
 {
     for (const SeveredLink& s : severed) (s.isBridge ? bridge : adj)[s.a].insert(s.b);
     severed.clear();
+    bareLinks = 0;
+}
+
+std::size_t Lattice::RejoinFrom(std::size_t mark)
+{
+    if (mark >= severed.size()) return 0;
+    std::size_t back = 0;
+    for (std::size_t i = mark; i < severed.size(); ++i) {
+        const SeveredLink& s = severed[i];
+        (s.isBridge ? bridge : adj)[s.a].insert(s.b);
+        if (s.bare && bareLinks) --bareLinks;
+        ++back;
+    }
+    severed.erase(severed.begin() + long(mark), severed.end());
+    return back / 2;                        // each link was recorded from both its ends
 }
 
 std::uint32_t Lattice::PeelStageMask(const std::vector<Key>& sel, std::uint32_t mask, int maxStages) const
@@ -2789,6 +2858,33 @@ std::uint32_t SoleParts(const std::vector<Section>& secs, std::size_t i)
     for (std::size_t j = 0; j < secs.size(); ++j)
         if (j != i) elsewhere |= secs[j].parts;
     return secs[i].parts & ~elsewhere;
+}
+
+// PACKED AND PROBED, as Sections() indexes its cells: one hash of what the
+// sections hold, then one pass over the cells. The same pack, exact for any
+// coordinate a body can have.
+std::vector<Key> LooseBeside(const Lattice& L, const std::vector<Section>& secs,
+                             std::uint32_t mask, std::int32_t column, bool below)
+{
+    auto pack = [](const Key& k) {
+        return (std::uint64_t(std::uint32_t(k.x) & 0x1FFFFFu))
+             | (std::uint64_t(std::uint32_t(k.y) & 0x1FFFFFu) << 21)
+             | (std::uint64_t(std::uint32_t(k.z) & 0x1FFFFFu) << 42);
+    };
+    std::size_t held = 0;
+    for (const Section& S : secs) held += S.cells.size();
+    std::unordered_set<std::uint64_t> in;
+    in.reserve(held * 2 + 16);
+    for (const Section& S : secs)
+        for (const Key& k : S.cells) in.insert(pack(k));
+    std::vector<Key> out;
+    for (const auto& [k, C] : L.cells) {
+        if (!C.Alive(mask)) continue;
+        if ((k.x < column) != below) continue;
+        if (in.count(pack(k))) continue;
+        out.push_back(k);
+    }
+    return out;
 }
 
 std::size_t TakeScraps(Lattice& L, std::size_t floorCells, std::map<Key, std::uint32_t>& ledger)

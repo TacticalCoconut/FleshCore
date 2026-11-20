@@ -6,18 +6,18 @@ Scriptname DC_Core extends Quest
  Consumers should not talk to this script directly; DC_Api is the interface and
  this is the cupboard behind it.}
 
-; ---- the impact sets, one per kind per size -------------------------------
+; ---- the impact sets, one per size ----------------------------------------
 ;
 ; SIZE IS A RECORD, NOT A NUMBER. PlayImpactEffect takes no size argument: the
 ; decal's dimensions live in the Impact's own Decal block. So the only way a
 ; caller can ask for a bigger mark is to be handed a different Impact, which is
-; why there are three of each rather than one and a multiplier.
+; why there are three rather than one and a multiplier.
+;
+; These are blood, kind 0, the one kind built in. Any other kind is registered
+; at runtime by the mod that owns its records -- see RegisterKind below.
 ImpactDataSet Property BloodS = None Auto
 ImpactDataSet Property BloodM = None Auto
 ImpactDataSet Property BloodL = None Auto
-ImpactDataSet Property CumS = None Auto
-ImpactDataSet Property CumM = None Auto
-ImpactDataSet Property CumL = None Auto
 
 ; ---- the same, but FOUR OF EACH, in a list --------------------------------
 ;
@@ -32,9 +32,6 @@ ImpactDataSet Property CumL = None Auto
 FormList Property SetsBloodS = None Auto
 FormList Property SetsBloodM = None Auto
 FormList Property SetsBloodL = None Auto
-FormList Property SetsCumS = None Auto
-FormList Property SetsCumM = None Auto
-FormList Property SetsCumL = None Auto
 
 ; ---- the overlay textures -------------------------------------------------
 ;
@@ -79,16 +76,14 @@ FormList Property Clutter = None Auto
 ; Bethesda's own BerserkerFXS is this exact thing: a membrane shader with no
 ; particles whose fill texture is a blood decal atlas. These are cloned from it.
 EffectShader Property CoatBlood = None Auto
-EffectShader Property CoatAlt = None Auto
 
 ; ---- and the same thing in BODY UV, for shards ----------------------------
 ;
-; Three per kind, ascending in density, whose fill textures are the OVERLAY art
-; rather than the decal atlases. A shard keeps their body's texture coordinates,
-; so body-UV art lands on it exactly where it sat on them; the flat-quad atlases
-; in the two Coat shaders would be meaningless wrapped round a fragment of thigh.
+; Three, ascending in density, whose fill textures are the OVERLAY art rather
+; than the decal atlases. A shard keeps their body's texture coordinates, so
+; body-UV art lands on it exactly where it sat on them; the flat-quad atlas in
+; the Coat shader would be meaningless wrapped round a fragment of thigh.
 FormList Property SkinCoatBlood = None Auto
-FormList Property SkinCoatAlt = None Auto
 
 Int Property SkinVariants = 6 Auto Hidden
 
@@ -113,12 +108,92 @@ Float Property LastPaintAt = 0.0 Auto Hidden
 
 Int Property Version = 2 Auto Hidden
 
+; ---- the kinds an add-on registers -----------------------------------------
+;
+; Blood is kind 0 and lives in the properties above. Any other kind is handed in
+; at runtime by the mod that owns its records, through DC_Api.RegisterKind, and
+; kept here in plain script variables: no property and no record in this plugin,
+; and it survives a save. A mod registers its kind again on every load, which
+; also picks up anything it changed. Kinds 1 to 7; each brings the same set of
+; records blood has -- three size lists of impact sets, a coat shader, a list of
+; three body-UV coat shaders -- and the stem of its six overlay textures.
+FormList[] kindSetsS
+FormList[] kindSetsM
+FormList[] kindSetsL
+EffectShader[] kindCoat
+FormList[] kindSkinCoat
+String[] kindSkin
+Int kindTop = 0
+
+Bool Function RegisterKind(Int kind, FormList setsS, FormList setsM, FormList setsL, \
+                           EffectShader coat, FormList skinCoat, String skinStem)
+    {Kind `kind` (1-7) marks with these records. skinStem names its overlay art
+     under textures\DecalCore\: layer variant v is skinStem + v + ".dds". False,
+     and nothing kept, for a kind out of range or an empty stem.}
+    If kind < 1 || kind > 7 || skinStem == ""
+        Return false
+    EndIf
+    If !kindSkin
+        kindSetsS = new FormList[8]
+        kindSetsM = new FormList[8]
+        kindSetsL = new FormList[8]
+        kindCoat = new EffectShader[8]
+        kindSkinCoat = new FormList[8]
+        kindSkin = new String[8]
+    EndIf
+    kindSetsS[kind] = setsS
+    kindSetsM[kind] = setsM
+    kindSetsL[kind] = setsL
+    kindCoat[kind] = coat
+    kindSkinCoat[kind] = skinCoat
+    kindSkin[kind] = skinStem
+    If kind > kindTop
+        kindTop = kind
+    EndIf
+    Return true
+EndFunction
+
+Bool Function HasKind(Int kind)
+    {Blood, or a kind something registered.}
+    If kind == 0
+        Return true
+    EndIf
+    Return kind >= 1 && kind <= 7 && kindSkin && kindSkin[kind] != ""
+EndFunction
+
+Int Function TopKind()
+    {The highest kind number that may be in use: 0 while blood is the only one.
+     A loop over 0..TopKind() still asks HasKind of each.}
+    Return kindTop
+EndFunction
+
+EffectShader Function CoatFor(Int kind)
+    {The flat-atlas coat for a kind, or None.}
+    If kind == 0
+        Return CoatBlood
+    ElseIf HasKind(kind)
+        Return kindCoat[kind]
+    EndIf
+    Return None
+EndFunction
+
+FormList Function SkinCoatFor(Int kind)
+    {The body-UV coat bands for a kind, lightest first, or None.}
+    If kind == 0
+        Return SkinCoatBlood
+    ElseIf HasKind(kind)
+        Return kindSkinCoat[kind]
+    EndIf
+    Return None
+EndFunction
+
 ImpactDataSet Function SetFor(Int kind, Int size)
     {One record for a kind and size, chosen at random from that list.
 
-     Falls back to the single frozen property if the list is empty or missing,
-     so a half-installed update degrades to one atlas per size rather than to
-     no decal at all.}
+     For blood, falls back to the single frozen property if the list is empty or
+     missing, so a half-installed update degrades to one atlas per size rather
+     than to no decal at all. A registered kind has its lists only; an unknown
+     kind has nothing and gets None.}
     FormList l = None
     ImpactDataSet one = None
     If kind == 0
@@ -132,16 +207,13 @@ ImpactDataSet Function SetFor(Int kind, Int size)
             l = SetsBloodL
             one = BloodL
         EndIf
-    ElseIf kind == 1
+    ElseIf HasKind(kind)
         If size <= 0
-            l = SetsCumS
-            one = CumS
+            l = kindSetsS[kind]
         ElseIf size == 1
-            l = SetsCumM
-            one = CumM
+            l = kindSetsM[kind]
         Else
-            l = SetsCumL
-            one = CumL
+            l = kindSetsL[kind]
         EndIf
     EndIf
     If l != None && l.GetSize() > 0
@@ -169,8 +241,8 @@ String Function SkinFor(Int kind, Int layer)
     v = v % SkinVariants
     If kind == 0
         Return "DecalCore\\blood_skin" + v + ".dds"
-    ElseIf kind == 1
-        Return "DecalCore\\alt_skin" + v + ".dds"
+    ElseIf HasKind(kind)
+        Return "DecalCore\\" + kindSkin[kind] + v + ".dds"
     EndIf
     Return ""
 EndFunction

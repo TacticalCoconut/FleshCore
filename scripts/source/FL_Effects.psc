@@ -10,9 +10,10 @@ Scriptname FL_Effects extends Quest
    * FL_Restored -> everything comes off.
  Parts a rule may name: any lattice part name, or leg / arm / head / trunk
  (either leg, either arm, the head, chest-or-abdomen). No idle is ever
- forced: abilities only, per standard warning about animating actors.
+ forced: abilities only, because an idle forced on an actor who is already
+ animating breaks what they are doing.
  A head wound also staggers them (the Dazed row's other half), by animation
- event, only if they are not dead, not animating a scene and not paralysed.}
+ event, only if they are not dead and not in a kill move.}
 
 Event OnInit()
     Rearm()

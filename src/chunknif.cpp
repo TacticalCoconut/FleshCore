@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <cctype>
 #include <map>
 #include <unordered_map>
 #include <utility>
@@ -16,14 +17,10 @@ static int   g_skinShader = 0;
 static bool  g_debris = false;
 static bool  g_haveTint = false;
 static float g_tint[3] = {1.0f, 1.0f, 1.0f};
-// A multiplier on their tint before it becomes a vertex colour. The lighting
-// shader multiplies the diffuse by the vertex colour, and their measured tints
-// are ordinary eight-bit skin values -- (221,221,221) pale, (143,114,101) tan,
-// (73,73,100) the dark elf -- so a plain multiply against the standard body
-// texture is what reproduces them. This exists because that is the ONE step of
-// the chain not measured here: whether the skin-tint shader
-// applies its own colour with a gain. It is a config number so testing can
-// answer that without a rebuild, and 1.0 is the default.
+// A multiplier on the vertex colour their tint becomes (SkinVertexColour,
+// below). 1.0 is the default and the expected answer; it stays a config number
+// so a piece can be nudged without a rebuild. It cannot take a channel past
+// white.
 static float g_tintGain = 1.0f;
 // AND THE WAY OUT, WITHOUT A REBUILD.
 //
@@ -32,8 +29,9 @@ static float g_tintGain = 1.0f;
 // failure this file has already been bitten by twice (the shader length, then
 // SLSF1_Skinned), and it is the reason a new vertex channel gets an off
 // switch that lives in the config rather than in the source. A gain of zero
-// or less in the cfg's S line turns vertex tinting off and the pieces go back
-// to the bytes they had before vertex tinting.
+// or less in the cfg's S line turns the colour lane off: the pieces go back to
+// the bytes they had before vertex tinting, and a rigid piece does not take
+// the skin-tint block either, which needs the lane.
 static bool  g_vcTint = true;
 static BuildStat g_lastBuild;
 // The fallback if the config does not say. NOT the Dismembering Framework
@@ -43,6 +41,46 @@ static BuildStat g_lastBuild;
 static std::string g_goreD = "Textures\\FleshCore\\flesh_muscle.dds";
 static std::string g_goreN = "Textures\\FleshCore\\flesh_muscle_n.dds";
 
+// THE FACE AND ITS ACCESSORIES (cfg FT). Set once, from LoadConfig, before
+// the forge thread exists; all zero is every piece's bytes as before the row.
+static int g_faceMaps = 0, g_faceHair = 0, g_faceCutout = 0, g_faceNormals = 0, g_faceDedup = 0;
+void SetFaceLook(int maps, int hair, int cutout, int normals, int dedup)
+{
+    g_faceMaps    = (maps    == 1) ? 1 : 0;
+    g_faceHair    = (hair >= 0 && hair <= 2) ? hair : 0;
+    g_faceCutout  = (cutout  == 1) ? 1 : 0;     // mode 2 (live alpha) waits for the probe
+    g_faceNormals = (normals == 1) ? 1 : 0;
+    g_faceDedup   = (dedup   == 1) ? 1 : 0;
+}
+static bool EndsWithI(const std::string& s, const char* suffix)
+{
+    const std::size_t n = std::strlen(suffix);
+    if (s.size() < n) return false;
+    for (std::size_t i = 0; i < n; ++i)
+        if (char(std::tolower(static_cast<unsigned char>(s[s.size() - n + i]))) != suffix[i]) return false;
+    return true;
+}
+static bool EqualI(const std::string& a, const std::string& b)
+{
+    if (a.size() != b.size()) return false;
+    for (std::size_t i = 0; i < a.size(); ++i)
+        if (std::tolower(static_cast<unsigned char>(a[i])) != std::tolower(static_cast<unsigned char>(b[i]))) return false;
+    return true;
+}
+bool FaceGenTexOK(const std::vector<std::string>& t)
+{
+    if (t.size() < 8) return false;
+    for (int k : { 0, 1, 2, 3, 6, 7 }) if (t[std::size_t(k)].empty()) return false;
+    // The detail slot must not be a map that belongs elsewhere: the body's
+    // subsurface map has come back at index 3, and eyes have shown _sk there.
+    // A subsurface map in a FaceGen detail slot is the old wash-out.
+    const std::string& d = t[3];
+    if (EndsWithI(d, "_sk.dds") || EndsWithI(d, "_s.dds") || EndsWithI(d, "_msn.dds")) return false;
+    if (EqualI(d, t[0]) || EqualI(d, t[1]) || EqualI(d, t[2])) return false;
+    std::string s6 = t[6];
+    for (char& ch : s6) ch = char(std::tolower(static_cast<unsigned char>(ch)));
+    return s6.find("facetint") != std::string::npos;
+}
 void SetSkinShader(int m) { g_skinShader = (m == 1) ? 1 : 0; }
 BuildStat LastBuild() { return g_lastBuild; }
 void SetTintGain(float g)
@@ -56,6 +94,51 @@ void SetSkinTint(const float rgb[3])
     g_haveTint = rgb != nullptr;
     if (rgb) { g_tint[0] = rgb[0]; g_tint[1] = rgb[1]; g_tint[2] = rgb[2]; }
     else     { g_tint[0] = g_tint[1] = g_tint[2] = 1.0f; }
+}
+// THE UNIQUENESS NUDGE (cfg S column 4). Off: the skin-tint block is written
+// byte for byte as before. On: each Build gives its type-5 blocks -- their
+// skin's and, with FT col 2 = 2, a feature-5 accessory's -- a uvOffset.x
+// of a fraction of a texel (2^-24 .. 2^-14 UV), different from the last 1023
+// builds, so a material key that ignores the tint but covers uvOffset cannot
+// merge two pieces. The type-6 hair-tint block is not nudged. Block length
+// and flags are unchanged. g_uniqSeq is
+// stepped only by Build, which has one caller (the forge thread).
+static bool g_uniqSkin = false;
+static std::uint32_t g_uniqSeq = 0;
+void SetUniqueSkin(bool on) { g_uniqSkin = on; }
+// THE GAME'S SKIN SHADER DOES NOT MULTIPLY THE TEXTURE BY THEIR TINT. IT BLENDS.
+//
+// Read out of the game's own lighting shaders, a skin-tint material's colour is
+//
+//     K * (b*b + 2*b*t*(1 - b))        K = (1.01171875, 0.99609375, 1.01171875)
+//
+// per channel, b the diffuse texel and t their tint. A tint of one half leaves
+// the texture as it is; a lighter one brightens it and a darker one darkens it.
+// A vertex colour on the ordinary lighting shader is a plain multiply, b*v, so
+// writing the tint itself there darkens every piece. Skin textures are dark, a
+// texel about a third, and a pale body, tint (206,205,204), then drops pieces
+// little more than half as bright as it is.
+//
+// The multiplier that reproduces the blend is the blend divided by b:
+//
+//     v = K * (2t + b*(1 - 2t))
+//
+// which still depends on the texel. kSkinTexel is a typical one: the mean
+// skin texel of one common pair of body textures. For a dark tint the piece
+// then matches them where the texture is near that mean, with a little less
+// contrast than the body elsewhere; a body texture much lighter or darker
+// than it drifts by that ratio.
+//
+// What a vertex colour cannot do is brighten: for a channel whose tint is
+// above one half, v is more than one and the byte stops at 255. With all
+// three stopped the piece wears the plain texture, about two thirds of a pale
+// body's brightness; with only some, its hue shifts as well. The skin block
+// (cfg S 1) has no such limit.
+static const float kSkinBlendK[3] = { 1.01171875f, 0.99609375f, 1.01171875f };
+static const float kSkinTexel[3]  = { 0.32f, 0.26f, 0.24f };
+static inline float SkinVertexColour(int k)
+{
+    return kSkinBlendK[k] * (2.0f * g_tint[k] + kSkinTexel[k] * (1.0f - 2.0f * g_tint[k]));
 }
 // How many bind-space units one tile of the flesh texture covers. The gore
 // textures are made tileable on purpose, so a coordinate past the edge
@@ -278,8 +361,7 @@ static inline std::uint64_t RigidDesc(std::uint64_t desc)
 static const std::uint64_t kMeatDesc = 0x0005B0007065040AULL;
 static const std::uint32_t kMeatVS   = 40;
 
-// A colour channel in [0,1] to the byte a vertex colour holds. Their tints come
-// out of the engine as exact multiples of 1/255, so this round-trips them.
+// A colour channel to the byte a vertex colour holds, cut off at both ends.
 static inline std::uint8_t Byte255(float v)
 {
     float x = v * 255.0f;
@@ -287,6 +369,8 @@ static inline std::uint8_t Byte255(float v)
     if (x > 255.0f) x = 255.0f;
     return std::uint8_t(x + 0.5f);
 }
+// More than the byte can hold, by over half a step: Byte255 stops it at white.
+static inline bool OverWhite(float v) { return v * 255.0f > 255.5f; }
 
 static inline std::uint8_t SNorm(float v)
 {
@@ -537,7 +621,7 @@ static const float kSolidKeep = FC_SOLID_KEEP;
 // rather than tripping it.
 static const std::size_t kShapeCeiling = 128;
 
-static void Solidify(std::vector<Shape>& shapes)
+static void Solidify(std::vector<Shape>& shapes, bool rindWorn)
 {
     if (shapes.empty()) return;
 
@@ -555,10 +639,10 @@ static void Solidify(std::vector<Shape>& shapes)
     // gets a thin rind so there is no gap to see between the skin and the meat
     // behind it -- thin on purpose, because a deep offset would drive it
     // straight through the boxes it is draped over.
-    bool anySolid = false, anySkin = false;
+    bool anySolid = false, bodySkin = false;
     for (const Shape& s : shapes) {
         if (s.solid) anySolid = true;
-        if (s.skin)  anySkin = true;
+        if (s.skin && !s.face) bodySkin = true;
     }
 
     if (!anySolid) {
@@ -574,10 +658,23 @@ static void Solidify(std::vector<Shape>& shapes)
 
     // WHICH SHELLS GET THE RIND.
     //
-    // With skin in the piece: the skin, and only the skin. Clothing over skin
-    // is left alone, as it always was -- the skin under it is what closes the
-    // volume. Without skin: EVERY shell. It used to be the single
-    // largest shell alone.
+    // Their skin, always. With their body's skin in the piece, the skin and
+    // only the skin: clothing over skin is left alone -- the skin under it is
+    // what closes the volume. Without it: EVERY shell as well that is not
+    // skin, not solid and not layer 0 -- what they wear, and any interior
+    // shell that is not a filled volume. Their face is skin and is rinded as
+    // skin, but it is not what closes the volume under a cuirass, a hood or
+    // a helmet, so a piece whose only skin is their face rinds its shells as
+    // a piece with no skin does. And a chunk that says so (Chunk::rindWorn)
+    // has what they wear (layer 4) rinded beside their body's skin.
+    //
+    // THEIR HAIR, EYES, BROWS AND MOUTH NEVER GET ONE, in any piece. They
+    // arrive as layer 0 and not skin; worn armour and clothing arrive as layer
+    // 4. A hair card, an eyeball or a brow strip is not the shell of a volume,
+    // and a muscle sheet behind each of them is a flesh-coloured copy of the
+    // hairdo standing round their head. What closes a head piece is their
+    // face, which is skin and is rinded as skin; a piece holding an accessory
+    // and no skin leaves the accessory as it is.
     //
     // FIELD: a Whiterun Guard's thigh section arrived as six
     // shapes -- two merged lump solids and FOUR one-sided armour shells -- and
@@ -593,27 +690,31 @@ static void Solidify(std::vector<Shape>& shapes)
     // THE CEILING. Build() refuses a chunk over kShapeCeiling shapes. A rinded
     // shell adds its inner sheet and its wall band -- and a band is a FRESH
     // SHAPE every 65,000 vertices (16,250 open edges), so a ragged shell can
-    // add three or more. Nothing is booked ahead, then: the skinless shells
+    // add three or more. Nothing is booked ahead, then: the worn shells
     // are taken largest first, each one's sheet and band(s) are built and
     // COUNTED, and the first shell that would put the piece over the ceiling
     // stops the rind -- it and the smaller shells after it stay one-sided
     // rather than sinking the piece, which is the very case the ceiling
     // exists to save (Build() returns nothing, and nothing spawns). A guard's
     // section is four to six shells, a dozen or so shapes after rinding; this
-    // bites only on an outfit of fifty-odd shells. With skin present every
-    // skin shell is rinded in index order, uncounted.
+    // bites only on an outfit of fifty-odd shells. Every skin shell is rinded
+    // first, in index order, uncounted.
+    const bool wornToo = !bodySkin || rindWorn;
     std::vector<std::size_t> order;
-    if (anySkin) {
-        for (std::size_t i = 0; i < shapes.size(); ++i) order.push_back(i);
-    } else {
+    for (std::size_t i = 0; i < shapes.size(); ++i)
+        if (shapes[i].skin) order.push_back(i);
+    if (wornToo) {
+        const std::size_t firstWorn = order.size();
         for (std::size_t i = 0; i < shapes.size(); ++i) {
             const Shape& s = shapes[i];
-            if (s.solid || !s.vsize) continue;
+            if (s.skin || s.solid || !s.vsize) continue;
+            if (s.layer == 0) continue;               // their hair, eyes, brows, mouth: never rinded
+            if (bodySkin && s.layer != 4) continue;   // beside their body's skin, only what they wear joins the rind
             if (s.vdata.size() / s.vsize < 3 || s.tris.size() < 3) continue;
             if (UVOff(s.desc) == 8) continue;         // half positions: the loop below cannot author it either
             order.push_back(i);
         }
-        std::sort(order.begin(), order.end(), [&](std::size_t x, std::size_t y) {
+        std::sort(order.begin() + std::ptrdiff_t(firstWorn), order.end(), [&](std::size_t x, std::size_t y) {
             if (shapes[x].tris.size() != shapes[y].tris.size()) return shapes[x].tris.size() > shapes[y].tris.size();
             return x < y;                             // ties resolve the same way every run
         });
@@ -624,7 +725,6 @@ static void Solidify(std::vector<Shape>& shapes)
         const std::size_t si = order[oi];
         const Shape& src = shapes[si];
         if (src.solid) continue;              // a box needs nothing done to it
-        if (!src.skin && anySkin) continue;   // skin carries the rind when there is skin; every shell in `order` when there is none
         if (!src.vsize) continue;
         const std::uint32_t nV = std::uint32_t(src.vdata.size() / src.vsize);
         const std::uint32_t nT = std::uint32_t(src.tris.size() / 3);
@@ -989,7 +1089,7 @@ static void Solidify(std::vector<Shape>& shapes)
         // COUNTED. If this shell's sheet and band(s) would put
         // the piece over the ceiling, it and every smaller shell after it stay
         // one-sided; Build() would otherwise refuse the whole piece.
-        if (!anySkin && shapes.size() + add.size() + mine.size() > kShapeCeiling) break;
+        if (!src.skin && shapes.size() + add.size() + mine.size() > kShapeCeiling) break;
         for (Shape& s : mine) add.push_back(std::move(s));
     }
     for (Shape& s : add) shapes.push_back(std::move(s));
@@ -998,7 +1098,50 @@ static void Solidify(std::vector<Shape>& shapes)
 std::vector<std::uint8_t> Build(const Chunk& c, float* massOut)
 {
     std::vector<Shape> shapes = c.shapes;
-    Solidify(shapes);
+    // Reset first, so a piece that is refused reports nothing rather than the
+    // piece built before it, and so the dedup below is counted.
+    g_lastBuild = BuildStat{};
+    // THE DOUBLED WIG (FT col 5). KS hairs come as two headparts, X and XHL,
+    // with the same mesh and textures; the game draws them twice with
+    // different alpha. Without that alpha two identical opaque surfaces
+    // z-fight. An accessory shape identical in every byte the writer uses to an
+    // earlier accessory in this piece is dropped. Only accessories are
+    // compared: worn gear on layer 4 that draws one mesh twice is left alone.
+    if (g_faceDedup) {
+        std::vector<Shape> kept;
+        kept.reserve(shapes.size());
+        for (Shape& s : shapes) {
+            bool dup = false;
+            if (s.accessory)
+                for (const Shape& k : kept) {
+                    if (!k.accessory) continue;
+                    if (k.desc != s.desc || k.vsize != s.vsize || k.feature != s.feature
+                        || k.hasMatTint != s.hasMatTint || k.skin != s.skin || k.face != s.face
+                        || k.layer != s.layer || k.solid != s.solid || k.blood != s.blood) continue;
+                    if (s.hasMatTint && (k.matTint[0] != s.matTint[0] || k.matTint[1] != s.matTint[1]
+                                         || k.matTint[2] != s.matTint[2])) continue;
+                    if (k.vdata != s.vdata || k.tris != s.tris || k.tex != s.tex || k.liveTex != s.liveTex) continue;
+                    dup = true;
+                    break;
+                }
+            if (dup) { ++g_lastBuild.dedup; continue; }
+            kept.push_back(std::move(s));
+        }
+        shapes.swap(kept);
+    }
+    Solidify(shapes, c.rindWorn);
+    // NORMALS ON ACCESSORIES (FT col 4). Their records carry position and UV
+    // only, and the lighting shaders an unskinned shape can take read a normal
+    // and a bitangent, so hair, brows and eyes were lit from data they do not
+    // have. ToMeat gives them the meat format every flesh shell already ships
+    // with, its frame built from their own triangles and UVs.
+    if (g_faceNormals)
+        for (Shape& s : shapes)
+            if (s.accessory && !(s.desc & (std::uint64_t(1) << 47)) && UVOff(s.desc) != 8) {
+                const std::uint64_t before = s.desc;
+                ToMeat(s);
+                if (s.desc != before) ++g_lastBuild.normals;
+            }
     // Bloody() is withdrawn: the blood is VANILLA -- the engine's
     // own spray and decals, which the landing impact now provides -- not a
     // painted shell. The machinery stays above; nothing calls it.
@@ -1009,6 +1152,8 @@ std::vector<std::uint8_t> Build(const Chunk& c, float* massOut)
     // ceiling of 24 would refuse whole chunks at
     // eight sources, so this one sits far above that, and the refusal is not
     // silent.
+    // (g_lastBuild was reset at the top, before the first refusal.)
+    ++g_uniqSeq;
     if (!nShapes) return {};
     // A SEVERED LIMB IS NOT A SHARD. A shard is a handful of cells and a
     // dozen shapes; a severed body half is a hundred and thirty cells whose
@@ -1137,38 +1282,79 @@ std::vector<std::uint8_t> Build(const Chunk& c, float* massOut)
 
     bool anyBlood = false;
     for (const Shape& sh : shapes) if (sh.blood) anyBlood = true;
-    // RIGID ONLY IF EVERY SHAPE CAN BE. The block layout is one number, so a
-    // file cannot be half skinned; a shape whose record does not end in its
-    // skin block would have to keep it, and then all of them do.
-    bool rigid = g_rigid != 0;
-    for (const Shape& sh : shapes)
-        if (!Strippable(sh.desc, sh.vsize)) {
-            rigid = false;
-            if (getenv("FC_WHY"))
-                std::fprintf(stderr, "  [rigid off] shape '%s' desc=0x%016llX vsize=%u skinOff=%u\n",
-                             sh.name.c_str(), (unsigned long long)sh.desc, sh.vsize, SkinOff(sh.desc));
-        }
-    g_lastBuild = BuildStat{};
-    g_lastBuild.rigid  = rigid;
+    // PER-SHAPE SKELETON (cfg D col 5 = 1). Only shapes that go onto the
+    // game's skin-tint (type-5) or FaceGen (type-4) block -- or whose vertex
+    // record cannot be stripped -- keep the 6-block skinned form, because
+    // their live body and head draw skinned on those shader types. Meat, bone,
+    // Solidify sheets and bands, hair, accessories, worn gear and S 0 shapes
+    // drop the skeleton (3 blocks, inline geometry rebased onto C) inside the
+    // same NIF. D col 5 = 0 keeps every shape skinned as a one-line retreat.
+    const bool whyLog = getenv("FC_WHY") != nullptr;
+    std::vector<int> shapeRigid(nShapes, 0);
+    std::vector<int> shapeBase(nShapes, 0);
+    int nextBlock = 6;
+    bool allRigid = (g_rigid != 0) && (nShapes > 0);
+    for (std::size_t s = 0; s < nShapes; ++s) {
+        const Shape& sh = shapes[s];
+        const bool stripOk = (g_rigid != 0) && Strippable(sh.desc, sh.vsize);
+        if (g_rigid != 0 && !stripOk && whyLog)
+            std::fprintf(stderr, "  [rigid off] shape '%s' desc=0x%016llX vsize=%u skinOff=%u\n",
+                         sh.name.c_str(), (unsigned long long)sh.desc, sh.vsize, SkinOff(sh.desc));
+        const bool haveSkinTex = sh.tex.size() > 7 && !sh.tex[2].empty() && !sh.tex[7].empty();
+        const bool wantFaceGen = (g_faceMaps == 1) && sh.face && FaceGenTexOK(sh.liveTex);
+        const bool wantSkinBlk = sh.skin && haveSkinTex && (g_skinShader == 1) && g_haveTint && !wantFaceGen;
+        const bool sRigid      = stripOk && !wantFaceGen && !wantSkinBlk;
+        shapeRigid[s] = sRigid ? 1 : 0;
+        if (!sRigid) allRigid = false;
+        shapeBase[s] = nextBlock;
+        nextBlock += sRigid ? 3 : 6;
+    }
+    g_lastBuild.rigid  = allRigid;
     g_lastBuild.shapes = int(nShapes);
-    const int perShape = rigid ? 3 : 6;
-    const int alphaBlk = 6 + int(nShapes) * perShape;   // one, shared by every shell
-    const int nBlocks = alphaBlk + (anyBlood ? 1 : 0);
+    // THE ALPHA BLOCKS: one per distinct (flags, threshold) pair, after every
+    // shape's blocks. The blood shell's pair comes first, as its single block
+    // always did; with no blood and no cut-out shape there are none, and the
+    // file is the one it always was.
+    //
+    // A CUT-OUT ACCESSORY (FT col 3 = 1): a feature-6 accessory (hair, brows)
+    // gets flags 0x12EC -- alpha TEST only, function GREATER, no blend -- at
+    // threshold 128, the word and value vanilla hair and mouths carry on disk.
+    // A test writes depth and has no draw-order problem on a piece.
+    const int alphaBase = nextBlock;
+    std::vector<std::pair<std::uint16_t, std::uint8_t>> alphaPairs;
+    std::vector<int> alphaOf(nShapes, -1);
+    auto alphaSlot = [&](std::uint16_t fl, std::uint8_t thr) -> int {
+        for (std::size_t i = 0; i < alphaPairs.size(); ++i)
+            if (alphaPairs[i].first == fl && alphaPairs[i].second == thr) return alphaBase + int(i);
+        alphaPairs.emplace_back(fl, thr);
+        return alphaBase + int(alphaPairs.size()) - 1;
+    };
+    if (anyBlood)
+        for (std::size_t s = 0; s < nShapes; ++s)
+            if (shapes[s].blood) alphaOf[s] = alphaSlot(0x12EC, 40);
+    if (g_faceCutout == 1)
+        for (std::size_t s = 0; s < nShapes; ++s)
+            if (!shapes[s].blood && shapes[s].accessory && shapes[s].feature == int(6)) {
+                alphaOf[s] = alphaSlot(0x12EC, 128);
+                ++g_lastBuild.cutout;
+            }
+    const int nBlocks = alphaBase + int(alphaPairs.size());
     std::vector<std::uint16_t> tidx(nBlocks);
     tidx[0]=tFade; tidx[1]=tBSX; tidx[2]=tHull; tidx[3]=tRigid; tidx[4]=tColl; tidx[5]=tNode;
     for (std::size_t s = 0; s < nShapes; ++s) {
-        const int b = 6 + int(s) * perShape;
+        const int b = shapeBase[s];
         tidx[b] = tTri;
-        if (rigid) { tidx[b+1]=tShader; tidx[b+2]=tTexSet; }
+        if (shapeRigid[s]) { tidx[b+1]=tShader; tidx[b+2]=tTexSet; }
         else { tidx[b+1]=tDSI; tidx[b+2]=tSkinD; tidx[b+3]=tSkinP; tidx[b+4]=tShader; tidx[b+5]=tTexSet; }
     }
-    if (anyBlood) tidx[alphaBlk] = tAlpha;
     std::vector<std::vector<std::uint8_t>> blocks(nBlocks);
-    if (anyBlood) {
-        // Measured off a shipping stump mesh, block 25:
-        // name -1, extra 0, controller -1, flags 0x12EC (blend + test), thr 40.
-        W w; w.i32(-1); w.u32(0); w.i32(-1); w.u16(0x12EC); w.u8(40);
-        blocks[alphaBlk] = std::move(w.b);
+    for (std::size_t i = 0; i < alphaPairs.size(); ++i) {
+        // Measured off a shipping stump mesh, block 25 (the blood pair):
+        // name -1, extra 0, controller -1, flags u16, threshold u8. 0x12EC
+        // is alpha TEST only (blend bit 0 clear), function GREATER.
+        tidx[alphaBase + int(i)] = tAlpha;
+        W w; w.i32(-1); w.u32(0); w.i32(-1); w.u16(alphaPairs[i].first); w.u8(alphaPairs[i].second);
+        blocks[alphaBase + int(i)] = std::move(w.b);
     }
 
     {   // BSFadeNode root
@@ -1178,7 +1364,7 @@ std::vector<std::uint8_t> Build(const Chunk& c, float* massOut)
         w.i32(4);
         w.u32(1 + std::uint32_t(nShapes));
         w.i32(5);
-        for (std::size_t s = 0; s < nShapes; ++s) w.i32(6 + int(s) * perShape);
+        for (std::size_t s = 0; s < nShapes; ++s) w.i32(shapeBase[s]);
         w.u32(0);
         blocks[0] = std::move(w.b);
     }
@@ -1269,63 +1455,122 @@ std::vector<std::uint8_t> Build(const Chunk& c, float* massOut)
 
     for (std::size_t s = 0; s < nShapes; ++s) {
         const Shape& sh = shapes[s];
-        const int b = 6 + int(s) * perShape;
+        const int b = shapeBase[s];
+        const bool sRigid = shapeRigid[s] != 0;
         const std::uint32_t nV = std::uint32_t(sh.vdata.size() / sh.vsize);
         const std::uint32_t nT = std::uint32_t(sh.tris.size() / 3);
         if (!nV || !nT || nV > 0xFFFF || nT > 0xFFFF) return {};
         const std::uint32_t so = SkinOff(sh.desc);
         if (so + 12 > sh.vsize) return {};
 
-        // THE RECORDS, in whichever of the two shapes this file takes.
+        // THE RECORDS, chosen per shape (`sRigid` above).
         //
-        //   rigid: the record loses its skin block and its POSITION is rebased
-        //          onto the chunk's centroid, because there is no bone left to
-        //          carry it there.
-        //   skinned: the record is kept whole, re-skinned to bone 0 at weight
-        //          one, and the positions are untouched -- the single bone's
-        //          own translation is what moves the piece onto its origin.
-        // ---- THEIR COLOUR, BY THE ONE ROUTE THAT SURVIVES BEING RIGID ------
+        //   rigid (`sRigid`): the record loses its skin block and its POSITION
+        //          is rebased onto the chunk's centroid, because there is no
+        //          bone left to carry it there.
+        //   skinned (`!sRigid`): the record is kept whole, re-skinned to bone 0
+        //          at weight one, and the positions are untouched -- the single
+        //          bone's own translation (-C) moves the shape onto the exact
+        //          same origin as its rigid neighbours.
+        // ---- THEIR COLOUR ---------------------------------------------------
         //
-        // The skin-tint shader cannot be used on a piece with no skeleton --
-        // repeated tests, written out at the shader block below. So
-        // their colour arrives as a VERTEX COLOUR on the ordinary lighting
-        // shader, which multiplies the diffuse by it and does not care in the
-        // slightest whether the geometry is skinned.
+        //   The ordinary lighting shader (cfg S 0) multiplies the diffuse by
+        //   the vertex colour on rigid skin shapes. Their tint goes into the
+        //   lane as the multiplier that matches the skin shader's blend
+        //   (SkinVertexColour).
         //
-        // It is added only where all four of these hold:
-        //   * the file is rigid -- the colour then goes at the very end of the
-        //     record, where the skin block used to be, and NOTHING MOVES. On
-        //     the skinned fallback the colour would have to be spliced in
-        //     ahead of the skin block, and no shipping mesh was measured for
-        //     that layout, so it is not attempted.
+        //   The skin-tint block (cfg S 1) and FaceGen block (cfg FT col 1)
+        //   keep their shapes skinned (`!sRigid` above), so they take the
+        //   game's skinned technique-5 and technique-4 shaders directly and
+        //   need no artificial vertex-colour lane.
+        //
+        // The vertex-colour lane is added only where all of these hold:
+        //   * the config has not turned it off (a gain above zero).
+        //   * THIS shape is rigid (`sRigid`) -- the colour then goes at the
+        //     very end of the record, where the skinning bytes used to be, and
+        //     NOTHING MOVES. On a skinned shape it is neither needed nor
+        //     attempted.
         //   * their tint was actually read off their live shader.
         //   * this shape is their SKIN. Meat and bone are not skin-toned: the
         //     cut face is gore texture and stays as it is.
-        //   * the skin-tint block is not in use (cfg S 1), which has its own
-        //     tint field and must not be tinted twice.
+        //   * the source record has no colour lane of its own. A second one
+        //     would leave four bytes that no channel owns; such a shape keeps
+        //     the lane and the colours it came with.
         // and the new offset still fits a nibble, which is offset/4 <= 15.
         const bool haveSkinTex  = sh.tex.size() > 7 && !sh.tex[2].empty() && !sh.tex[7].empty();
-        const bool useSkinBlock = sh.skin && haveSkinTex && g_skinShader == 1;
-        const bool tintShape    = g_vcTint && rigid && g_haveTint && sh.skin
-                                  && !useSkinBlock && (so + 4u) <= 60u;
-        if (sh.skin)   ++g_lastBuild.skinShapes;
-        if (tintShape) ++g_lastBuild.tinted;
+        const bool tintShape    = g_vcTint && sRigid && g_haveTint && sh.skin
+                                  && (sh.desc & (std::uint64_t(1) << 49)) == 0
+                                  && (so + 4u) <= 60u;
+        // No tint, no skin block: without one it would wear the template's
+        // white. Under per-shape skinning any FaceGen or skin-block shape is
+        // already `!sRigid`, so `faceLane` stays an unreachable guard.
+        // THEIR OWN FACE ON THE FACEGEN BLOCK (FT col 1). A face whose live
+        // texture list carries its detail map (3) and its FaceTint map (6)
+        // takes the type-4 block the game draws that head with, written
+        // skinned (`!sRigid` above) with no artificial vertex-colour lane.
+        const bool faceLane     = g_vcTint && sRigid
+                                  && (sh.desc & (std::uint64_t(1) << 49)) == 0
+                                  && (so + 4u) <= 60u;
+        const bool useFaceGen   = g_faceMaps == 1 && sh.face && FaceGenTexOK(sh.liveTex)
+                                  && (!sRigid || faceLane);
+        // HAIR AND BROWS ON THE HAIR-TINT BLOCK (FT col 2), in the colour read
+        // off their live material. Technique 6 unskinned reads a normal and a
+        // bitangent, so only a shape that has them (FT col 4) takes it.
+        const bool hasNormals   = (sh.desc & (std::uint64_t(1) << 47)) != 0;
+        const bool useHair      = g_faceHair >= 1 && sh.accessory && !sh.skin && sh.feature == 6
+                                  && sh.hasMatTint && hasNormals;
+        // FEATURE-5 ACCESSORIES (FT col 2 = 2): horns, frills and brows of an
+        // Argonian or an Orc, on the skin-tint block in their own colour,
+        // WITHOUT model space normals and without a lane (technique 5
+        // unskinned non-MSN reads a normal and a bitangent: FT col 4 again).
+        // One whose normal map is a _msn stays as it was.
+        const bool accMsn       = sh.tex.size() > 1 && sh.tex[1].size() >= 8
+                                  && EndsWithI(sh.tex[1], "_msn.dds");
+        const bool useAccSkin   = g_faceHair >= 2 && sh.accessory && !sh.skin && sh.feature == 5
+                                  && sh.hasMatTint && hasNormals && !accMsn
+                                  && (sh.desc & (std::uint64_t(1) << 49)) == 0;
+        const bool useSkinBlock = sh.skin && haveSkinTex && g_skinShader == 1
+                                  && g_haveTint && (!sRigid || tintShape) && !useFaceGen;
+        // ONE CONDITION FOR THE LANE. It sizes the record, declares the
+        // channel, writes the bytes and sets the shader flag; a lane declared
+        // and not written is a piece that never appears.
+        const bool laneShape    = tintShape || (useFaceGen && sRigid);
+        // On the ordinary shader a channel that asks for more than white is
+        // cut off there, and the piece comes out darker than they are.
+        const float vcol[3] = { SkinVertexColour(0) * g_tintGain,
+                                SkinVertexColour(1) * g_tintGain,
+                                SkinVertexColour(2) * g_tintGain };
+        const bool clipped = tintShape && !useSkinBlock && !useFaceGen
+                             && (OverWhite(vcol[0]) || OverWhite(vcol[1]) || OverWhite(vcol[2]));
+        if (sh.skin)                   ++g_lastBuild.skinShapes;
+        if (tintShape || useSkinBlock || useFaceGen) ++g_lastBuild.tinted;
+        if (useSkinBlock)              ++g_lastBuild.skinBlock;
+        if (clipped)                   ++g_lastBuild.clipped;
+        if (useFaceGen)                ++g_lastBuild.faceGen;
+        if (useHair)                   ++g_lastBuild.hairTint;
+        if (useAccSkin)                ++g_lastBuild.accSkin;
 
-        const std::uint32_t copyN = rigid ? so : sh.vsize;
-        const std::uint32_t vsz  = copyN + (tintShape ? 4u : 0u);
-        std::uint64_t desc = rigid ? RigidDesc(sh.desc) : sh.desc;
-        if (tintShape) desc = WithColour(desc, copyN);
+        const std::uint32_t copyN = sRigid ? so : sh.vsize;
+        const std::uint32_t vsz  = copyN + (laneShape ? 4u : 0u);
+        std::uint64_t desc = sRigid ? RigidDesc(sh.desc) : sh.desc;
+        if (laneShape) desc = WithColour(desc, copyN);
+        // White beside the skin block, which applies their tint itself, and
+        // beside the FaceGen block, whose colour is in its maps; the
+        // matching multiplier on the ordinary lighting shader.
+        const bool whiteLane = useSkinBlock || useFaceGen;
         const std::uint8_t col[4] = {
-            Byte255(g_tint[0] * g_tintGain), Byte255(g_tint[1] * g_tintGain),
-            Byte255(g_tint[2] * g_tintGain), 0xFF
+            whiteLane ? std::uint8_t(0xFF) : Byte255(vcol[0]),
+            whiteLane ? std::uint8_t(0xFF) : Byte255(vcol[1]),
+            whiteLane ? std::uint8_t(0xFF) : Byte255(vcol[2]),
+            0xFF
         };
         std::vector<std::uint8_t> vd(std::size_t(nV) * vsz);
         for (std::uint32_t i = 0; i < nV; ++i) {
             const std::uint8_t* src = sh.vdata.data() + std::size_t(i) * sh.vsize;
             std::uint8_t* dst = vd.data() + std::size_t(i) * vsz;
             std::memcpy(dst, src, copyN);
-            if (tintShape) std::memcpy(dst + copyN, col, 4);
-            if (rigid) {
+            if (laneShape) std::memcpy(dst + copyN, col, 4);
+            if (sRigid) {
                 float p[3];
                 PosOf(src, sh.desc, p);
                 p[0] -= C[0]; p[1] -= C[1]; p[2] -= C[2];
@@ -1351,7 +1596,7 @@ std::vector<std::uint8_t> Build(const Chunk& c, float* massOut)
         }
         const float bc[3] = { (pxa+pxb)*0.5f, (pya+pyb)*0.5f, (pza+pzb)*0.5f };
         const float br = 0.5f * std::sqrt((pxb-pxa)*(pxb-pxa) + (pyb-pya)*(pyb-pya) + (pzb-pza)*(pzb-pza));
-        const int shaderBlk = rigid ? (b + 1) : (b + 4);
+        const int shaderBlk = sRigid ? (b + 1) : (b + 4);
 
         {   W w;
             w.i32(3 + int(s));
@@ -1359,9 +1604,9 @@ std::vector<std::uint8_t> Build(const Chunk& c, float* massOut)
             w.avxform(g_noDecals ? 0x400u : 0u);
             w.i32(-1);
             w.f32(bc[0]); w.f32(bc[1]); w.f32(bc[2]); w.f32(br);
-            w.i32(rigid ? -1 : (b + 1)); w.i32(shaderBlk); w.i32(sh.blood ? alphaBlk : -1);
+            w.i32(sRigid ? -1 : (b + 1)); w.i32(shaderBlk); w.i32(alphaOf[s]);
             w.u64(desc);
-            if (rigid) {
+            if (sRigid) {
                 // numTriangles, numVertices, dataSize, then the geometry, then
                 // particleDataSize. dataSize == nV*vertexSize + nT*6 -- measured
                 // exact on three shipping unskinned meshes.
@@ -1376,7 +1621,7 @@ std::vector<std::uint8_t> Build(const Chunk& c, float* massOut)
             }
             blocks[b] = std::move(w.b);
         }
-        if (!rigid) {
+        if (!sRigid) {
         {   W w;
             w.i32(b + 2); w.i32(b + 3); w.i32(0);
             w.u32(1); w.i32(5);
@@ -1422,11 +1667,11 @@ std::vector<std::uint8_t> Build(const Chunk& c, float* massOut)
             // AND IT CARRIES THEIR COLOUR WHEN ONE WAS READ.
             //
             // The 112-byte type-5 block ends in three floats -- their skin tint
-            // -- and the 100-byte type-0 block does not have them at all. That
-            // is why the default block leaves every piece white whatever their
-            // skin, and why the skin
-            // path with no tint read uses the template's own (1,1,1) and comes
-            // out as bleached meat. Both are the same missing number.
+            // -- and the 100-byte type-0 block does not have them at all. So
+            // on the default block their colour has to arrive as a vertex
+            // colour, and the skin block with no tint written would wear the
+            // template's own (1,1,1) and come out as bleached meat, which is
+            // why a body with no tint read never gets it.
             //
             // The block needs that number: with their
             // tint in hand the skin path is right and the piece matches them;
@@ -1449,35 +1694,60 @@ std::vector<std::uint8_t> Build(const Chunk& c, float* massOut)
             // only slots 0 and 1 and has always rendered these shapes correctly.
             // So the worst case is a piece that is their shape but not their colour,
             // and cyan is no longer reachable.
-            // THE SKIN-TINT SHADER CANNOT BE USED ON A PIECE THAT HAS NO
-            // SKELETON; repeated tests show it.
+            // ON A PIECE THAT HAS NO SKELETON THE SKIN-TINT SHADER NEEDS A
+            // VERTEX COLOUR.
             //
             // Their body's skin shape is TYPE 5 with flags1 82601303 -- and bit 1
             // of that is SLSF1_Skinned. A forged piece is RIGID: it has no skin
             // instance, no bone palette and no partition, and writing that bit
             // onto it is what originally stopped every piece from ever
             // appearing. So it must be cleared, and 82601301 is a skin shader
-            // told its geometry is not skinned -- a permutation that reads
-            // inputs nothing has bound, and renders a flat pale blue wash.
+            // told its geometry is not skinned.
             //
-            // That is the cyan, and no better data cures it: the donor's flags,
-            // the default's flags, the vertex
-            // colour bit cleared, the subsurface map moved to the slot a NIF
-            // means by it, or a texture set matching their body mesh
-            // EXACTLY -- slots 0, 1, 2, 7 and nothing else -- all render it blue.
-            // The cause is the shader type on
-            // unskinned geometry.
+            // The game has very few shaders for that. Read out of its shader
+            // package: for unskinned geometry with model space normals, every
+            // skin-tint vertex shader takes a vertex colour, and every pixel
+            // shader that goes with them has soft lighting. A rigid piece on
+            // this block with no colour lane asks for a shader that does not
+            // exist, and renders a flat pale blue wash. With the colour flag
+            // set and no lane behind it, the shader reads a colour out of a
+            // buffer that has none, and renders flat cyan. No better data
+            // cures either: the donor's flags, the default's flags, the
+            // subsurface map moved to the slot a NIF means by it, or a texture
+            // set matching their body mesh EXACTLY -- slots 0, 1, 2, 7 and
+            // nothing else.
             //
-            // So the skin block is off unless the config asks for it. The
-            // ordinary lighting shader has rendered these shapes correctly in
-            // every build that used it, and an untinted piece of them is a great
-            // deal better than a blue one. Their colour has to arrive by a route
-            // that survives being rigid -- vertex colours on the default
-            // shader -- which needs the colour-offset nibble of the vertex
-            // descriptor measured off a mesh that actually has them.
-            const unsigned char* tpl = useSkinBlock ? kTplShaderSkin : kTplShaderDefault;
-            const std::size_t len   = useSkinBlock ? sizeof(kTplShaderSkin) : sizeof(kTplShaderDefault);
+            // So on a rigid shape the block is used only with a real colour
+            // lane beside it (`tintShape`, above), filled with white, and it
+            // keeps its soft lighting. It stays off unless the config asks for
+            // it: the ordinary lighting shader has rendered these shapes
+            // correctly in every build that used it.
+            // FOUR BLOCKS, each a shipping block of the length its type
+            // demands (blobs.h): the type-4 FaceGen head, the type-6 hair,
+            // the type-5 skin, and the type-0 default.
+            const bool skinTpl = useSkinBlock || useAccSkin;
+            const unsigned char* tpl = useFaceGen ? kTplShaderFaceGen
+                                     : useHair    ? kTplShaderHair
+                                     : skinTpl    ? kTplShaderSkin : kTplShaderDefault;
+            const std::size_t len    = useFaceGen ? sizeof(kTplShaderFaceGen)
+                                     : useHair    ? sizeof(kTplShaderHair)
+                                     : skinTpl    ? sizeof(kTplShaderSkin) : sizeof(kTplShaderDefault);
             std::vector<std::uint8_t> sp(tpl, tpl + len);
+            // THE NEW BLOCKS CARRY NO COLOUR FLAG OF THEIR OWN: Vertex_Colors
+            // is cleared here and set again below only where a lane was
+            // written (or the source had one). The FaceGen template ships with
+            // it set; the hair and the accessory skin block have no lane.
+            // Vertex_Alpha (flags1 bit 3) goes with it.
+            if (useFaceGen || useHair || useAccSkin) {
+                std::uint32_t f1 = 0, f2 = 0;
+                std::memcpy(&f1, sp.data() + 16, 4);
+                std::memcpy(&f2, sp.data() + 20, 4);
+                f1 &= ~0x8u;                     // SLSF1_Vertex_Alpha
+                f2 &= ~0x20u;                    // SLSF2_Vertex_Colors
+                if (useAccSkin) f1 &= ~(1u << 12);   // no Model_Space_Normals: their normal map is not a _msn
+                std::memcpy(sp.data() + 16, &f1, 4);
+                std::memcpy(sp.data() + 20, &f2, 4);
+            }
             // A RIGID SHAPE MUST NOT DECLARE ITSELF SKINNED.
             //
             // This is what originally stopped every forged piece from
@@ -1501,13 +1771,13 @@ std::vector<std::uint8_t> Build(const Chunk& c, float* massOut)
             //
             // kTplShaderSkin comes from Dismembering Framework's limb prop and
             // carries that mesh's flags. Exactly one of them is wrong for a
-            // forged piece:
+            // piece with no colour lane:
             //
             //   flags2 bit 5, SLSF2_Vertex_Colors. It tells the shader every
-            //   vertex carries a colour. NEITHER vertex format a skin-block shape uses has a
+            //   vertex carries a colour. Neither source vertex format has a
             //   colour channel -- their skin is Vertex|UVs|Skinned and the meat
             //   is Vertex|UVs|Normals|Tangents|Skinned, checked in the
-            //   descriptor -- so the shader read a
+            //   descriptor -- so with the flag and no lane the shader read a
             //   per-vertex colour out of a buffer that has none and got flat,
             //   uniform cyan.
             //
@@ -1522,20 +1792,22 @@ std::vector<std::uint8_t> Build(const Chunk& c, float* massOut)
             //   and no colour either.
             //
             //   flags2 bit 25, SLSF2_Soft_Lighting -- subsurface softening,
-            //   which is what skin wants and degrades harmlessly without it.
+            //   which is what skin wants, and on a rigid piece a bit the block
+            //   cannot lose: the game has no skin-tint shader for it without.
             //
             // The bit list is anchored: bit 12 of flags1 is
             // Model_Space_Normals, which this file has relied on by name since
             // the meat format was worked out, and the same list gives bit 21.
             //
-            // So the skin block now keeps its OWN flags and clears one bit.
+            // So the skin block keeps its OWN flags and clears one bit, which is
+            // set again below wherever a colour lane was written.
             if (useSkinBlock) {
                 std::uint32_t f2 = 0;
                 std::memcpy(&f2, sp.data() + 20, 4);
                 f2 &= ~0x20u;                    // SLSF2_Vertex_Colors
                 std::memcpy(sp.data() + 20, &f2, 4);
             }
-            if (rigid) {
+            if (sRigid) {
                 std::uint32_t f1 = 0;
                 std::memcpy(&f1, sp.data() + 16, 4);
                 f1 &= ~2u;                       // SLSF1_Skinned
@@ -1545,10 +1817,11 @@ std::vector<std::uint8_t> Build(const Chunk& c, float* massOut)
             //
             // SLSF2_Vertex_Colors on a buffer with no colour lane is what
             // turned every shard cyan at first, and the reverse -- a colour
-            // lane no shader reads -- is four wasted bytes a vertex. So the
-            // one condition, `tintShape`, drives both, so a shape never
+            // lane no shader reads -- is four wasted bytes a vertex. So one
+            // condition, `laneShape`, writes the lane and sets the flag, and a
+            // shape that came with a lane of its own keeps both: a shape never
             // carries one without the other.
-            if (tintShape || (desc & (std::uint64_t(1) << 49)) != 0) {
+            if (laneShape || (desc & (std::uint64_t(1) << 49)) != 0) {
                 std::uint32_t f2 = 0;
                 std::memcpy(&f2, sp.data() + 20, 4);
                 f2 |= 0x20u;                     // SLSF2_Vertex_Colors
@@ -1567,21 +1840,51 @@ std::vector<std::uint8_t> Build(const Chunk& c, float* massOut)
             //
             // Offsets 100, 104 and 108 of the 112-byte skin block: the three
             // floats the type-0 block does not have. Measured off the shipping
-            // template, where all three are 1.0 -- white skin, which is what
-            // every piece this mod has ever forged has worn.
+            // template, where all three are 1.0: white skin.
             if (useSkinBlock && g_haveTint && sp.size() >= 112) {
                 std::memcpy(sp.data() + 100, &g_tint[0], 4);
                 std::memcpy(sp.data() + 104, &g_tint[1], 4);
                 std::memcpy(sp.data() + 108, &g_tint[2], 4);
             }
+            // uvOffset.x, block offset 24 (facts.h: uvOffset and uvScale sit
+            // between flags2 at 20 and the texture-set ref at 40; 0.0 on every
+            // shipped block). Only with the nudge on; see SetUniqueSkin. Every
+            // type-5 block: their skin's and a feature-5 accessory's (FT col 2 = 2,
+            // whose own colour below is at +100, clear of +24).
+            if ((useSkinBlock || useAccSkin) && g_uniqSkin && sp.size() >= 32) {
+                const float u = float((g_uniqSeq % 1024u) + 1u) * (1.0f / 16777216.0f);
+                std::memcpy(sp.data() + 24, &u, 4);
+            }
+            // THE ACCESSORY'S OWN COLOUR, at the same three floats of the
+            // 112-byte hair-tint or skin-tint block: what its live material held.
+            if ((useHair || useAccSkin) && sp.size() >= 112) {
+                std::memcpy(sp.data() + 100, &sh.matTint[0], 4);
+                std::memcpy(sp.data() + 104, &sh.matTint[1], 4);
+                std::memcpy(sp.data() + 108, &sh.matTint[2], 4);
+            }
             const std::int32_t ts = shaderBlk + 1;
             std::memcpy(sp.data() + 40, &ts, 4);
             blocks[shaderBlk] = std::move(sp);
         }
-        {   W w;
+        {   // THE TEXTURE SET, from a local copy. A face on the FaceGen block
+            // takes slots 0-3, 6 and 7 exactly as the live set held them --
+            // the set the game draws that head with, on the same shader type.
+            // Any other face has slots 3 and 6 cleared here, whatever the list
+            // says: a detail map under the skin or default block is what once
+            // washed every shard out.
+            std::vector<std::string> tx(9);
+            for (std::size_t t = 0; t < 9 && t < sh.tex.size(); ++t) tx[t] = sh.tex[t];
+            if (useFaceGen) {
+                for (std::size_t t = 0; t < 9; ++t) tx[t].clear();
+                for (std::size_t t : { 0, 1, 2, 3, 6, 7 }) tx[t] = sh.liveTex[t];
+            } else if (sh.face) {
+                tx[3].clear();
+                tx[6].clear();
+            }
+            W w;
             w.u32(9);
             for (int t = 0; t < 9; ++t) {
-                const std::string& p = (std::size_t(t) < sh.tex.size()) ? sh.tex[t] : std::string();
+                const std::string& p = tx[std::size_t(t)];
                 w.u32(std::uint32_t(p.size()));
                 w.raw(p.data(), p.size());
             }

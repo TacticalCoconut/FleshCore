@@ -48,7 +48,8 @@ Float Property MaxLife = 300.0 Auto
 {A rune nobody ever steps on still has to stop polling eventually.}
 
 Int Property Kind = 0 Auto
-{What the ring is made of, in DecalCore's numbering: 0 blood, 1 alt.}
+{What the ring is made of, in DecalCore's numbering: 0 blood, or a kind
+ another mod registered.}
 
 Float Property Ring = 40.0 Auto
 {Radius of the mark ring on the floor.}
@@ -173,8 +174,8 @@ Function Draw()
         Return
     EndIf
     Int k = DC_Api.BLOOD()
-    If Kind == DC_Api.ALT()
-        k = DC_Api.ALT()
+    If c.HasKind(Kind)
+        k = Kind
     EndIf
     ImpactDataSet s = c.SetFor(k, DC_Api.MEDIUM())
     If s == None

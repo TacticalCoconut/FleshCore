@@ -31,8 +31,6 @@ event OnConfigManagerReady(string a_eventName, string a_strArg, float a_numArg, 
 endEvent
 ```
 
-An empty stub in `scripts/source` stands in for an optional mod's menu script: `FL_Watch` declares a local of that type, and the type has to resolve for the scripts to compile.
-
 ## Tests
 
 The unit tests build with MinGW and run on Windows. From `test/`:

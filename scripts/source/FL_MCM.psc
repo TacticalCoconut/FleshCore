@@ -277,7 +277,7 @@ Event OnPageReset(String a_page)
         EndIf
         _oidEngine = AddTextOption("Engine (SKSE plugin)", engine, OPTION_FLAG_DISABLED)
 
-        _oidScripts = AddTextOption("Scripts", "0.1 Beta", OPTION_FLAG_DISABLED)
+        _oidScripts = AddTextOption("Scripts", "0.1.1 Beta", OPTION_FLAG_DISABLED)
 
         ; The plugin is proven by resolving a record out of it rather than by
         ; asking whether a file exists: a plugin present but not ENABLED
@@ -423,7 +423,7 @@ State ABGUILSPAWN
         Form guil = Game.GetFormFromFile(0x00000801, "FleshCore Guillotine.esp")
         Actor p = Game.GetPlayer()
         If !guil || !p
-            ShowMessage("Could not resolve FCG_BisectGuillotine_BoxTie (0x801) in FleshCore Guillotine.esp.", false)
+            ShowMessage("Could not resolve the Bisecting Guillotine (0x801) in FleshCore Guillotine.esp.", false)
             Return
         EndIf
         ObjectReference dummy = p.PlaceAtMe(Game.GetFormFromFile(0x000D19BA, "Skyrim.esm"))
@@ -683,9 +683,10 @@ Event OnGameReload()
 EndEvent
 
 Bool Function HasCombinedMenu()
-    {an external combined menu mod shows these pages inside its own combined menu (the companion menu on
-     its controller quest), so there this menu stays off SkyUI's list. Looked up by
-     editor id, which FleshCore's plugin binding leaves alone.}
+    {A mod that shows these pages inside a menu of its own says so by carrying a
+     quest with the editor id FL_CombinedMenuQuest; then this menu stays off
+     SkyUI's list. Looked up by editor id, so the host needs no script of its
+     own for it and no FormID of FleshCore's.}
     Return Quest.GetQuest("FL_CombinedMenuQuest") != None
 EndFunction
 

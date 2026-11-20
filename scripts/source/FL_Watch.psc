@@ -247,11 +247,6 @@ Event OnInit()
     ; it always has. On the existing-save case the flag costs one window, and
     ; the next load has it.
     skipFirstWindow = true
-    RegisterForModEvent("PaSo_TrapFollower", "OnPaSoTrapFollower")
-    Quest mcm = Game.GetFormFromFile(0x000A01, "FleshCore.esp") as Quest
-    If mcm != None
-        mcm.EnsureRegistered()
-    EndIf
     RegisterForSingleUpdate(Tick())
 EndEvent
 
@@ -281,8 +276,8 @@ Event OnKeyDown(Int keyCode)
         Actor player = Game.GetPlayer()
         Spell open = Game.GetFormFromFile(panelSpell, "FleshCore.esp") as Spell
         If open && player
-            ; Source and target both the player -- the idiom the retired quest and
-            ; FL_Grind already use for a self-delivered spell.
+            ; Source and target both the player -- the idiom FL_Grind already
+            ; uses for a self-delivered spell.
             open.Cast(player, player)
         Else
             Debug.Trace("[FleshCore] watcher: the panel spell " + panelSpell \
@@ -486,85 +481,6 @@ Race  beast2 = None
 Race  beast3 = None
 Race  beast4 = None
 Bool  beastAsked = false
-Keyword noStripKey = None    ; the scene framework's NoStrip, resolved once per session
-Bool  noStripAsked = false
-
-; ---- THE DEATH HOLD ---------------------------------------------
-;
-; One actor at a time whose next dismemberment must NOT kill them: the retired quest
-; takes their head with FleshCore's own Decapitate while they are knocked out, and
-; the design is "beheaded but not dead". Drain honours it in the two places a
-; wound kills -- Dismember, and the player-dies-of-anything rule -- and nowhere
-; else: they still bleed, their pieces still land, a Detonate still lifts them.
-;
-; The deadline is real time and it survives a clock restart the way
-; FL_KO_Hold's does: (until - now) can never exceed the span within one
-; session, so a larger value means the application restarted, and the hold is
-; re-based rather than left open for hours. the retired quest releases it itself on
-; every path; the deadline is the net under that.
-Actor heldDeath = None
-Float heldDeathUntil = 0.0
-Float heldDeathSpan = 0.0
-
-; ---- THEIR INTERIOR STAYS ON THROUGH A the scene framework SCENE -----------------
-;
-; the scene framework strips by biped slot, and its default female strip mask has 30, 47 and
-; 54 in it -- the test head, and the slots the fill and the lining wear. So a
-; target who went into a scene solid came out of it hollow, and a Detonate at
-; the end of one (which is what a consumer now does) found no head to split. the scene framework's
-; own exemption is a keyword, NoStrip (the scene plugin 0x2F16E), on the armour
-; itself; stamping head armour with it is established practice among
-; head-replacement mods, and it is done here the same way. The stamp is not saved
-; with the game, so it is made again on every engine session and every load,
-; and once more when the head armour is first learned from a mailbox.
-Bool Function StampNoStrip(Form akWhat)
-    If akWhat == None
-        Return false
-    EndIf
-    ; RESOLVED ONCE, like RetiredHead() and IsBeast(). DressRequested calls
-    ; this on every non-empty mailbox read -- five times a second -- and the
-    ; two lookups below sat ABOVE the HasKeyword early-out, so a keyword that
-    ; was stamped once was re-resolved by filename for the rest of the session.
-    ; Cleared on load with the other caches, because a Form resolved in one
-    ; session is not one to trust in the next.
-    If !noStripAsked
-        noStripAsked = true
-        If Game.IsPluginInstalled("FleshCore.esp")
-            noStripKey = None
-        EndIf
-    EndIf
-    Keyword noStrip = noStripKey
-    If noStrip == None
-        Return false
-    EndIf
-    If akWhat.HasKeyword(noStrip)
-        Return true
-    EndIf
-    PO3_SKSEFunctions.AddKeywordToForm(akWhat, noStrip)
-    Debug.Trace("[FleshCore] NoStrip keyword stamped on " + akWhat)
-    Return true
-EndFunction
-
-Function StampAllNoStrip()
-    StampNoStrip(Interior)
-    ; The head armour is learned from a mailbox, and on a save that has never
-    ; asked for a dress it is still None here -- which would leave the head
-    ; strippable in exactly the first scene this exists for. So the shipped
-    ; head is stamped by its own id when nothing better is known: FL_Head is
-    ; 0x860 in this plugin's frozen layout (the X row of the config carries the
-    ; same number), and a learned head, when there is one, is stamped as well.
-    ; BOTH OF THEM, ALWAYS. The fill later moved onto a second armour on
-    ; another biped slot, and slot 47 is in the scene framework's default strip mask exactly
-    ; as 30 was. Stamping only the learned one leaves the other strippable in
-    ; the first scene of a session that has not yet had a mailbox -- and which
-    ; one is "the other" depends on a config row, which is the wrong thing for
-    ; this to depend on. Both ids are frozen-layout facts.
-    StampNoStrip(Game.GetFormFromFile(0x00000860, "FleshCore.esp") as Armor)
-    StampNoStrip(Game.GetFormFromFile(0x0000088C, "FleshCore.esp") as Armor)
-    If headFill
-        StampNoStrip(headFill)
-    EndIf
-EndFunction
 
 Bool Function HasAcheron()
     If acheronKnown == 0
@@ -576,51 +492,6 @@ Bool Function HasAcheron()
         Debug.Trace("[FleshCore] Acheron " + (acheronKnown == 1))
     EndIf
     Return acheronKnown == 1
-EndFunction
-
-Function HoldDeath(Actor who, Float seconds = 300.0)
-    {Their next dismemberment does not kill them, for `seconds` or until released.}
-    If !who
-        Return
-    EndIf
-    If heldDeath && heldDeath != who
-        Debug.Trace("[FleshCore] death hold moves from " + heldDeath + " to " + who)
-    EndIf
-    heldDeath = who
-    heldDeathSpan = seconds
-    heldDeathUntil = Utility.GetCurrentRealTime() + seconds
-    Debug.Trace("[FleshCore] death HELD on " + who + " for " + seconds + "s")
-EndFunction
-
-Function ReleaseDeath(Actor who)
-    {The hold comes off. Only theirs: releasing somebody else's is a no-op.}
-    If who && heldDeath == who
-        heldDeath = None
-        heldDeathUntil = 0.0
-        heldDeathSpan = 0.0
-        Debug.Trace("[FleshCore] death RELEASED on " + who)
-    EndIf
-EndFunction
-
-Bool Function DeathHeld(Actor who)
-    {Is their death held right now? Expiry and a restarted clock are handled here,
-     on the read, so nothing has to tick for the hold to lapse.}
-    If !who || heldDeath != who
-        Return false
-    EndIf
-    Float now = Utility.GetCurrentRealTime()
-    If (heldDeathUntil - now) > heldDeathSpan
-        heldDeathUntil = now + heldDeathSpan
-        Debug.Trace("[FleshCore] the real-time clock restarted under the death hold on " + who + " -- re-based")
-    EndIf
-    If now > heldDeathUntil
-        Debug.Trace("[FleshCore] the death hold on " + who + " EXPIRED")
-        heldDeath = None
-        heldDeathUntil = 0.0
-        heldDeathSpan = 0.0
-        Return false
-    EndIf
-    Return true
 EndFunction
 
 Function KillForReal(Actor vic)
@@ -645,8 +516,8 @@ Function KillForReal(Actor vic)
     Bool guarded = HasAcheron()
     If guarded
         ; A GLOBAL SWITCH, COUNTED. This runs on this script's beat and
-        ; on the retired quest's thread; two kills in flight used to let the first
-        ; one's re-enable land under the second one's Kill().
+        ; on any other script's thread that calls it; two kills in flight used to
+        ; let the first one's re-enable land under the second one's Kill().
         killGuard += 1
         Acheron.DisableProcessing(true)
         Acheron.DisableConsequence(true)
@@ -717,10 +588,6 @@ Function AssertIdentity()
      same fact FL_Grant writes; asserting it once a minute means any future
      identity change heals within a minute of loading, instead of never.}
     MiscUtil.WriteToFile("Data/SKSE/Plugins/FleshCore.ids.txt", "" + Self.GetFormID(), false, false)
-    Quest mcm = Game.GetFormFromFile(0x000A01, "FleshCore.esp") as Quest
-    If mcm != None
-        mcm.EnsureRegistered()
-    EndIf
 EndFunction
 
 Function RegrantSpells()
@@ -742,36 +609,19 @@ Function RegrantSpells()
     ;
     ; A spell that is no longer in FL_SpellList stops being GRANTED, and that
     ; is all it stops: a save that already has it keeps it forever, castable
-    ; and inert, because its wound row is gone from the config too. These two
-    ; were meant to go, so they are removed from them as well.
+    ; and inert, because its wound row is gone from the config too. This one
+    ; was meant to go, so it is removed from them as well.
     ;
-    ; By local id and not by property: adding two properties would mean two
-    ; more entries in the plugin's script data, and these records are being
-    ; retired, not wired in. FormIDs never move in this plugin, so 0x888 and
-    ; 0x88A are facts.
+    ; By local id and not by property: adding a property would mean one more
+    ; entry in the plugin's script data, and this record is being retired, not
+    ; wired in. FormIDs never move in this plugin, so 0x888 is a fact.
     ;
     ; DropSpell used to sit at the bottom of this function, under the
     ; `If !SpellList` return -- so on a save whose SpellList property failed to
-    ; fill, the two retired spells would never come off the player at all.
+    ; fill, the retired spell would never come off the player at all.
     ; Taking something away has nothing to do with the list of things to give.
     Int gone = 0
     gone += DropSpell(0x00000888)         ; FL_DetonateAlt_Spell
-    gone += DropSpell(0x0000088A)         ; the alt burst spell
-    ; ---- The retired Sequence -----------------------------------------------------------
-    ; The Sequence is not offered: its two spells are
-    ; retired outright (the effect stub is a no-op, the HQ neither lists nor grants
-    ; them, the grant loop below refuses them whatever grants.txt says, and
-    ; FL_Api.Cast refuses them). The four white-mark spells are no longer
-    ; granted by the base mod: the records stay (the FL_Api kinds the alt mark /
-    ; the alt burst still resolve them, consumers cast 0x885 directly), they are
-    ; simply off the player's spellbook and out of FL_SpellList. Same DropSpell
-    ; precedent, same reason as 0x888/0x88A above.
-    gone += DropSpell(0x00000894)         ; retired spell 0x894        -- retired
-    gone += DropSpell(0x000008A9)         ; retired spell 0x8A9       -- retired
-    gone += DropSpell(0x00000846)         ; the mark spell         -- "Splatter (White)": no longer granted by the base mod
-    gone += DropSpell(0x00000852)         ; the self mark spell     -- "Splatter (White, Self)": FL_Api kind "the alt mark" still resolves it
-    gone += DropSpell(0x00000882)         ; the alt burst spell     -- "Detonate (White)"
-    gone += DropSpell(0x00000885)         ; the self alt burst spell -- "Detonate (White, Self)": FL_Api kind "the alt burst"; consumers cast it directly
     If gone > 0
         Debug.Notification("[FleshCore] " + gone + " retired spell(s) removed")
         Debug.Trace("[FleshCore] watcher removed " + gone + " retired spell(s)")
@@ -816,8 +666,7 @@ Function RegrantSpells()
         Spell sp = SpellList.GetAt(i) as Spell
         If sp
             Int lid = Math.LogicalAnd(sp.GetFormID(), 0xFFFFFF)
-            ; 0x894 / 0x8A9 are retired: never wanted, whatever the file says.
-            Bool want = lid != 0x894 && lid != 0x8A9 && StringUtil.Find(granted, "\n" + lid + "\n") >= 0
+            Bool want = StringUtil.Find(granted, "\n" + lid + "\n") >= 0
             Bool has = player.HasSpell(sp)
             If want && !has
                 player.AddSpell(sp, false)
@@ -983,28 +832,6 @@ Function SeatHead(Actor a)
      slot-30 helmet keeps it and gets no head fill, where the old code would have
      knocked the helmet off.}
     If !a || !headFill
-        Return
-    EndIf
-    ; ---- NOT WHILE THE SEQUENCE OWNS THEIR DEATH ------------------
-    ;
-    ; They are decapitated ON PURPOSE for as long as DeathHeld(a) is true --
-    ; the retired quest's own "a neck cut that needs no skull" -- and neither the
-    ; dress mailbox nor the general sweep knew that: RequestDressing fires
-    ; the instant their Decapitate wound leaves them without a head fill, the
-    ; same way it would for any ordinary wound, and this function used to
-    ; seat the fill right back on regardless of why they have none. The equip
-    ; that followed rebuilt their 3D; the DLL's own watch noticed and re-cut
-    ; the newly-seated shape onto their still-standing wound the moment it
-    ; did (flesh.cpp's WatchOne / the warm thread's reread, "put back: N
-    ; wounded cell(s) re-cut onto their new 3D") -- and the mark saw their head
-    ; reappear and vanish again mid-scene, one of the bugs seen in testing.
-    ; PreDressOne already refuses this for the load sweep alone (its own
-    ; "neck cut that needs no skull" note, gated on Unconscious/Paralysis);
-    ; this is the same refusal, asked the more direct way, for every caller
-    ; -- the mailbox and the general sweep never had it at all, and even
-    ; PreDressOne's own gate does not reach the scene itself, where they are
-    ; stood up (LetUp) but still DeathHeld until OnSceneEnd releases them.
-    If DeathHeld(a)
         Return
     EndIf
     ; ---- NOT ON A BEAST TARGET -------------------------------------------
@@ -1210,11 +1037,6 @@ Function CheckLoad()
         Return
     EndIf
     lastLoad = v
-    RegisterForModEvent("PaSo_TrapFollower", "OnPaSoTrapFollower")
-    Quest mcm = Game.GetFormFromFile(0x000A01, "FleshCore.esp") as Quest
-    If mcm != None
-        mcm.EnsureRegistered()
-    EndIf
     ; RESET FIRST, STRIP SECOND. The reset is this script's own variables and
     ; cannot fail; the strip reaches into another mod and a dozen native calls.
     ; If anything in there throws, the wound replay is already stopped.
@@ -1240,7 +1062,6 @@ Function CheckLoad()
     ; is not something to trust in the next.
     retiredHeadAsked = false
     beastAsked = false
-    noStripAsked = false
     koHoldAsked = false
     ; ---- AND LEARNED BACK FROM THE CONFIG AT ONCE ----------------
     ;
@@ -1296,9 +1117,15 @@ Function CheckLoad()
     ; registrations have to be refreshed after each game load, and FL_MCM's
     ; quest has no alias to tell it one happened, so the quest is registered
     ; for this event here, by its form, right before the event goes out.
+    ; The hooks quest (0x948) is registered the same way: FL_Effects, and any
+    ; script a mod attaches beside it, re-arms its own listeners on this event.
     Quest mcmQuest = Game.GetFormFromFile(0x000008C4, "FleshCore.esp") as Quest
     If mcmQuest
         mcmQuest.RegisterForModEvent("FleshCore_GameReload", "OnFleshCoreReload")
+    EndIf
+    Quest hooksQuest = Game.GetFormFromFile(0x00000948, "FleshCore.esp") as Quest
+    If hooksQuest
+        hooksQuest.RegisterForModEvent("FleshCore_GameReload", "OnFleshCoreReload")
     EndIf
     SendModEvent("FleshCore_GameReload")
     ; A load is the one moment the process may be carrying a death-camera
@@ -1376,9 +1203,6 @@ Function CheckLoad()
         lastStampText = ss
         lastStamp = ss as Int
     EndIf
-    ; The stamp CheckSession would have made is made here instead, because the
-    ; stamp adopted above is what stops CheckSession from noticing.
-    StampAllNoStrip()
     Debug.Trace("[FleshCore] watcher: save loaded (load stamp " + v \
                 + ") -- wound sequence restarted at 1, reconciling decals for 10s (" \
                 + DC_Api.MarkedCount() + " actor(s) may be dirty, " + owed \
@@ -1445,8 +1269,6 @@ Function CheckSession()
         nextWound = 1
         nextEvent = 1
         Debug.Trace("[FleshCore] watcher: engine session " + lastStamp + " -- wound sequence restarted at 1")
-        ; A new engine session is a new form table: the stamp is gone with it.
-        StampAllNoStrip()
         ; AND THE LOAD THAT LED HERE IS MADE VISIBLE. Reaching
         ; this line means a load happened that CheckLoad did not fire on: the
         ; VM only runs once a save is loaded, and CheckLoad adopts the session
@@ -1627,7 +1449,7 @@ Function NotifySkyrimNetWound(Actor vic, String payload)
     If lostMask != prevLostMask
         StorageUtil.SetIntValue(vic, "FC_SNLostMask", Math.LogicalOr(prevLostMask, lostMask))
     EndIf
-    Bool isBlast = (flags / 1024 % 2 == 1) || (wForm == "detonate") || (wForm == "detonatealt")
+    Bool isBlast = (flags / 1024 % 2 == 1) || (wForm == "detonate")
     Bool headLost = (flags / 4096 % 2 == 1)
     Bool trunkLost = Math.LogicalAnd(newLostMask, 12) != 0
     Bool lArmLost = Math.LogicalAnd(newLostMask, 112) != 0
@@ -1635,7 +1457,7 @@ Function NotifySkyrimNetWound(Actor vic, String payload)
     Bool lLegLost = Math.LogicalAnd(newLostMask, 7168) != 0
     Bool rLegLost = Math.LogicalAnd(newLostMask, 57344) != 0
     Bool isSevered = headLost || trunkLost || lArmLost || rArmLost || lLegLost || rLegLost || (flags % 2 == 1 && newLostMask != 0)
-    Bool noKill = DeathHeld(vic) || (flags / 2048 % 2 == 1) || FL_Api.NoKill(vic)
+    Bool noKill = (flags / 2048 % 2 == 1) || FL_Api.NoKill(vic)
     Float now = Utility.GetCurrentRealTime()
     Float lastAt = StorageUtil.GetFloatValue(vic, "FC_SNLastTime", 0.0)
     Int lastSev = StorageUtil.GetIntValue(vic, "FC_SNLastSev", 0)
@@ -1666,11 +1488,7 @@ Function NotifySkyrimNetWound(Actor vic, String payload)
     String msg = ""
     If isBlast
         evType = "fleshcore_explosion"
-        If wForm == "detonatealt" || (flags / 256 % 4 == 2)
-            msg = vName + "'s body violently explodes apart from overwhelming internal pressure into visceral chunks!"
-        Else
-            msg = vName + "'s body violently explodes apart into bloody chunks and torn flesh!"
-        EndIf
+        msg = vName + "'s body violently explodes apart into bloody chunks and torn flesh!"
     ElseIf headLost
         evType = "fleshcore_decapitation"
         If noKill
@@ -1880,7 +1698,8 @@ Function PlaceLine(String out)
     ; ---- THE KICK AND THE MARK, OUT OF THE SAME WORD ----------------
     ;
     ; Bits 0 and 1 are what they always were. Bits 2-7 are the wound's kick,
-    ; bits 8-9 the mark it forces onto its pieces (0 none, 1 blood, 2 alt),
+    ; bits 8-9 the mark it forces onto its pieces (0 none, 1 blood, 2 and 3
+    ; a DecalCore kind another mod registered -- see the forced mark below),
     ; both straight off the W row -- flesh.cpp packs them exactly so. Papyrus
     ; has no shift, so they are divided out. The kick is handed to each
     ; severed section on the call that already tells it what it is; the mark
@@ -1907,7 +1726,7 @@ Function PlaceLine(String out)
     ;     2 severed     how many separate sections they are in now
     ; numArg is the flags word again, for a handler that wants no parsing.
     ; Sent BEFORE the kill below, so a handler sees them alive and can act --
-    ; a held death (the Sequence) is reported exactly like any other.
+    ; a held death (a never-kill rule) is reported exactly like any other.
     If vic
         vic.SendModEvent("FleshCore_Wound", flags + "|" + n + "|" + severed, flags as Float)
     EndIf
@@ -1921,7 +1740,7 @@ Function PlaceLine(String out)
     ; way, and a target standing up with no legs is worse than a missing gib.
     Bool noKillVic = false
     If vic
-        noKillVic = DeathHeld(vic) || (flags / 2048 % 2 == 1) || FL_Api.NoKill(vic) \
+        noKillVic = (flags / 2048 % 2 == 1) || FL_Api.NoKill(vic) \
             || ((flags % 2 == 0) && FL_Api.GetInt(vic, "headfatal") == 0)
     EndIf
     ; NOT A FAILED REVIVE: a wound that kills them, or that finds them
@@ -1938,7 +1757,7 @@ Function PlaceLine(String out)
     EndIf
     If flags % 2 == 1 && vic
         If noKillVic
-            ; A held death -- the Sequence's decapitation, or a NoKill/registry override.
+            ; A held death -- a NoKill/registry override.
             ; They come apart and stay alive; no kill, no ragdoll, no flag clearing.
             Debug.Trace("[FleshCore] " + vic + " was severed but their death is HELD / NoKill -- not killed")
         Else
@@ -1968,8 +1787,8 @@ Function PlaceLine(String out)
     ; No separate rule here: for the player the DLL sets bit 0 only when a
     ; named part is lost to something other than a spell, so a non-fatal cut
     ; or a spell wound never kills them. The kill above is the only one, after
-    ; the same noKillVic test as anyone's (DeathHeld, bit 11 nolethal,
-    ; FL_Api.NoKill, or a non-lethal headfatal=0 override).
+    ; the same noKillVic test as anyone's (bit 11 nolethal, FL_Api.NoKill,
+    ; or a non-lethal headfatal=0 override).
 
 
 
@@ -2055,14 +1874,16 @@ Function PlaceLine(String out)
     ; and returns None for anything that is not one, which MarkOn treats as
     ; unmarked.
     Int mark = -1
-    ; A FORCED MARK OUTRANKS WHAT THEY WORE. the alt burst's row says 2,
-    ; so every piece of them leaves in alt at the heaviest band whether or not
-    ; anyone painted them first; the blood coat FL_Chunk gives every piece
+    ; A FORCED MARK OUTRANKS WHAT THEY WORE. A W row's mark column of 2 or 3
+    ; names DecalCore kind 1 or 2, a kind another mod registered: every piece
+    ; of them leaves wearing it at the heaviest band whether or not anyone
+    ; painted them first; the blood coat FL_Chunk gives every piece
     ; unconditionally goes on underneath it, as it does under any mark. 1 is
-    ; blood, which the piece already wears, so it is the same as none. The
-    ; packing is DC_Api's own: kind * 10 + level, level 5 the heaviest of six.
-    If forced == 2
-        mark = DC_Api.ALT() * 10 + 5
+    ; blood, which the piece already wears, so it is the same as none, and so
+    ; is a kind nobody registered. The packing is DC_Api's own: kind * 10 +
+    ; level, level 5 the heaviest of six.
+    If forced >= 2 && DC_Api.HasKind(forced - 1)
+        mark = (forced - 1) * 10 + 5
     ElseIf DC_Api.PaintReady()
         mark = DC_Api.MarkOn(victim as Actor)
     EndIf
@@ -2423,8 +2244,8 @@ Function Dismember(Actor vic)
     EndIf
     ; Design note: when the player dies a FleshCore death, the camera sits
     ; a little further out than usual. Raised BEFORE the kill, while
-    ; the caller (consumers) is still holding them in third person -- see
-    ; DeathCamOut (an INI setting, and no forced third person).
+    ; the camera may still be in third person -- see DeathCamOut (an INI
+    ; setting, and no forced third person).
     If pusher && pusher == vic
         DeathCamOut()
     EndIf
@@ -2583,7 +2404,6 @@ Function ReviveRequested()
         headArmor = Game.GetFormEx(ids[0] as Int) as Armor
         If headArmor
             headFill = headArmor
-            StampNoStrip(headFill)
         EndIf
     EndIf
     Int k = 1
@@ -2679,13 +2499,12 @@ Function ReviveRequested()
                     Acheron.RescueActor(a)
                 Else
                     a.Resurrect()
-                    ; PARALYSIS SURVIVES RESURRECT (standard
-                    ; own warning, consumer scripts), and a target revived
+                    ; PARALYSIS SURVIVES RESURRECT, and a target revived
                     ; with it at 1 lies there for good. The knockout hold sets
                     ; it on every target it puts down and leaves it on their
-                    ; corpse, and a consumer sets it on its corpses too -- so a body
-                    ; brought back here is taken to zero unconditionally, the
-                    ; way a consumer's RecoverPlayer does, before the register is told.
+                    ; corpse, and other mods leave it on corpses too -- so a body
+                    ; brought back here is taken to zero unconditionally, before
+                    ; the register is told.
                     ; The register then gives back the rest of what it set (the
                     ; flag, and the AI under the AI-freeze hold) in this same frame
                     ; rather than on its next tick.
@@ -2710,17 +2529,17 @@ Function ReviveRequested()
                 ; above already re-seats the head; one path, one set of rules.
                 ; ---- AND THEY ARE CLEANED, BECAUSE NOTHING ELSE EVER DID ----
                 ;
-                ; Field report: restored targets were still covered in alt.
+                ; Field report: restored targets were still covered in marks.
                 ; There were two separate reasons for it, so
                 ; there are two calls.
                 ;
                 ; THE COAT. DC_Api.CoatSkin and DC_Api.Coat play an effect
                 ; shader with a duration of -1.0, which the engine reads as
                 ; forever, and at first DecalCore had no call that stopped
-                ; one. the burst script coats them at the heaviest band on every
-                ; cast; Resurrect does not touch a shader. Both kinds are taken
-                ; off because a target can have been shot with either and this
-                ; is not the place to work out which.
+                ; one. The burst script coats them at the heaviest band on every
+                ; cast; Resurrect does not touch a shader. Every kind is taken
+                ; off because a target can have been marked with any of them and
+                ; this is not the place to work out which.
                 ;
                 ; THE OVERLAY MARKS. Those are RaceMenu node properties, and
                 ; Resurrect leaves them alone as well -- and the save's own
@@ -2732,8 +2551,7 @@ Function ReviveRequested()
                 ; put ARMOUR on them, and an overlay is written onto the 3D they
                 ; are wearing; cleaning first and equipping after invites the
                 ; rebuild an equip can queue to arrive on top of the clean.
-                DC_Api.Uncoat(a, DC_Api.ALT())
-                DC_Api.Uncoat(a, DC_Api.BLOOD())
+                DC_Api.UncoatAll(a)
                 DC_Api.ClearMarks(a)
                 CleanFEC(a)
                 ; AND THEY ARE LOOKED AT AGAIN, because Resurrect() returning is
@@ -2805,7 +2623,6 @@ Function DressRequested()
         Armor h = Game.GetFormEx(ids[0] as Int) as Armor
         If h
             headFill = h
-            StampNoStrip(headFill)
             headToken = ids[0]
             k = 1
         EndIf
@@ -3075,8 +2892,7 @@ EndFunction
 ; frame in the first second buys nothing a corpse can use. So is a target held
 ; unconscious or paralysed (the knockout register's): a biped rebuild on a
 ; ragdoll is a visible pop; their head is left to the sweep, which has no such
-; guard, and the Sequence's Decapitate on them is a neck cut that needs no
-; skull. A standing naked cut target among the five pays one
+; guard. A standing naked cut target among the five pays one
 ; on-thread voxelise in the fade-in for their skull and brain; that is the
 ; trade, and it is stated here so the log reader expects the [LOAD] line.
 
@@ -3590,8 +3406,7 @@ Int Function PreDressOne(Actor a)
      unconscious or paralysed -- the knockout register's targets, ragdolled on
      the floor: a biped rebuild on a ragdoll is a visible pop, they are the
      cut-and-watched body the note above prices; their head is deferred to the
-     sweep, and the Sequence's Decapitate is a neck cut that needs no skull
-     (the W row for 2169 names the neck). The clothed path is not gated this
+     sweep. The clothed path is not gated this
      way: an interior is what makes them a target at all, and the register
      holds only targets the DLL already knows.
 
@@ -3915,7 +3730,7 @@ EndFunction
 ; booked them, or the checker would call up a target its caller called down.
 ;
 ; SAME PARALLEL-ARRAY SHAPE AS THE LIFT. Sixteen slots: the revive file names
-; up to sixty-three targets but a scene usually has a handful dead at once, and a
+; up to sixty-three targets but a fight usually leaves a handful dead at once, and a
 ; seventeenth is simply not checked -- they still got their Resurrect(). Bookings
 ; are staggered a tenth of a second per slot so a whole Restore's worth of
 ; targets do not reach the same rung on the same beat.
@@ -4232,20 +4047,6 @@ Function DeathCamBack(Bool abForce)
     MiscUtil.WriteToFile(CamFile(), "0", false, false)
     Utility.SetINIFloat("fVanityModeMinDist:Camera", prev)
     Debug.Trace("[FleshCore] death camera: fVanityModeMinDist:Camera back to " + prev)
-EndFunction
-
-Function OnPaSoTrapFollower(String eventName, String strArg, Float numArg, Form sender)
-    {Automatically restore FleshCore wounds/head-fills on the player whenever an external
-     aftermath mod fires this mod event, even on an untouched that mod install.}
-    Actor p = Game.GetPlayer()
-    If !p
-        Return
-    EndIf
-    FL_Api.Restore(p)
-    FL_Api.SetNoKill(p, false)
-    Utility.Wait(1.6)
-    FL_Api.Restore(p)
-    FL_Api.SetNoKill(p, false)
 EndFunction
 
 Function VoiceMouthPass()

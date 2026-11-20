@@ -15,14 +15,14 @@ Scriptname FL_Api Hidden
      EndIf
 
  THE CONTRACT:
-   * Every function here is permanent. New ones may be added; none removed
-     or renamed.
-   * Local FormIDs published in the reference are permanent. FleshCore only
-     ever appends records (the plugin's own law).
+   * Every function here is kept. New ones may be added; none is removed or
+     renamed without a note in the changelog.
+   * Local FormIDs published in the reference keep their records for as long
+     as they exist, and a retired id is never given to another record.
    * Event payloads are '|'-separated and only ever GROW, at the end. Read
      them by index with Field() and a missing column comes back "".
-   * Feature tokens are permanent: added the version a feature ships, never
-     removed, never renamed. Ask Has() before using anything optional.
+   * Feature tokens are kept and never renamed; one whose feature is withdrawn
+     goes with a note in the changelog. Ask Has() before using anything optional.
    * The config's row letters, the wound files, and anything reached other
      than through this script are NOT promised.
 
@@ -38,7 +38,7 @@ Bool Function IsInstalled() Global
 EndFunction
 
 String Function VersionString() Global
-    {The engine's own version, e.g. "0.1 Beta", read from what the DLL wrote this
+    {The engine's own version, e.g. "0.1.1 Beta", read from what the DLL wrote this
      session. "" means the SKSE plugin did not load -- which is the single most
      useful thing to know when nothing else works.}
     String raw = MiscUtil.ReadFromFile("Data/SKSE/Plugins/FleshCore.version.txt")
@@ -63,7 +63,7 @@ Bool Function Has(String feature) Global
      every launch, so a stale file cannot claim a feature that is not there.
      Tokens so far: api wound restore lethality event grants panel mcm decals
      state nolethal registry whynot trig vulnhp cmd events vortex heal window
-     magic drain scalar verdict scenes effects shards plugin per
+     magic drain scalar verdict effects shards plugin per
      hq drainspell.
      A consumer that asks before using degrades instead of failing.}
     If feature == ""
@@ -133,13 +133,6 @@ Bool Function Cast(Actor akActor, Int localId) Global
     If !akActor || localId <= 0
         Return false
     EndIf
-    If localId == 0x894 || localId == 0x8A9
-        ; THE SEQUENCE IS INERT:
-        ; its effect is a no-op, so a caller is told here instead of casting
-        ; something that does nothing.
-        Debug.Trace("[FleshCore] FL_Api.Cast: 0x894/0x8A9 (the Sequence) is retired -- not cast")
-        Return False
-    EndIf
     If !IsInstalled()
         Return false
     EndIf
@@ -170,25 +163,15 @@ EndFunction
 Int Function KindToLocal(String kind) Global
     {The kind table. Local ids are permanent (the plugin only appends), so
      these are facts, not configuration. Case-insensitive: Papyrus string
-     comparison already is.
-
-     Additional alias kinds resolve records kept in the plugin for
-     append-only FormID stability. The base mod does not grant those
-     reserved spells to the player (they are not in FL_SpellList or
-     the HQ), but the records remain in the plugin so existing callers
-     continue to resolve them.}
+     comparison already is.}
     If kind == "decapitate"
         Return 0x00000896
     ElseIf kind == "detonate"
         Return 0x0000089E
-    ElseIf kind == "detonatealt"
-        Return 0x00000885
     ElseIf kind == "bisect"
         Return 0x00000856
     ElseIf kind == "splatter"
         Return 0x0000084F
-    ElseIf kind == "altmark"
-        Return 0x00000852
     ElseIf kind == "armoffl"
         Return 0x000008A0
     ElseIf kind == "armoffr"
@@ -197,10 +180,6 @@ Int Function KindToLocal(String kind) Global
         Return 0x000008A4
     ElseIf kind == "legoffr"
         Return 0x000008A6
-    ElseIf kind == "altmark2"          ; additive alias of "the alt mark": same record 0x852, same promise
-        Return 0x00000852
-    ElseIf kind == "detonatealt2"      ; additive alias of "the alt burst": same record 0x885
-        Return 0x00000885
     EndIf
     Return 0
 EndFunction
@@ -215,9 +194,9 @@ EndFunction
 ; death rule alone is told to look away. The other two levels are the config's
 ; (a W row's nokill column, and the NL row's per-origin flags).
 ;
-; PER SESSION. The engine clears the file at every launch, so a scene that
-; crashed cannot leave them unkillable into the next game. Set it when your
-; scene starts, clear it when your scene ends.
+; PER SESSION. The engine clears the file at every launch, so a mod that
+; crashed cannot leave them unkillable into the next game. Set it before the
+; stretch in which they must not die, clear it when that stretch ends.
 
 Function SetNoKill(Actor akActor, Bool abOn) Global
     {Add or remove an actor from the never-kill registry. Takes effect on the
@@ -497,7 +476,7 @@ Function RemoveTrigger(String caller, Int id) Global
 EndFunction
 
 Function ClearTriggers(String caller) Global
-    {Take every one of your rows back -- what a mod does when its scene ends.}
+    {Take every one of your rows back -- what a mod does when it is done with them.}
     If caller == ""
         Return
     EndIf
@@ -633,16 +612,13 @@ Int Function WoundAt(String caller, Actor akActor, Float x, Float y, Float z, St
     Return Send("woundat", caller, akActor.GetFormID() + "|" + x + "|" + y + "|" + z + "|" + columns)
 EndFunction
 
-Int Function Detonate(String caller, Actor akActor, Bool altMark = false) Global
-    {A fixed detonate wound (size 12, depth 3, at the centre), as a command, with optional alt mark.}
-    Int mark = 1
-    If altMark
-        mark = 2
-    EndIf
+Int Function Detonate(String caller, Actor akActor) Global
+    {A fixed detonate wound (size 12, depth 3, at the centre), as a command; every
+     piece wears blood.}
     If !akActor
         Return -4
     EndIf
-    Return WoundEx(caller, akActor, Columns("detonate", 12.0, 3, "-", "centre", false, 1, 34, 20, 0, false, 0, mark))
+    Return WoundEx(caller, akActor, Columns("detonate", 12.0, 3, "-", "centre", false, 1, 34, 20, 0, false, 0, 1))
 EndFunction
 
 Int Function RestoreParts(String caller, Actor akActor, String parts = "all", Int layermask = 0) Global
@@ -876,7 +852,7 @@ EndFunction
 ; One number per actor, the PRODUCT of every caller's contribution (each
 ; 0.1..10), default 1. The engine divides every trigger threshold by it and
 ; scales what a BLOW or a DRAIN does to them (size, budget, depth); spells,
-; commands, vortexes and scene actions are deliberate and never scaled --
+; commands and vortexes are deliberate and never scaled --
 ; a mod that wants its own command scaled reads EffectiveScalar and
 ; multiplies its own columns. Who computes the factor is you: a belt is
 ; worth 1.3 to one mod and 2.0 to another, and FleshCore has no opinion.
@@ -1010,11 +986,11 @@ Bool Function EffectiveImmune(Actor akActor) Global
 EndFunction
 
 Bool Function EffectiveNoLethal(Actor akActor, String origin) Global
-    {Whether a wound from this origin (spell/hit/command/vortex/drain/scene)
+    {Whether a wound from this origin (spell/hit/command/vortex/drain)
      would be unable to kill them right now: the never-kill list, then the
      NL row's origin flags (spell, hit) as the config carries them, with the
-     player exemption. Scene actions are commands and are never suppressed
-     by origin -- a scene mod uses SetNoKill.}
+     player exemption. Commands are never suppressed by origin -- a mod that
+     needs a target kept alive uses SetNoKill.}
     If !akActor
         Return false
     EndIf
@@ -1076,12 +1052,13 @@ Int Function EffectiveLimbFatal(Actor akActor) Global
     Return v
 EndFunction
 
-; ---- scene rules and effect rules -------
+; ---- effect rules -------
 ;
-; Both live in StorageUtil on the hooks quest (FleshCore.esp 0x948) and are
-; read by the scene script / FL_Effects there. Per save, not per session: a rule
-; you add stays until you remove it; the abilities plugin re-registers its
-; three on every load through FleshCore_GameReload, which is the pattern.
+; They live in StorageUtil on the hooks quest (FleshCore.esp 0x948) and are
+; read by FL_Effects there. Per save, not per session: a rule you add stays
+; until you remove it; a mod that adds rules re-registers them on every load
+; through FleshCore_GameReload, which is the pattern. HooksQuest and NextRuleId
+; are open to any mod that keeps rules of its own on the same quest.
 
 Quest Function HooksQuest() Global
     Return Game.GetFormFromFile(0x00000948, "FleshCore.esp") as Quest
@@ -1093,77 +1070,6 @@ Int Function NextRuleId() Global
         Return 0
     EndIf
     Return StorageUtil.AdjustIntValue(q, "FC_ruleseq", 1)
-EndFunction
-
-Int Function AddSceneRule(String caller, String when, String partner, String tags, String target, String action, \
-        Int n = 1, Float withinSec = 60.0, Int prio = 0, String columns = "") Global
-    {when: end | stage | stageN. partner: any | creature | npc | player |
-     race:<name>. tags: "" or a comma list the animation must carry. target:
-     victim | player | nonplayer | all | random. action: a wound form name,
-     detonate, the alt burst or none; `columns` (thirteen) overrides the
-     action's default wound. Returns the rule id (> 0), or a negative code.}
-    If caller == "" || StringUtil.GetLength(caller) > 24
-        Return -1
-    EndIf
-    Quest q = HooksQuest()
-    If !q
-        Return -2
-    EndIf
-    If !(when == "end" || when == "stage" || when == "stageN")
-        Return -5
-    EndIf
-    If !(partner == "any" || partner == "creature" || partner == "npc" || partner == "player" || StringUtil.Find(partner, "race:") == 0)
-        Return -5
-    EndIf
-    If !(target == "victim" || target == "player" || target == "nonplayer" || target == "all" || target == "random")
-        Return -5
-    EndIf
-    If columns != "" && StringUtil.Split(columns, "|").Length != 13
-        Return -6
-    EndIf
-    If n < 1 || withinSec < 1.0
-        Return -6
-    EndIf
-    If tags == ""
-        tags = "-"
-    EndIf
-    If columns == ""
-        columns = "-"
-    EndIf
-    Int id = NextRuleId()
-    StorageUtil.StringListAdd(q, "FC_scene_rules", caller + "|" + id + "|" + when + "|" + partner + "|" + tags + "|" + target \
-        + "|" + action + "|" + n + "|" + withinSec + "|" + prio + "|" + columns, false)
-    Return id
-EndFunction
-
-Function RemoveSceneRule(String caller, Int id) Global
-    Quest q = HooksQuest()
-    If !q
-        Return
-    EndIf
-    Int i = StorageUtil.StringListCount(q, "FC_scene_rules") - 1
-    While i >= 0
-        String[] f = StringUtil.Split(StorageUtil.StringListGet(q, "FC_scene_rules", i), "|")
-        If f.Length >= 2 && f[0] == caller && (f[1] as Int) == id
-            StorageUtil.StringListRemoveAt(q, "FC_scene_rules", i)
-        EndIf
-        i -= 1
-    EndWhile
-EndFunction
-
-Function ClearSceneRules(String caller) Global
-    Quest q = HooksQuest()
-    If !q
-        Return
-    EndIf
-    Int i = StorageUtil.StringListCount(q, "FC_scene_rules") - 1
-    While i >= 0
-        String[] f = StringUtil.Split(StorageUtil.StringListGet(q, "FC_scene_rules", i), "|")
-        If f.Length >= 1 && f[0] == caller
-            StorageUtil.StringListRemoveAt(q, "FC_scene_rules", i)
-        EndIf
-        i -= 1
-    EndWhile
 EndFunction
 
 Int Function AddEffectRule(String caller, String part, Int maxRemainPct, Spell ability, Int prio = 0) Global
@@ -1219,24 +1125,6 @@ Function ClearEffectRules(String caller) Global
         EndIf
         i -= 1
     EndWhile
-EndFunction
-
-String Function SceneRules(String caller = "") Global
-    Quest q = HooksQuest()
-    If !q
-        Return ""
-    EndIf
-    String out = ""
-    Int n = StorageUtil.StringListCount(q, "FC_scene_rules")
-    Int i = 0
-    While i < n
-        String r = StorageUtil.StringListGet(q, "FC_scene_rules", i)
-        If caller == "" || StringUtil.Find(r, caller + "|") == 0
-            out += r + "\n"
-        EndIf
-        i += 1
-    EndWhile
-    Return out
 EndFunction
 
 ; ---- shards --------------------------------------

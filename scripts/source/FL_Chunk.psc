@@ -125,7 +125,7 @@ Int kick = 0                ; the wound's kick, given with ItIsAPieceOfTheBody
 ; target's own angles) is never mistaken for one. Decoded in OnInit from this
 ; reference's own angle: a native on itself, waiting on nobody.
 Bool engineMade = false     ; the roll decoded: this piece was placed by the engine
-Int  rollMark = -1          ; the wound's forced mark from the roll (0 theirs, 1 blood, 2 alt)
+Int  rollMark = -1          ; the wound's forced mark from the roll (0 theirs, 1 blood, 2-3 a registered kind)
 Float Property RollBase = 7.0702992 Auto
 {0.1234 rad in degrees -- the roll an engine-placed piece is born with, before
  its code is added. Must match flesh.cpp PlaceOne.}
@@ -512,12 +512,13 @@ Function Launch()
     ; both. That is also what a piece of them should look like.
     DC_Api.CoatSkin(Self, DC_Api.BLOOD(), BloodLevel)
     Int mark = DC_Api.PendingMark()
-    ; an engine-placed piece of a wound that FORCES alt (the alt burst's
-    ; W row says mark 2) carries that in its roll and does not depend on
-    ; FL_Watch having reached SetPendingMark before this piece's 3D arrived --
-    ; the exact packing FL_Watch uses for a forced mark, kind * 10 + level 5.
-    If engineMade && rollMark == 2
-        mark = DC_Api.ALT() * 10 + 5
+    ; an engine-placed piece of a wound whose W row FORCES a registered kind
+    ; (mark 2 or 3: DecalCore kind 1 or 2) carries that in its roll and does
+    ; not depend on FL_Watch having reached SetPendingMark before this piece's
+    ; 3D arrived -- the exact packing FL_Watch uses for a forced mark, kind * 10
+    ; + level 5. A kind nobody registered leaves the pending mark as it was.
+    If engineMade && rollMark >= 2 && DC_Api.HasKind(rollMark - 1)
+        mark = (rollMark - 1) * 10 + 5
     EndIf
     If mark >= 0 && mark / 10 != DC_Api.BLOOD()
         DC_Api.CoatSkin(Self, mark / 10, mark % 10)

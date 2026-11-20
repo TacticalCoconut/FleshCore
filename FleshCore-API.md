@@ -1,6 +1,6 @@
 # FleshCore - developer reference
 
-*FleshCore Beta v0.1 · this file ships in the mod folder*
+*FleshCore Beta v0.1.1 · this file ships in the mod folder*
 
 FleshCore voxelises playable-race actors into lattices of cells,
 forged at runtime from each actor's own meshes, and removes the cells a wound reaches; the
@@ -42,7 +42,7 @@ a registry rule, a trigger row and a `WhyNot` line - about a hundred and twenty 
 | function | returns | meaning |
 |---|---|---|
 | `IsInstalled()` | Bool | `FleshCore.esp` is in the load order |
-| `VersionString()` | String | the engine's version, e.g. `"0.1 Beta"`; `""` if the SKSE plugin did not load |
+| `VersionString()` | String | the engine's version, e.g. `"0.1.1 Beta"`; `""` if the SKSE plugin did not load |
 | `CoreActive()` | Bool | the engine is armed. False for the first second or two of a session |
 | `Has(String feature)` | Bool | this build carries the feature token - see below |
 | `Features()` | String | all tokens, space-separated |
@@ -66,7 +66,7 @@ a registry rule, a trigger row and a `WhyNot` line - about a hundred and twenty 
 | **Commands** | | every one returns a **ticket** (> 0) answered by `FL_Done`, or a negative code |
 | `WoundPart(caller, Actor, form, size, depth, part, anchor = "centre", nokill = false)` | Int | a wound on one named part, no record in the plugin |
 | `WoundEx(caller, Actor, columns)` / `WoundAt(caller, Actor, x, y, z, columns)` | Int | the thirteen columns; at a world point |
-| `Detonate(caller, Actor, altMark = false)` | Int | the standard detonate wound as a command: size 12, depth 3, at the centre |
+| `Detonate(caller, Actor)` | Int | the standard detonate wound as a command: size 12, depth 3, at the centre; the pieces wear blood |
 | `RestoreParts(caller, Actor, parts = "all", layermask = 0)` | Int | put parts back (`all` + 0 = whole) |
 | `Heal(caller, Actor, cellsPerSec = 4.0)` / `StopHeal(caller, Actor)` | Int | regrow them over time |
 | `Drain(caller, Actor, cellsPerSec = 4.0, seconds = 30.0, parts = "-", anchor = "-")` / `StopDrain(caller, Actor)` | Int | a **feed**: so many cells a second off them, one bite a second at the anchor of the named parts, for up to `seconds` or until stopped - what the Voxel Drain spell does, by command |
@@ -91,8 +91,20 @@ a registry rule, a trigger row and a `WhyNot` line - about a hundred and twenty 
 **Kinds** (all self-delivery, the only shape proven to land on a target cast at itself):
 `decapitate` `detonate` `bisect` `splatter` `armoffl` `armoffr` `legoffl` `legoffr`.
 Anything else: `Cast()` with a local id from the table below. Aimed spells
-(the twelve `Take*` limb spells, `Decapitate 0x87A`) may not land when self-cast. `Cast()` refuses
-`0x894` / `0x8A9` (reserved records) with a Papyrus log line and returns false.
+(the twelve `Take*` limb spells, `Decapitate 0x87A`) may not land when self-cast.
+
+## Mark kinds - `DC_Api`
+
+Marks on skin, surfaces and pieces come in **kinds**. Blood is kind `0` (`DC_Api.BLOOD()`), the one
+kind built in. Another mod can add kinds of its own, `1` to `7`, from its own records:
+`DC_Api.RegisterKind(kind, setsS, setsM, setsL, coat, skinCoat, skinStem)` - three FormLists of
+impact sets (small, medium, large; one is picked at random per cast), the flat-atlas coat
+`EffectShader`, a FormList of three body-UV coat shaders (lightest first), and the stem of six
+overlay textures under `textures\DecalCore\` (`skinStem` + `0`..`5` + `.dds`). It is kept in the
+save; register again on every load. `DC_Api.HasKind(kind)` says whether a kind is there. Every
+call that takes a kind - `Paint`, `Splat*`, `Coat`, `CoatSkin`, `Uncoat` - then marks with it, and
+a `W` row's `mark` column of `2` or `3` puts kind `1` or `2` on every piece of the wound. A kind
+nobody registered marks nothing (a burst falls back to blood).
 
 ## Feature tokens - `FleshCore.features.txt`
 
@@ -101,9 +113,10 @@ before using anything optional; a build that lacks a token simply lacks the feat
 
 `api` `wound` `restore` `lethality` `event` `grants` `panel` `mcm` `decals` `state` `nolethal`
 `registry` `whynot` `trig` `vulnhp` `cmd` `events` `vortex` `heal` `window` `magic` `drain` `scalar`
-`verdict` `scenes` `effects` `shards` `plugin` `per` `hq` `drainspell` `armour`
+`verdict` `effects` `shards` `plugin` `per` `hq` `drainspell` `armour`
 
-A token is added with the feature it names and is not removed or renamed.
+A token is added with the feature it names and is not renamed; a token whose feature is
+withdrawn goes with a note in the changelog.
 
 ## The events - from the engine, relayed by the watcher
 
@@ -125,7 +138,7 @@ about one tick (100 ms) after the engine wrote them. FormIDs inside `strArg` are
 | `FL_ShardActivated` (Papyrus) | the actor who touched it | 0 | `shardId\|victimId\|part\|layers\|cells\|section` |
 | `FL_ShardConsumed` (Papyrus) | the consumer's actor | 0 | the same, then `\|caller` |
 
-`origin`: 0 spell · 1 hit · 2 command · 3 vortex · 4 drain · 5 scene. `partsRemain` is
+`origin`: 0 spell · 1 hit · 2 command · 3 vortex · 4 drain. `partsRemain` is
 `part:pct,…` for every part not at 100 % - attachment, the loss rule's own number.
 `FL_Done` results: 0 done · 1 immune · 2 no body · 3 nothing to take · 4 expired · 5
 cancelled · 6 unsupported form · 7 bad argument · 8 not found.
@@ -170,7 +183,7 @@ the death rule. The target can still die of the *next* wound, from an origin tha
 1. **The registry** - `FL_Api.SetNoKill(target, true)`. A mod that names an actor has said they
    do not die of FleshCore wounds until it takes their name back. Outranks everything,
    including the player exemption. **Per session**: cleared at every launch, so set it when
-   your scene starts and clear it when it ends.
+   your encounter starts and clear it when it ends.
 2. **The wound's own column** - a `W` row's optional column 15, `nokill`.
 3. **The origin** - the config's `NL <spell> <hit> <player>` row, also the HQ's *Wounds
    that never kill* toggles. `player 0` exempts the player from levels 2 and 3.
@@ -182,7 +195,7 @@ the death rule. The target can still die of the *next* wound, from an origin tha
 rule matters. **One winner per (actor, key)**: the highest `prio`, ties to the later line;
 `immune` is *any true wins* - a mod that says they are immune is not out-voted by one that says
 they are not. `GetInt` and `WhoSet` read the same arbitration back. **Per session**: cleared at
-every launch, so set rules when your scene starts and clear them when it ends.
+every launch, so set rules when your encounter starts and clear them when it ends.
 
 | key | value | honoured by |
 |---|---|---|
@@ -204,7 +217,7 @@ eligible actor is **typed by what swung** and **measured against the rows**; one
 ```papyrus
 Int id = FL_Api.AddTrigger("MyMod", target, "slash", "pct", 15.0, "slabz", 5.0, 3)   ; them alone
 FL_Api.AddTrigger("MyMod", None, "blunt", "abs", 30.0, "bite", 12.0, 2)             ; everyone
-FL_Api.ClearTriggers("MyMod")                                                       ; when your scene ends
+FL_Api.ClearTriggers("MyMod")                                                       ; when you are done with them
 ```
 
 | column | values |
@@ -230,7 +243,7 @@ and the `H` fallback stand down
 (the page can keep the `T` rows). **Your registered rows always stand**; at prio 6 or above they
 outrank the HQ's. The page's *gates* apply to every row of every owner: who a blow may cut (the
 player, a follower, an essential or protected NPC, anyone else - asked by the hit path and the
-typed-magic path only, never of a spell, a command, a scene or a vortex; `FL_Declined … who`),
+typed-magic path only, never of a spell, a command or a vortex; `FL_Declined … who`),
 the health % above which no blow cuts (a registry `vulnhp` on them outranks it), which blows count
 (every one, or power and sneak only - a row's `blows` column, always 0 for yours), and its reset
 clocks (after so long without a new wound, or their health back above N %, they heal back through
@@ -433,17 +446,16 @@ holds; a `DR` config row (`DR 2379 4.0 30 chest top`) makes the effect a feed, a
 own script (`FL_Drain`) ends it on `OnEffectFinish`. The full list is the plugin's `SPEL`
 records; every editor id is `FL_<Name>_Spell`.
 
-Not in `FL_SpellList` (the plugin only appends records): `0x846`, `0x852`, `0x882`, `0x885`,
-`0x888`, `0x88A`, `0x894`, and `0x8A9` are reserved records kept for append-only FormID layout
-stability; the HQ does not list or grant them, and the watcher removes them from the player's spellbook.
+Not in `FL_SpellList`: `0x888`, a retired spell the plugin keeps so that its local id is never
+reused; the HQ does not list or grant it, and the watcher removes it from the player's spellbook.
 
 ## Compatibility
 
-- **FormIDs do not move.** FleshCore only appends records, so a local id in this document
-  keeps its record.
+- **FormIDs do not move.** A record keeps its local id for as long as it exists, and a
+  retired id is never given to another record.
 - **`FL_Api` functions are kept.** New ones may be added; none is removed or renamed without a note in the changelog.
 - **Event payloads only grow, at the end.** `Field()` is the reader.
-- **Feature tokens are kept.**
+- **Feature tokens are kept**; one whose feature is withdrawn goes with a note in the changelog.
 - **Return codes keep their meaning**; new ones may be added.
 - **Not promised:** the config's row letters, the wound files' format, `panel.json`, the
   DLL's log lines, and anything reached other than through `FL_Api` and the event.

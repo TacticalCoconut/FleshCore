@@ -197,6 +197,13 @@ constexpr std::uintptr_t kGeom_shaderProperty = 0x128;
 constexpr std::uintptr_t kGeom_skinInstance   = 0x130;
 constexpr std::uintptr_t kGeom_rendererData   = 0x138;
 constexpr std::uintptr_t kGeom_vertexDesc     = 0x148;
+// PROBE-ONLY, UNREAD: the slot before shaderProperty, taken to be the alpha
+// property, and NiAlphaProperty's flags (u16) and threshold (u8). Recalled,
+// not read. Only the FT probe reads them, through Peek, with no call through
+// what it finds; nothing acts on them until the probe's lines settle them.
+constexpr std::uintptr_t kGeom_alphaProperty  = 0x120;
+constexpr std::uintptr_t kAlpha_flags         = 0x30;
+constexpr std::uintptr_t kAlpha_threshold     = 0x32;
 
 // BSDynamicTriShape (clib RE/B/BSDynamicTriShape.h, sizeof 0x180 SE): a
 // BSTriShape (0x160) followed by DYNAMIC_TRISHAPE_RUNTIME_DATA at 0x160 --
@@ -312,6 +319,15 @@ constexpr std::uintptr_t kMatFG_tintTexture       = 0xA0;
 constexpr std::uintptr_t kMatFG_detailTexture     = 0xA8;
 constexpr std::uintptr_t kMatFG_subsurfaceTexture = 0xB0;
 
+// A FEATURE-6 (hair tint) material's colour: three floats at +0xA0, each a
+// multiple of 1/255, identical across one NPC's hair, brows and beard. READ in
+// a 1.6.1170 field log (57 of 57 feature-6 materials, vtable RVA 0x01AB7278);
+// re-checked by the FT probe's colour line. The vtable is corroboration for the
+// log only, as kVT_MaterialFacegen is: nothing tests it.
+constexpr std::uint32_t kMatFeature_HairTint = 6;
+constexpr std::uintptr_t kMatHT_tintColor    = 0xA0;
+constexpr std::uintptr_t kVT_MaterialHairTint = 0x01AB7278;
+
 // NiObjectNET's extra-data array, clib RE/N/NiObjectNET.h:
 //   NiExtraData** extra 0x20, u16 extraDataSize 0x28, u16 maxSize 0x2A.
 // NiExtraData itself is an NiObject with a BSFixedString name at 0x10
@@ -354,6 +370,31 @@ constexpr std::uintptr_t kSkinI_skinData      = 0x10;
 constexpr std::uintptr_t kSkinI_skinPartition = 0x18;
 constexpr std::uintptr_t kSkinI_bones         = 0x28;   // NiAVObject**
 constexpr std::uintptr_t kSkinI_numMatrices   = 0x3C;
+
+// NiTransform (sizeof 0x34): rotate 0x00 (NiMatrix3, row major), translate
+// 0x24, scale 0x30 -- the static_assert-checked layout quoted at kAV_world
+// above. A point goes through one as scale * (rotate * p) + translate.
+constexpr std::size_t    kSizeof_NiTransform = 0x34;
+
+// NiSkinData, reached through kSkinI_skinData: the mesh's overall skin
+// transform, an NiTransform.
+//
+// RECALLED, NOT READ AND NOT MEASURED. The public header, as remembered,
+// lists skinPartition 0x10, rootParentToSkin 0x18, boneData 0x50, bones 0x58,
+// sizeof 0x60. Those numbers are not read out of a copy of the header and
+// are not measured on a live shape, so nothing rests on the offset
+// unchecked: the object must answer to the class name "NiSkinData", the 0x34
+// bytes here must validate as a rigid transform -- every entry a number, the
+// rotation orthonormal and not a mirror, the translate and the scale within
+// reach -- and each [XFORM] line in the log states what the read came to. A
+// read that fails is reported and never used. When it fails, the
+// 4-byte-aligned offsets from kSkinD_scanFirst to kSkinD_scanLast are tried
+// the same way, for the log only, so the line names where a rigid transform
+// does sit; the last of them still ends inside the 0x60 bytes recalled
+// above.
+constexpr std::uintptr_t kSkinD_rootParentToSkin = 0x18;
+constexpr std::uintptr_t kSkinD_scanFirst        = 0x10;
+constexpr std::uintptr_t kSkinD_scanLast         = 0x2C;
 
 // NiSkinPartition (sizeof 0x28) and its Partition (sizeof 0x50).
 constexpr std::uintptr_t kSkinP_numPartitions = 0x10;
@@ -495,6 +536,27 @@ constexpr std::uint32_t kVertexSizeShift = 4;
 inline std::uint32_t VertexStride(std::uint64_t d) { return std::uint32_t(d & 0xF) * kVertexSizeShift; }
 inline std::uint32_t UVOffset(std::uint64_t d)     { return std::uint32_t((d >> 8) & 0xF) * 4u; }
 inline std::uint32_t SkinOffset(std::uint64_t d)   { return std::uint32_t((d >> 28) & 0xF) * 4u; }
+
+// THE NORMAL AND THE TANGENT, by the same nibble scheme: n4 * 4 is the packed
+// normal's offset and n5 * 4 the packed tangent's. Each is three signed
+// bytes (byte / 255 * 2 - 1) followed by one byte of the bitangent -- its y
+// after the normal, its z after the tangent -- and the bitangent's x is a
+// float in the four bytes after a full-float position, at offset 12.
+//
+// MEASURED, not quoted from a header: the meat format note in chunknif.cpp
+// reads all of it off a shipping stride-40 record, desc 0x0005B0007065040A
+// (normal @20, tangent @24, bitangent.x @12), and the stride-32 static mesh
+// measured beside it, 0x0003B00007650408, carries the same two nibbles. The
+// flag bits follow from those two descriptors and the three already proven
+// (VERTEX bit 44, COLORS bit 49, SKINNED bit 50): their flag words are 0x05B
+// and 0x03B, both with bits 3 and 4 set and bit 2 clear, so NORMALS is bit 47
+// and TANGENTS is bit 48. The skinned armour record measured there for its
+// colour lane, 0x0007B0008765040B, carries the same two nibbles and closes:
+// normal @20, tangent @24, colour @28, skin @32, stride 44.
+constexpr std::uint64_t kVF_NORMAL  = 1ull << 47;
+constexpr std::uint64_t kVF_TANGENT = 1ull << 48;
+inline std::uint32_t NormalOffset(std::uint64_t d)  { return std::uint32_t((d >> 16) & 0xF) * 4u; }
+inline std::uint32_t TangentOffset(std::uint64_t d) { return std::uint32_t((d >> 20) & 0xF) * 4u; }
 
 // BSLightingShaderProperty, as it sits in a NIF block: type u32 @0, name @4,
 // numExtra @8, controller @12, flags1 @16, flags2 @20, uvOffset, uvScale,

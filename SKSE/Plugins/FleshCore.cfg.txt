@@ -3,6 +3,23 @@
 # L cell wound maxcells budget mincells dropcells   H hitmode radius cooldownms
 # M shardnames sectionnames         -- 0 0 = built-in; small = force a wrap
 # S skinshader tintgain             G goreDiffuse goreNormal
+#   skinshader: 0 = a piece's skin takes their colour as a vertex colour on the
+#   ordinary shader; 1 = it takes the game's own skin shader, with their colour
+#   in it. tintgain multiplies the vertex colour under 0 and is not used under
+#   1; 0 or less turns their colour off under both.
+#   Two more S columns: tintcheck nudge.
+#   tintcheck: 0 (or absent) = off. 1 = when a piece appears in the world, read
+#   which colour the game holds for its skin, hair and face materials and write
+#   it to the log ([TINT] lines); nothing in the game is changed. 2 = also put
+#   their colour into a piece's own skin material, only after this session has
+#   seen two pieces of different colour on different materials. Other users of
+#   that material outside FleshCore cannot be seen, so 2 is a test setting.
+#   While FT column 2 is 2, a 2 here runs as 1, with a [CFG] line.
+#   nudge: 1 = each piece's skin block gets its own tiny texture offset (a
+#   fraction of a pixel, invisible) so the game cannot merge its material with
+#   another body's; 0 (or absent) = piece files exactly as before.
+#   A change takes effect at the next game start. As in every row, the columns
+#   are separated by TABs, not spaces.
 # V trianglesPerLump                 -- how the solid fill is grouped
 # C prewarm                          -- 1: build a body when they LOAD
 # R reread pollMs roster             -- 1: rebuild a changed 3D off the game's thread.
@@ -10,7 +27,7 @@
 #   that thread is idle, so a target a same-cell load raises no event for is built BEFORE
 #   something hits them. Otherwise such targets are a large share of game-thread rebuilds.
 # K clearGain jointGain headGain     -- the clearance rule; headGain is not used yet (0 = none)
-# HD probes swap lock skinGate       -- the head probes, [HEAD] in the log.
+# HD probes swap lock                -- the head probes, [HEAD] in the log.
 #   probes 1 costs about a millisecond on the FIRST wound of each of the first
 #   eight targets (read-only). HD 0, as shipped, leaves them off.
 # E mode perFrame prime clearance lift -- 0 script places; 1 PROBE (engine places first piece);
@@ -105,7 +122,7 @@
 #   sweep:  'nosever' skips the dismemberment sweep for this wound, so what
 #           it cuts free stays where it is instead of dropping as a piece
 #   kick:   N multiplies the launch force of every piece (0 = the default throw)
-#   mark:   what every piece wears -- 0 as they do, 1 blood, 2 alt
+#   mark:   what every piece wears -- 0 as they do, 1 blood; 2 and 3 a DecalCore kind another mod registered
 #   budget 0 = STRIP (remove it, build nothing); layers 0 = derive from depth
 Q	2101
 X	2188
@@ -114,19 +131,22 @@ P	2049,2050,2051,2052,2053,2054,2055,2056,2057,2058,2059,2060,2061,2062,2063,206
 L	4.0	12.0	34	12	34	10
 M	0	0
 H	0	9.0	900
-HD	0	0	0	0
+HD	0	0	0
 # HF mode -- THEIR OWN FACE. 0 off; 1 READ their live FaceGen
 #   face into the lattice as their skin, with nothing drawn changed and nothing
 #   of it counting towards their death; 2 as 1, and their face's skin counts
 #   towards the head's skin threshold (D row); 3 as 2, AND their face
 #   is cut on them like their body's skin -- its skin partition privatised and
 #   the survivors written into a new index buffer on the DLL's clone.
+#   What a severed section takes of their face goes into that piece as their
+#   skin; a shard carries none of it.
 HF	3
 # FA acc maxVerts -- THEIR EYES, BROWS, MOUTH AND HAIR. acc 0 reads no accessories;
 #   acc 1 reads every OTHER BSDynamicTriShape on them -- eyes, brows, mouth,
 #   face overlays, hair -- through the same private-buffer reader as their face,
-#   but as WARDROBE: layer 0, not skin, forging nothing and counting towards no
-#   death rule, and cut by the same Redraw that cuts their body. maxVerts is a
+#   but as WARDROBE: layer 0, not skin, counting towards no death rule, and cut
+#   by the same Redraw that cuts their body. In a piece they are plain surfaces
+#   with no muscle behind them. maxVerts is a
 #   COST ceiling, not a filter against physics hair: 12000 admits
 #   typical physics wigs (8,000-11,000 vertices) and excludes far denser shapes. See
 #   Config::accMaxVerts in flesh.cpp. FA 1 needs HF 3: an accessory is always cut, and
@@ -143,6 +163,28 @@ FO	0.000	-1.548	120.344
 #   and off skeleton_male.nif root-to-head: the same three numbers as the female row to
 #   the third decimal, kept as its own row because it is a constant of the MALE rig.
 FOM	0.000	-1.548	120.344
+# FT maps hair cutout normals dedup probe -- THEIR FACE AND ITS ACCESSORIES IN A
+#   PIECE. An absent row or column is 0, and all 0 writes every piece byte for
+#   byte as before the row. A value outside a column's range turns that column
+#   off, with a [CFG] line.
+#   maps 1: their face goes into a piece on the game's FaceGen shader, with the
+#     detail and tint maps read off their live head (needs HF 3), always
+#     written skinned even when the rest of the piece is rigid (D col 5 = 1).
+#   hair 1: hair, brows and beards (feature 6) take the hair-tint shader in the
+#     colour read off their live material; 2 also puts horns, frills and brows
+#     of the skin-tint kind (feature 5) on the skin-tint shader in their own
+#     colour. Needs normals 1: an accessory has no normals without it.
+#   cutout 1: feature-6 accessories get an alpha test (0x12EC, threshold 128),
+#     as vanilla hair carries on disk. 2 is not built yet and runs as 1.
+#   normals 1: accessories are given normals and tangents, so they are lit.
+#   dedup 1: an accessory identical to another in the same piece (a doubled
+#     wig) is dropped.
+#   probe 1: TEST ONLY. Writes budgeted [FACETEX] lines: at most 4000 a
+#     session (each wound's header included) and three one-time notices,
+#     most of them held until each actor's first wound. It reads at most
+#     2000 shapes a session. A release config carries 0.
+#   hair, cutout, normals and dedup need FA 1. Separate the fields with TABs.
+FT	1	2	1	1	1	0
 # DC <mode> <delta> <hold> <bleedX> -- the death camera, written into the
 #   player camera's state objects on the game's thread when a wound of theirs
 #   posts. delta is added to the third-person zoom offsets, bleedX multiplies
@@ -150,7 +192,7 @@ FOM	0.000	-1.548	120.344
 #   In play: state 9 at the wound, state 11 within half
 #   a second, bleedout zoom 200 -> 500, and the camera visibly further out.
 DC	1	0.35	6	2.5
-S	0	1.00
+S	1	1.00	0	1
 G	Textures\FleshCore\flesh_muscle.dds	Textures\FleshCore\flesh_muscle_n.dds
 V	108
 C	1
@@ -169,6 +211,7 @@ E	2	6	0	14.0	6.0
 #   a right hand to a right foot 7
 # 2 keeps a whole arm and a whole leg intact and forbids a whole side of the body.
 # 1 makes limbs come apart at the elbow and the knee.  0 turns the rule off.
+# A cutx row is exempt: the half it parts leaves whole, whatever this is set to.
 # LOSS DIVISORS (cols 8 and 9) -- a part counts as LOST when
 #   cells_now * N < cells_at_birth.   4 = 'under a quarter left',
 #   2 = 'under half left'.  Higher N is HARDER to lose.
@@ -256,10 +299,19 @@ W	2084	bite	24.0	1	14	16	1	0	-	-	-	0	0	# Flay
 #  whole body and forges nothing, which shows whether the worn interior is
 #  drawn. Flay itself is a bite.)
 W	2086	slabz	5.0	1	34	16	3	0	-	-	-	0	0	# Cleave
-W	2088	slabx	5.0	1	34	16	3	0	-	centre	-	0	0	# Bisect
+W	2088	cutx	5.0	1	34	16	3	0	-	centre	-	0	0	# Bisect
 #  anchor is 'centre', not '-' (the crosshair): a plane through wherever the ray
 #  landed on them often took an arm off instead of halving them. 'centre' puts it on their
 #  midline. Change this row's anchor column to '-' to aim it.
+#  cutx removes no cell. It parts them along the boundary between two columns
+#  of cells nearest the anchor's x, and one side leaves as ONE severed piece:
+#  with chest on both sides, the side with fewer cells. That piece is exempt
+#  from PART SPAN. The size, count and budget columns are not read. The cells
+#  column is read only when the cut leaves more than two pieces: nine tenths
+#  of it, never over the L row's minimum and never under COALESCE, is the
+#  smallest a section may be before it is merged into a neighbour.
+#  With parts named in the parts column, with 'nosever' in the sweep column,
+#  or on a target who may not be severed, the row cuts nothing.
 W	2090	slaby	5.0	1	34	16	3	0	-	-	-	0	0	# Sunder
 W	2092	borey	7.0	1	27	12	3	0	-	-	-	0	0	# Skewer
 W	2094	borez	7.0	1	27	12	3	0	-	-	-	0	0	# Impale
@@ -268,7 +320,7 @@ W	2098	all	1.0	1	40	20	3	0	-	-	-	0	0	# Unmake
 W	2107	layerz	1.0	1	14	16	3	0	-	-	-	0	0	# ThinCut
 W	2109	halve	7.0	1	40	20	3	0	-	-	-	0	0	# Halve
 W	2121	all	1.0	1	40	0	3	7	-	-	-	0	0	# Excarnate
-W	2133	slabx	5.0	1	34	16	3	0	-	centre	-	0	0	# BisectSelf
+W	2133	cutx	5.0	1	34	16	3	0	-	centre	-	0	0	# BisectSelf
 #  anchored on their centre, for the same reason as Bisect above.
 #  Change THIS row's anchor column to '-' to aim it.
 W	2135	grind	1.0	2	7	4	3	0	-	-	-	0	0	# GrindTick
@@ -298,8 +350,6 @@ W	2173	restore	1.0	1	3	0	1	0	-	-	-	0	0	# RestoreSelf
 W	2175	detonate	1.0	1	20	20	3	0	-	-	-	0	0	# Detonate
 #  kick is 0: a x4 throw puts every piece across the room. 0 is the
 #  throw every other wound gives its pieces, and it is the intended one.
-W	2177	detonate	1.0	1	20	20	3	0	-	-	-	0	2	# Detonate (Alt)
-W	2180	detonate	1.0	1	20	20	3	0	-	-	-	0	2	# DetonateSelf (Alt)
 # DetonateSelf -- the SAME wound as 2175, on an effect whose spell is
 #   delivery = Self. The Shredder spells cast it on the victim FROM the victim,
 #   which cannot miss; the aimed 2175 fires a projectile and did, every time.

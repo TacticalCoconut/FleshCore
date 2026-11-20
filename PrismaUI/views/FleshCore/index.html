@@ -262,7 +262,7 @@ details.adv[open] > summary::after{content:"Hide Advanced ▴"}
     <header class="top">
       <h2 id="ptitle">The Body</h2>
       <span class="pill ok" id="armed"><span class="dot"></span>ENGINE ARMED</span>
-      <span class="ver" id="banner">FleshCore v0.1 Beta</span>
+      <span class="ver" id="banner">FleshCore v0.1.1 Beta</span>
     </header>
 
     <!-- ============================= THE BODY ============================= -->
@@ -339,13 +339,10 @@ details.adv[open] > summary::after{content:"Hide Advanced ▴"}
           </div>
 
           <details class="adv">
-            <summary>Advanced Tissue Thresholds &amp; Scene Rules</summary>
+            <summary>Advanced Tissue Thresholds</summary>
             <div class="stack" id="advBodyStack">
               <div class="card">
                 <h3>Internal Origin Immunities</h3>
-                <div class="row"><div class="lab"><b>Scene wounds never kill</b>
-                  <small>Keeps scene targets (Knockout and external scene mods) alive until the scene finishes.</small></div>
-                  <div class="ctl"><button class="sw" id="nkScene" aria-pressed="true" aria-label="Scene wounds never kill"></button></div></div>
                 <div class="row"><div class="lab"><b>Mod API commands never kill</b>
                   <small>External mod wounds do not trigger death.</small></div>
                   <div class="ctl"><button class="sw" id="nkCommand" aria-pressed="false" aria-label="Command wounds never kill"></button></div></div>
@@ -585,7 +582,7 @@ details.adv[open] > summary::after{content:"Hide Advanced ▴"}
                 <output for="coalesce" id="coalesceV">24</output><span class="unit">cells</span></div></div>
               <div class="row"><div class="lab"><b>Merge distance</b>
                 <small>Maximum gap in cells to merge a small fragment across.</small></div>
-                <div class="ctl num"><input type="range" id="cgap" min="0" max="12" step="1" value="4">
+                <div class="ctl num"><input type="range" id="cgap" min="1" max="8" step="1" value="4">
                 <output for="cgap" id="cgapV">4</output><span class="unit">cells</span></div></div>
               <div class="row"><div class="lab"><b>Part span</b>
                 <small>How many joints a severed piece may span before it is split.</small></div>
@@ -615,7 +612,7 @@ details.adv[open] > summary::after{content:"Hide Advanced ▴"}
         <div class="card">
           <h3>Engine Status</h3>
           <dl class="kv">
-            <dt>Version</dt><dd id="dBanner">FleshCore v0.1 Beta</dd>
+            <dt>Version</dt><dd id="dBanner">FleshCore v0.1.1 Beta</dd>
             <dt>Armed</dt><dd id="dArmed">yes — form lookups validated</dd>
             <dt>Co-save</dt><dd id="dCosave">armed · serialization v4 · id FCWS</dd>
             <dt>Plugin</dt><dd id="dPlugin">FleshCore.esp</dd>
@@ -1054,7 +1051,7 @@ function describeIntensity(lvl) {
   if (lvl <= 0) {
     return {
       title: "Disabled",
-      vox: "Combat blows and hostile spells do not open voxel wounds (spells cast by hand and scenes still work).",
+      vox: "Combat blows and hostile spells do not open voxel wounds (spells cast by hand and other mods' commands still work).",
       surv: "Only Head and Trunk (Upper Torso / Abdomen) loss are immediately fatal; all 12 limb segments are survivable individually (6 limbs lost before death)."
     };
   }
@@ -1372,6 +1369,10 @@ window.fcApply = function (json) {
   if (d.live)   { Object.assign(state.live, d.live); draw(); renderSel(); }
   if (d.fatal)  { state.previewFatal = null; Object.assign(state.fatal, d.fatal); draw(); renderSel(); lethalAllRefresh(); }
   if (d.combat) { Object.assign(CB, d.combat); renderCombat(); }
+  // The engine's own switches, sliders and head thresholds, as it holds them.
+  if (d.tog) { for (const k of Object.keys(d.tog)) { const b = document.getElementById(k); if (b && b.classList.contains("sw")) b.setAttribute("aria-pressed", d.tog[k] ? "true" : "false"); } }
+  if (d.num) { for (const k of Object.keys(d.num)) { const el = document.getElementById(k); if (el && el.type === "range") { el.value = d.num[k]; if (el.oninput) el.oninput(); if (+el.value !== d.num[k]) { const o = document.getElementById(k + "V"); if (o) o.textContent = String(d.num[k]); } } } }
+  if (d.thr) { for (const k of Object.keys(d.thr)) { const p = k.split("."); const el = document.getElementById(p[0] + "-" + p[1]); if (el && el.type === "range" && state[p[0]]) { state[p[0]][p[1]] = d.thr[k]; el.value = d.thr[k]; if (el.oninput) el.oninput(); } } }
   // The DLL pushes every GRANTED id (PanelPush walks g_panel.grant); an id it does not name is not granted.
   // Known ids only: an id the panel does not know is neither merged nor counted.
   if (d.spells) { for (const k of Object.keys(state.spells)) state.spells[k] = !!d.spells[k]; renderSpells(); }

@@ -576,6 +576,19 @@ std::vector<Section> SplitBySpan(const Lattice& L, const Section& S, int maxSpan
 // actual reason they are not dismemberments.
 std::uint32_t SoleParts(const std::vector<Section>& secs, std::size_t i);
 
+// EVERY LIVING CELL NO SECTION HOLDS, ON ONE SIDE OF A COLUMN BOUNDARY.
+//
+// Sections() leaves out unnamed geometry that no flesh of theirs reaches -- a
+// worn thing hung off a bone with no name, a cell or more clear of them -- and
+// makes a loose section of it only where it borders a destroyed cell. A cut
+// that removes no cell destroys none, so after one such geometry is in no
+// section at all, on either side of the plane. This names the cells of it that
+// lie on one side, so the caller can send them with the half that leaves.
+// `column` is the column that begins the +x side; `below` asks for the cells
+// with a lower x than that. One pass over the cells and one over the sections.
+std::vector<Key> LooseBeside(const Lattice& L, const std::vector<Section>& secs,
+                             std::uint32_t mask, std::int32_t column, bool below);
+
 // MAKE THEM ONE BODY, BY CONSTRUCTION.
 //
 // A target does not arrive as one connected thing, and the reason is mundane:
@@ -701,15 +714,38 @@ public:
     // fell between rows. TearTrunkAtPlane() judges the trunk's band by it, so
     // the band it measures is the band the cut took.
     mutable float lastPlaneHalf = 0.0f;
+    // THE LAST PLANE LIES ON A COLUMN BOUNDARY, and which: the column that
+    // begins its +x side. Written by Form::CutX alone. SeverPlane() then
+    // sides a cell by its KEY and not by its centroid: a centroid is the mean
+    // of what is in a cell and may sit anywhere in it, its own low face
+    // included -- exactly on the plane, where the side test parts a cell from
+    // both halves -- and a key is never on a boundary. Read once and cleared
+    // with the plane; Select()'s top and SelectPlane() clear it too, so it
+    // cannot outlive the one cut that set it.
+    mutable bool lastPlaneOnColumn = false;
+    mutable std::int32_t lastPlaneColumn = 0;
     // EVERY LINK SeverPlane() TOOK OUT, so an un-cut body gets them
     // back. Clearing `gone` makes a cell alive; it does not join it to anything,
     // and a warm Restore keeps this lattice: a target who outlived a cut (a
     // limb the preset lets them lose, NoKill) came back whole in one lattice and
     // in two sections, and the next scratch swept the smaller off them. Build
     // starts it empty, because Build's links are all there.
-    struct SeveredLink { Key a, b; bool isBridge; };
+    //
+    // `bare` marks a link a column cut parted (Form::CutX): no cell was
+    // removed beside it, so the face it opened is marked by nothing but this
+    // record, and whoever needs that face -- a piece deciding which of its
+    // cells show meat -- reads it here. `bareLinks` counts them, so a body
+    // that was never cut that way costs such a reader one comparison.
+    struct SeveredLink { Key a, b; bool isBridge; bool bare; };
     std::vector<SeveredLink> severed;
+    std::size_t bareLinks = 0;
     void Rejoin();
+    // PUT BACK THE LINKS SEVERED SINCE `severed` WAS `mark` LONG, and only
+    // those. A cut that removed no cell and then could not be carried through
+    // has nothing else to show for itself: left severed, the body is drawn
+    // whole and is two sections. Returns how many links went back, counted as
+    // SeverPlane() counts them.
+    std::size_t RejoinFrom(std::size_t mark);
     // A bind-space proxy for each bone: the mean position of the vertices it
     // owns. This is what lets a wound named by a BONE become a wound named by
     // a POINT, without ever needing the skeleton's bind transforms.
@@ -1011,6 +1047,25 @@ public:
         // Not aimed and not budgeted: `p`, `a`, `count` and `maxTotal` are
         // ignored, because a seam left standing is a limb left attached.
         Detonate,
+        // A CUT THAT REMOVES NOTHING.
+        //
+        // Every form above takes cells, and what a wound takes becomes an
+        // object or is thrown away -- so a slab laid between two halves of
+        // them is always a third thing, a column of cells wide at the least.
+        // This form takes none. It names a plane BETWEEN two columns of cells
+        // -- the column boundary nearest the seed's x, so that every cell
+        // lies wholly on one side of it -- and SeverPlane() parts every link
+        // that crosses it. The two sides are then two sections with nothing
+        // between them, and the sweep does with them what it does with any
+        // section.
+        //
+        // Select() returns no cell for it, by design: the plane it records is
+        // the whole of the wound, and a caller that reads an empty selection
+        // as a miss has to ask for this form by name. `a`, `count` and
+        // `maxTotal` are ignored. It records no plane when what is alive
+        // holds fewer than two columns, because no boundary then has
+        // anything on both sides.
+        CutX,
         Count,
     };
     static bool FormFromName(const std::string& s, Form& out);

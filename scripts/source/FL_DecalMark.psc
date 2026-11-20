@@ -39,6 +39,8 @@ Scriptname FL_DecalMark extends ObjectReference
  does not become six marks.}
 
 Int Property Kind = 0 Auto
+{The DecalCore kind this mark is made of: 0 blood, or a kind another mod
+ registered. Set on the record.}
 Float Property Reach = 96.0 Auto
 {The fallback reach, for a marker that stopped in open air.}
 
@@ -186,7 +188,7 @@ Function Mark(String how)
         ;
         ; FL_Decal never ran, so the magic effect never reached them: the
         ; projectile went past and detonated on the geometry behind. Those
-        ; targets are bound and in furniture, and an actor in that state does not
+        ; targets are sitting in furniture, and an actor in that state does not
         ; present the collision an aimed projectile needs.
         ;
         ; So the marker steps in -- but only where it is nearly certain, and

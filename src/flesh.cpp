@@ -829,9 +829,19 @@ struct PlacePiece {
     bool section = false;
     u32 refID = 0;             // filled in once placed; 0 = the script places it
     int part = 0; u32 layers = 0; std::size_t cells = 0;   // provenance
+    int skinBlocks = 0;        // type-5 skin-tint blocks written into this file (chunknif LastBuild)
+    // The slot-0 textures (TintTexKey form) of the shapes FT col 2 = 2 may put on the type-5
+    // skin-tint block in their own colour (accTex0: feature-5 accessories with a colour read)
+    // and of their skin shapes (skinTex0, kept only beside a non-empty accTex0). Both empty
+    // without FT col 2 = 2. Read by the colour pass only (TintAccessoryVerdict).
+    std::vector<std::string> accTex0, skinTex0;
 };
 struct PlaceJob {
     long seq = 0; int victim = 0; int kick = 0; int mark = 0;
+    // The batch's own colour, the one handed to chunknif::SetSkinTint: what the
+    // piece-colour read-back (S column 3) compares the live material with.
+    float tint[3] = {1.0f, 1.0f, 1.0f};
+    bool hasTint = false;
     bool dismembered = false; bool trunk = false; double t0 = 0;
     bool nolethal = false;
     bool blast = false;        // a Detonate: the script lifts what is left of the body
@@ -929,6 +939,7 @@ static void PlaceEnqueue(PlaceJob&& job);
 static bool PlacedNote3D(u32 fid, bool on, double* msSincePlaced);   // was PlacedByUs
 static int  LivePieceCount();                                          // the plugin's pieces with 3D right now
 static void PlacedForgetAll();                                         // with the registry, on a load
+static void TintOnGot(u32 fid, bool on);                               // piece colour read-back (S col 3), sink side
 struct SKSEPluginVersionData {
     u32  dataVersion, pluginVersion;
     char name[256], author[256], supportEmail[252];
@@ -938,15 +949,15 @@ struct SKSEPluginVersionData {
 // ONE VERSION, WRITTEN ONCE.
 //
 // The load banner and the plugin version data both come from these macros:
-// the banner shows major.minor and the release tag ("0.1 Beta"), and
+// the banner shows major.minor.patch and the release tag ("0.1.1 Beta"), and
 // pluginVersion packs major, minor and patch. Keeping them side by side
 // keeps a log's first line naming the build that wrote it.
 #define FC_VER_MAJOR 0
 #define FC_VER_MINOR 1
-#define FC_VER_PATCH 0
+#define FC_VER_PATCH 1
 #define FC_STR2(x) #x
 #define FC_STR(x) FC_STR2(x)
-#define FC_VERSION FC_STR(FC_VER_MAJOR) "." FC_STR(FC_VER_MINOR) " Beta"
+#define FC_VERSION FC_STR(FC_VER_MAJOR) "." FC_STR(FC_VER_MINOR) "." FC_STR(FC_VER_PATCH) " Beta"
 extern "C" __declspec(dllexport) SKSEPluginVersionData SKSEPlugin_Version =
 {
     1, (FC_VER_MAJOR << 16) | (FC_VER_MINOR << 8) | FC_VER_PATCH,
@@ -1398,7 +1409,7 @@ struct Wound {
     // comment on that word gives: a bit inside a number already parsed as a
     // number moves nothing.
     int   kick = 0;     // 0 = the script's own force; N = that force times N
-    int   mark = 0;     // 0 = whatever they wear; 1 = blood; 2 = alt
+    int   mark = 0;     // 0 = whatever they wear; 1 = blood; 2, 3 = DecalCore kind 1, 2 (registered by another mod)
     // ---- NEVER KILL ----------------------------------------------
     // noKill  column 15 of a W row: THIS wound takes flesh and never counts
     //         toward death, whoever cast it.
@@ -1410,8 +1421,8 @@ struct Wound {
     // WHAT KIND OF HARM IT IS, for the armour: armour::kSlash,
     // kPierce, kBlunt, kMagic, or kFamNone (0) -- untyped, and no armour
     // answers it. Stamped on a COPY by the callers whose wounds come from the
-    // world (a blow, a typed effect, a window, a drain); a spell, a command, a
-    // scene and a vortex leave it 0, as the per-actor scalar leaves them.
+    // world (a blow, a typed effect, a window, a drain); a spell, a command and
+    // a vortex leave it 0, as the per-actor scalar leaves them.
     std::uint8_t fam = 0;
     // HOW MANY LAYERS ONE HIT PEELS, per wound: 1..4, or 0 for g_hq.peelStages.
     // The magic schools set it, so fire takes one layer a hit
@@ -1603,10 +1614,21 @@ struct Config {
     std::map<std::string, std::uint8_t> armourKw;
     std::vector<Trigger> triggers;
     int   skinShader = 0;
-    // S <skinShader> [tintGain] -- the multiplier on their measured skin tint
-    // before it is written into the shards as a vertex colour. 1.0 is a plain
-    // multiply, which is what the lighting shader does with a vertex colour.
+    // S <skinShader> [tintGain] -- skinShader 1 puts a piece's skin on the
+    // game's skin-tint shader; 0 keeps the ordinary lighting shader and writes
+    // their colour as a vertex colour. tintGain multiplies that vertex colour;
+    // zero or less turns their colour off under both.
     float tintGain = 1.0f;
+    // S ... [live] [uniq] -- columns 3 and 4, read only if present.
+    // live (pieceTint): 0 (absent) = no piece-colour pass at all; 1 = when an
+    // engine-placed piece's 3D arrives, read its materials back and log them
+    // ([TINT] lines), writing nothing; 2 = also write their colour into a
+    // proven, unshared FacegenTint material, behind the in-session gate
+    // (never beside FT col 2 = 2: LoadConfig runs 2 as 1 there).
+    // uniq (pieceUniq): 0 (absent) = forged files byte-identical to before;
+    // 1 = chunknif's uvOffset nudge on type-5 blocks (SetUniqueSkin).
+    int pieceTint = 0;
+    int pieceUniq = 0;
     // BUILD THEIR LATTICE WHEN THEY LOAD, NOT WHEN THEY ARE HIT. 0 off, 1 on.
     int   prewarm = 1;
     // ...AND WHEN NOTHING EVER TOLD THE PLUGIN THEY WERE THERE. The third
@@ -1644,7 +1666,7 @@ struct Config {
     //
     // defer     0 is the old behaviour. 1 defers what the WORLD does to them -- a blow, a
     //           typed effect, a drain (origin 2 and 5). 2 adds the spells
-    //           (origin 1). API, command, vortex and scene origins are never
+    //           (origin 1). API, command and vortex origins are never
     //           deferred: CommandWound answers FL_Api from g_sepRan the moment
     //           WoundActor returns, and a cut that happens later would be a
     //           "no separation ran" that lied.
@@ -1654,7 +1676,7 @@ struct Config {
     //           every world or spell wound. WD 1/2: the ones DeferWound could
     //           not hand to the worker (R 0, eight rebuilds in flight, a walk
     //           that found nothing) and, at WD 1, the spells. Command, API,
-    //           vortex and scene wounds are never gated. Without the frame
+    //           and vortex wounds are never gated. Without the frame
     //           probe the gate is inert.
     int   woundDefer      = 1;
     int   woundDeferMaxMs = 1500;
@@ -1800,7 +1822,7 @@ struct Config {
     //                  as every slab was before the cleave. Now in units:
     //                  it used to be cells, so at the HQ's cell 8 it was 80 units,
     //                  wider than the body, and bounded nothing.
-    int   bladeAxis        = 2;
+    int   bladeAxis        = -1;
     int   combatSeverMax   = 3;
     float cleaveHalf       = 0.75f;
     float cleaveReach      = 40.0f;
@@ -1822,12 +1844,12 @@ struct Config {
     int   headBonePct  = 15;
     int   headBrainPct = 0;
     // ---- THE HEAD PROBES --------------------------------------
-    // HD <probes> <swap> <lock> <skinGate>       -- default `HD 1 0 0 0`
+    // HD <probes> <swap> <lock>       -- default `HD 1 0 0`
     //
     // NOT `H`. H would be the natural letter, but H is already the hit
     // response (`H <mode> <radius> <cooldownMs>`).
-    // Re-using the letter and telling the two apart by how many columns follow
-    // would mean a four-column probe row silently becoming a hit-response row,
+    // Re-using the letter would leave a probe row and a hit-response row with
+    // three columns each and nothing to tell them apart,
     // so the token is HD -- head diagnostics -- and rows are compared whole,
     // so it cannot collide with anything.
     //
@@ -1845,16 +1867,9 @@ struct Config {
     //           engine memory, and which engine function writes dynamicData --
     //           and whether it honours this lock at all -- is unknown, so the
     //           default reads the two lock words and touches neither.
-    // skinGate  1 makes ReadSkinTint refuse the head's material unless its
-    //           GetFeature returns 5. Correct in principle (0xA0 was measured
-    //           on feature-5 materials only) and OFF by default because it
-    //           CHANGES TODAY'S BEHAVIOUR: their colour would stop coming off
-    //           their head on any target whose head material is feature 4. Probe
-    //           #4 reads the live feature; turn this on after reading it.
     int   headProbe    = 1;
     int   headSwap     = 0;
     int   headLock     = 0;
-    int   headSkinGate = 0;
     // HF <mode> -- THEIR OWN FACE, the reader.
     //
     //   0  off: their FaceGen head is skipped exactly as it was at first.
@@ -1875,8 +1890,9 @@ struct Config {
     //   3  THE CUT. As 2, and their face is redrawn
     //      like any skin shape of theirs: its skin partition is privatised and
     //      the survivors go into a new index buffer on the plugin's clone, the shipped
-    //      mechanism of every body cut. Nothing of their face is
-    //      copied into a piece, and no blood quad is painted on it. Probe
+    //      mechanism of every body cut. What a severed section takes of
+    //      their face goes into that piece as their skin; a shard carries
+    //      none of it, and no blood quad is painted on it. Probe
     //      3(a) found no pointer change on their head's buffers in testing.
     //      Whether the engine binds the PARTITION's index buffer for a
     //      dynamic shape -- the "partition path", the likelier of the
@@ -1897,7 +1913,8 @@ struct Config {
     //   0  off: the old behaviour.
     //   1  READ AS WARDROBE. The same private-buffer read their face gets, but
     //      pushed as layer 0, NOT skin: the cells are cells of what they are
-    //      WEARING, not cells of them. They forge nothing, they count towards
+    //      WEARING, not cells of them. They go into a piece as plain surfaces
+    //      with no muscle behind them, they count towards
     //      no death rule, they cannot become their skin -- and the sweep that
     //      already drops a hat when the head it sat on comes off drops them
     //      with the piece of them they were drawn over. Cut through the same
@@ -2126,6 +2143,12 @@ struct Config {
     //   Refused -- no pre-warm, no wound, no replayed wound -- and a read that
     //   fails refuses them too.
     int   raceGate = 1;
+    // ---- FT <maps> <hair> <cutout> <normals> <dedup> <probe> -------------
+    // THEIR FACE AND ITS ACCESSORIES, AS A PIECE CARRIES THEM. An absent row is
+    // all 0, which is every piece's bytes as before the row. See
+    // chunknif::SetFaceLook for what each column does; probe 1 writes the
+    // budgeted [FACETEX] lines (FaceTexProbe). A release cfg carries probe 0.
+    int   ftMaps = 0, ftHair = 0, ftCutout = 0, ftNormals = 0, ftDedup = 0, ftProbe = 0;
 };
 static Config g_cfg;
 static u32  g_prefix = 0;
@@ -2697,7 +2720,7 @@ static void HQBuild(const std::map<std::string, double>& m, HQState& st, std::ve
     }
 }
 // WHO A BLOW MAY CUT. Checked by the hit path and the typed magic
-// path only -- a spell, a command, a scene and a vortex are deliberate and
+// path only -- a spell, a command and a vortex are deliberate and
 // never gated here. The reads are facts.h's: the player by id, a follower by
 // the teammate bit, essential or protected by the runtime flags OR the base
 // record's own (a quest that makes an actor essential for a while sets the
@@ -2775,17 +2798,6 @@ static void PanelSave()
     std::fclose(f);
 }
 
-// RETIRED SPELLS. The two Sequence spells are
-// not a feature. Their records stay in the plugin (append-only); the HQ
-// neither lists nor grants them, and neither a stale page nor a stale grants
-// file can put them back: every road into g_panel.grant refuses them.
-static const u32 kRetiredSpells[] = { 0x894u /* retired 0x894 */, 0x8A9u /* retired 0x8A9 */, 0u };
-static bool IsRetiredSpell(u32 local)
-{
-    for (int i = 0; kRetiredSpells[i]; ++i) if (kRetiredSpells[i] == local) return true;
-    return false;
-}
-
 // THE GRANTS FILE IS PER SAVE NOW, SO IT IS READ WHEN IT IS NEEDED.
 // PanelLoad runs once per process; the watcher rewrites the file from each
 // loaded save's own spellbook (FL_Watch.SeedGrants on CheckLoad). A map read
@@ -2799,7 +2811,7 @@ static void PanelReadGrants()
     g_panel.grant.clear();
     if (FILE* gf = std::fopen("Data\\SKSE\\Plugins\\FleshCore.grants.txt", "rb")) {
         char line[64];
-        while (std::fgets(line, sizeof(line), gf)) { const u32 id = u32(std::strtoul(line, nullptr, 10)); if (id && !IsRetiredSpell(id)) g_panel.grant[id] = 1; }
+        while (std::fgets(line, sizeof(line), gf)) { const u32 id = u32(std::strtoul(line, nullptr, 10)); if (id) g_panel.grant[id] = 1; }
         std::fclose(gf);
     }
 }
@@ -2979,7 +2991,7 @@ static void PanelApply(Config& c)
     if (c.coalesceGap < 1 || c.coalesceGap > 8) c.coalesceGap = 3;
     if (c.coalesce    < 0)    c.coalesce    = 0;
     if (c.rereadMs    < 50)   c.rereadMs    = 50;   if (c.rereadMs > 5000)  c.rereadMs = 5000;
-    if (c.cellSize < 1.0f || c.cellSize > 40.0f) c.cellSize = 6.0f;
+    if (!(c.cellSize >= 1.0f && c.cellSize <= 40.0f)) c.cellSize = 6.0f;
     if (c.sectLumps < 0 || c.sectLumps > 64) c.sectLumps = 8;
     if (c.headSkinPct  < 0) c.headSkinPct  = 0;  if (c.headSkinPct  > 100) c.headSkinPct  = 100;
     if (c.headBonePct  < 0) c.headBonePct  = 0;  if (c.headBonePct  > 100) c.headBonePct  = 100;
@@ -3336,8 +3348,7 @@ static void PanelOnSet(const char* json)
                 // and the file keep the number. strtoul with base 0 reads the
                 // 0x itself rather than this guessing at the prefix.
                 const u32 local = u32(std::strtoul(id.c_str(), nullptr, 0));
-                if (local && !IsRetiredSpell(local)) { if (on != 0.0) g_panel.grant[local] = 1; else g_panel.grant.erase(local); }
-                else if (local) Log("[PANEL] grant of retired spell 0x%X refused", unsigned(local));
+                if (local) { if (on != 0.0) g_panel.grant[local] = 1; else g_panel.grant.erase(local); }
             }
         }
         else if (verb == "grantAll" && haveD) {
@@ -3348,7 +3359,7 @@ static void PanelOnSet(const char* json)
             g_panel.grant.clear();
             if (on != 0.0) {
                 const char* p = JsonFind(ds, de, "ids");
-                if (p && *p == '[') { ++p; while (p < de && *p != ']') { char* endp = nullptr; const unsigned long v = std::strtoul(p, &endp, 10); if (endp == p) { ++p; continue; } if (v && !IsRetiredSpell(u32(v))) g_panel.grant[u32(v)] = 1; else if (v) Log("[PANEL] grant of retired spell 0x%X refused", unsigned(v)); p = endp; } }
+                if (p && *p == '[') { ++p; while (p < de && *p != ']') { char* endp = nullptr; const unsigned long v = std::strtoul(p, &endp, 10); if (endp == p) { ++p; continue; } if (v) g_panel.grant[u32(v)] = 1; p = endp; } }
             }
         }
         else if (verb == "hitMode" && haveD) {
@@ -3420,14 +3431,6 @@ static void PanelOnSet(const char* json)
                 if (custom) g_panel.combat["preset.id"] = -1.0;
                 Log("[HQ] %s = %g%s", key.c_str(), val, custom ? " (preset -> Custom)" : "");
             }
-        }
-        else if (verb == "fadeOn" || verb == "fadeOut" || verb == "fadeIn" || verb == "fadeHold" ||
-                 verb == "seq2" || verb == "holdSec" || verb == "limbGap" || verb == "reach" || verb == "sceneTo") {
-            // THE SEQUENCE PAGE IS GONE. Nothing in this DLL or in
-            // retired spells ever read these; a page that still sends them is
-            // older than this build. Logged and dropped.
-            Log("[PANEL] verb '%s' belongs to the retired Sequence page -- ignored", verb.c_str());
-            return;
         }
         else if (haveD && JsonNum(ds, de, "value", v)) {
             g_panel.num[verb] = v;
@@ -3536,6 +3539,26 @@ static void PanelPush()
             first = false;
         }
         j += "}";
+    }
+    // THE HQ'S ENGINE SWITCHES AND SLIDERS, ITS NEVER-KILL SWITCHES AND ITS
+    // HEAD THRESHOLDS, EFFECTIVE: what the engine holds for each -- the saved
+    // value where one is saved, the config's where none is. The page ships its
+    // own defaults; sent nothing, it draws them over an engine that may not
+    // share them, and the first click on a switch then sends the value the
+    // engine already has.
+    {
+        Guard lk(&g_csPanel);
+        char buf[400];
+        std::snprintf(buf, sizeof(buf),
+            ",\"tog\":{\"sever\":%d,\"prewarm\":%d,\"reread\":%d,\"roster\":%d,"
+            "\"nkHit\":%d,\"nkSpell\":%d,\"nkPlayer\":%d}"
+            ",\"num\":{\"cell\":%.6g,\"coalesce\":%d,\"cgap\":%d,\"partSpan\":%d,\"pollMs\":%d}"
+            ",\"thr\":{\"head.skin\":%d,\"head.bone\":%d,\"head.brain\":%d}",
+            g_cfg.sever ? 1 : 0, g_cfg.prewarm ? 1 : 0, g_cfg.reread ? 1 : 0, g_cfg.roster ? 1 : 0,
+            g_cfg.nlHit ? 1 : 0, g_cfg.nlSpell ? 1 : 0, g_cfg.nlPlayer ? 1 : 0,
+            double(g_cfg.cellSize), g_cfg.coalesce, g_cfg.coalesceGap, g_cfg.partSpan, g_cfg.rereadMs,
+            g_cfg.headSkinPct, g_cfg.headBonePct, g_cfg.headBrainPct);
+        j += buf;
     }
     // THE COMBAT PAGE'S STATE, EFFECTIVE: every key the page has,
     // as the engine resolves it -- the stored number where one is stored,
@@ -3675,9 +3698,9 @@ static void PanelKeepHidden()
 // it. One line, pipe-separated, because FL_Watch already splits on '|' and the
 // idiom is not worth inventing twice:
 //
-//     0.1 Beta|panel ready
-//     0.1 Beta|panel off in the config
-//     0.1 Beta|PrismaUI is not installed
+//     0.1.1 Beta|panel ready
+//     0.1.1 Beta|panel off in the config
+//     0.1.1 Beta|PrismaUI is not installed
 //
 // A missing file means the DLL did not load at all, which is itself the most
 // useful thing the MCM could tell anyone.
@@ -3975,6 +3998,75 @@ static u32 PartsFromNames(const std::string& s, std::string* unknown)
     return m;
 }
 
+// THE FT ROW, HELD TO WHAT THIS BUILD CAN DO. Called once from LoadConfig,
+// after the HF and FA checks, so it sees their final values.
+//   - A value outside a column's range turns THAT column off, with one line,
+//     as HF and FA do: a typo must not switch on the least-tested mode.
+//   - The one exception is cutout 2 (each shape's own live alpha), which waits
+//     for the probe to read the alpha offsets: it runs as 1, the fixed alpha
+//     test, with its own single line.
+//   - The face maps need their face read and cut (HF 3); the accessory
+//     columns need the accessories read at all (FA 1).
+//   - Hair colour needs normals: an accessory's record carries position and UV
+//     only, and the hair-tint and skin-tint blocks an accessory can take read
+//     a normal and a bitangent, which only FT normals gives it. Without them
+//     the forge would colour nothing, so hair is turned off and the line says
+//     why.
+static void CheckFaceLook(Config& c)
+{
+    auto offIfOut = [](int& v, int hi, const char* what) {
+        if (v >= 0 && v <= hi) return;
+        Log("[CFG] FT %s %d is not 0..%d -- FT %s is off", what, v, hi, what);
+        v = 0;
+    };
+    offIfOut(c.ftMaps, 1, "maps");
+    offIfOut(c.ftHair, 2, "hair");
+    offIfOut(c.ftCutout, 2, "cutout");    // 2 is taken as 1 below, after the FA gate
+    offIfOut(c.ftNormals, 1, "normals");
+    offIfOut(c.ftDedup, 1, "dedup");
+    offIfOut(c.ftProbe, 1, "probe");
+    if (c.ftMaps && c.targetFace < 3) {
+        Log("[CFG] FT maps needs HF 3 and HF is %d -- FT maps is off", c.targetFace);
+        c.ftMaps = 0;
+    }
+    if (!c.targetAcc && (c.ftHair || c.ftCutout || c.ftNormals || c.ftDedup)) {
+        Log("[CFG] FT hair/cutout/normals/dedup need FA 1 and FA is off -- those columns are off");
+        c.ftHair = c.ftCutout = c.ftNormals = c.ftDedup = 0;
+    }
+    // After the FA gate, so a cutout of 2 says one thing: this, or that FA is off.
+    if (c.ftCutout == 2) {
+        Log("[CFG] FT cutout 2 (each shape's own live alpha) waits for the probe to read the alpha"
+            " offsets -- using 1, the fixed alpha test");
+        c.ftCutout = 1;
+    }
+    if (c.ftHair && !c.ftNormals) {
+        Log("[CFG] FT hair %d needs FT normals 1 -- an accessory's record carries no normals and the"
+            " hair-tint and skin-tint blocks read them, so no colour could reach a piece. FT hair is off",
+            c.ftHair);
+        c.ftHair = 0;
+    }
+}
+
+// THE FT LINE OF THE LAUNCH SUMMARY: what the forge will apply, after
+// CheckFaceLook. FaceGen faces (FT col 1) are always written skinned on the
+// type-4 block, regardless of D rigid or S gain.
+static void LogFaceLookLine(const Config& c)
+{
+    if (!(c.ftMaps || c.ftHair || c.ftCutout || c.ftNormals || c.ftDedup || c.ftProbe)) {
+        Log("      their face and accessories in a piece: as before (no FT row, or FT all 0)");
+        return;
+    }
+    Log("      their face and accessories in a piece (FT %d %d %d %d %d %d): FaceGen maps %s, hair colour %s,"
+        " cutout %s, accessory normals %s, duplicate accessories %s, [FACETEX] probe %s",
+        c.ftMaps, c.ftHair, c.ftCutout, c.ftNormals, c.ftDedup, c.ftProbe,
+        c.ftMaps ? "ON" : "off",
+        c.ftHair == 2 ? "ON (feature 6 on the hair-tint block, feature 5 on the skin-tint block)"
+                      : c.ftHair ? "ON (feature 6 on the hair-tint block)" : "off",
+        c.ftCutout ? "ON (alpha test 0x12EC/128 on feature 6)" : "off",
+        c.ftNormals ? "ON" : "off", c.ftDedup ? "DROPPED" : "kept",
+        c.ftProbe ? "ON (budgeted; most lines wait for each actor's first wound)" : "off");
+}
+
 static bool LoadConfig()
 {
     FILE* f = std::fopen("Data\\SKSE\\Plugins\\FleshCore.cfg.txt", "rb");
@@ -4066,13 +4158,12 @@ static bool LoadConfig()
             // is every K row ever written before this existed.
             if (t.size() >= 4) c.headGain = float(std::atof(t[3].c_str()));
         }
-        // HD <probes> <swap> <lock> <skinGate> -- the head probes, see Config.
+        // HD <probes> <swap> <lock> -- the head probes, see Config.
         // A DISTINCT TOKEN, not a fourth column on H: H is the hit response.
         else if (t[0] == "HD" && t.size() >= 2) {
             c.headProbe = std::atoi(t[1].c_str());
             if (t.size() >= 3) c.headSwap     = std::atoi(t[2].c_str());
             if (t.size() >= 4) c.headLock     = std::atoi(t[3].c_str());
-            if (t.size() >= 5) c.headSkinGate = std::atoi(t[4].c_str());
         }
         // HF <mode> -- their own face, the reader. See Config::targetFace.
         else if (t[0] == "HF" && t.size() >= 2) {
@@ -4082,6 +4173,16 @@ static bool LoadConfig()
         else if (t[0] == "FA" && t.size() >= 2) {
             c.targetAcc = std::atoi(t[1].c_str());
             if (t.size() >= 3) c.accMaxVerts = std::atoi(t[2].c_str());
+        }
+        // FT <maps> <hair> <cutout> <normals> <dedup> <probe> -- see Config::ftMaps.
+        // Every column is optional; an absent one is 0.
+        else if (t[0] == "FT" && t.size() >= 2) {
+            c.ftMaps = std::atoi(t[1].c_str());
+            if (t.size() >= 3) c.ftHair    = std::atoi(t[2].c_str());
+            if (t.size() >= 4) c.ftCutout  = std::atoi(t[3].c_str());
+            if (t.size() >= 5) c.ftNormals = std::atoi(t[4].c_str());
+            if (t.size() >= 6) c.ftDedup   = std::atoi(t[5].c_str());
+            if (t.size() >= 7) c.ftProbe   = std::atoi(t[6].c_str());
         }
         // FO <x> <y> <z> -- head-bind to root. See Config::headOffset.
         else if (t[0] == "FO" && t.size() >= 4) {
@@ -4172,6 +4273,8 @@ static bool LoadConfig()
         else if (t[0] == "S" && t.size() >= 2) {
             c.skinShader = std::atoi(t[1].c_str());
             if (t.size() >= 3) c.tintGain = float(std::atof(t[2].c_str()));
+            if (t.size() >= 4) c.pieceTint = std::atoi(t[3].c_str());
+            if (t.size() >= 5) c.pieceUniq = std::atoi(t[4].c_str());
         }
         // C <prewarm> -- voxelise an eligible body the moment their 3D appears,
         // so the first blow pays for a wound and nothing else.
@@ -4257,7 +4360,7 @@ static bool LoadConfig()
     // unbounded configuration surface.
     if (!g_panel.loaded) PanelLoad();
     PanelApply(c);
-    if (c.cellSize < 1.0f || c.cellSize > 40.0f) c.cellSize = 6.0f;
+    if (!(c.cellSize >= 1.0f && c.cellSize <= 40.0f)) c.cellSize = 6.0f;
     if (c.lumpTris > 4096) c.lumpTris = 0;
     if (c.fuse < 1 || c.fuse > 8) c.fuse = 3;
     if (c.severMin < 1) c.severMin = 1;
@@ -4335,7 +4438,6 @@ static bool LoadConfig()
     if (c.headProbe    < 0 || c.headProbe    > 1) c.headProbe    = 1;
     if (c.headSwap     < 0 || c.headSwap     > 1) c.headSwap     = 0;
     if (c.headLock     < 0 || c.headLock     > 1) c.headLock     = 0;
-    if (c.headSkinGate < 0 || c.headSkinGate > 1) c.headSkinGate = 0;
     if (c.targetFace < 0 || c.targetFace > 3) {
         Log("[CFG] HF %d is not 0, 1, 2 or 3 -- their face is NOT read (0)", c.targetFace);
         c.targetFace = 0;
@@ -4391,6 +4493,8 @@ static bool LoadConfig()
             " face left whole. FA is off.", c.targetFace);
         c.targetAcc = 0;
     }
+    // FT: after the FA-needs-HF-3 gate above, so it sees the final HF and FA.
+    CheckFaceLook(c);
     if (c.roster < 0 || c.roster > 1) { Log("[CFG] R roster %d is not 0 or 1 -- on", c.roster); c.roster = 1; }
     if (c.dcMode < 0 || c.dcMode > 1) { Log("[CFG] DC mode %d is not 0 or 1 -- the death camera is off", c.dcMode); c.dcMode = 0; }
     if (!(c.dcDelta >= -1.0f && c.dcDelta <= 1.0f)) { Log("[CFG] DC delta %.2f is out of range (-1..1) -- using 0.35", c.dcDelta); c.dcDelta = 0.35f; }
@@ -4454,6 +4558,24 @@ static bool LoadConfig()
         Log("[CFG] LP sectionLife %d s is out of range (5..3600) -- this side says 300; FL_Watch reads the row as written", c.sectionLifeS);
         c.sectionLifeS = 300;
     }
+    if (c.pieceTint < 0 || c.pieceTint > 2) {
+        Log("[CFG] S column 3 (piece colour) %d is out of range (0..2) -- 0, off", c.pieceTint);
+        c.pieceTint = 0;
+    }
+    // MODE 2 NOT BESIDE FT col 2 = 2 (merged review X1, verify R3). The pass sets
+    // a feature-5 accessory's material aside, but a material one piece set aside
+    // is not seen as held when another piece judges it as their skin, so a write
+    // could still reach it. Until that check exists, 2 runs as 1. CheckFaceLook
+    // (above) has already settled ftHair.
+    if (c.pieceTint == 2 && c.ftHair == 2) {
+        Log("[CFG] S column 3 = 2 (write their colour) cannot run beside FT column 2 = 2"
+            " in this build -- running as 1: read back and logged, nothing written");
+        c.pieceTint = 1;
+    }
+    if (c.pieceUniq < 0 || c.pieceUniq > 1) {
+        Log("[CFG] S column 4 (uniqueness nudge) %d is out of range (0..1) -- 0, off", c.pieceUniq);
+        c.pieceUniq = 0;
+    }
     c.ok = c.questLocal && !c.poolLocals.empty();
     if (c.ok) {
         g_cfg = c;
@@ -4463,6 +4585,8 @@ static bool LoadConfig()
         chunknif::SetCellSize(c.cellSize);
         chunknif::SetRigid(c.rigid);
         chunknif::SetNoDecals((c.noDecals & 2) != 0);
+        chunknif::SetUniqueSkin(c.pieceUniq == 1);
+        chunknif::SetFaceLook(c.ftMaps, c.ftHair, c.ftCutout, c.ftNormals, c.ftDedup);
         // The HQ's rows, from panel.json, once the config they sit beside is
         // live. Before this line g_cfg.triggers was the old table.
         HQApply();
@@ -4490,7 +4614,8 @@ static bool LoadConfig()
     Log("      re-read watch %s (every %d ms); engine placement %s (%d per frame,"
         " model priming %s, clearance %.1f, lift %.1f)",
         c.reread ? "ON" : "off", c.rereadMs,
-        c.place == 2 ? "ON -- every piece" : c.place == 1 ? "PROBE -- first piece only" : "off",
+        c.place == 2 ? "ON -- every piece, shards a frame before sections"
+                     : c.place == 1 ? "PROBE -- first piece only" : "off",
         c.placePerFrame, c.placePrime ? "PROBE" : "off", c.spawnClearance, c.spawnLift);
     // the WD and LP rows, so a log says on its own what
     // was in force when a blow landed on a cold body or the floor filled up.
@@ -4521,7 +4646,7 @@ static bool LoadConfig()
         c.sectLumps ? "" : " (0: every lump there is)",
         c.sever ? "DROPPED as objects"
                 : "NOT dropped (the part still leaves them and they still die of it)",
-        c.rigid ? "rigid" : "skinned");
+        c.rigid ? "rigid (skin and face shapes skinned)" : "skinned");
     // the cleave, so a log says which axis, how thin
     // and how far on its own.
     if (c.bladeAxis < 0)
@@ -4552,21 +4677,23 @@ static bool LoadConfig()
                         : "off -- no race is read");
     // the HD row, so a launch's log says on its own whether the head
     // probes ran and what they were allowed to do.
-    Log("      head probes %s (swap %d -- not built, lock %d, skin gate %s); head gain %.2f",
+    Log("      head probes %s (swap %d -- not built, lock %d); head gain %.2f",
         c.headProbe ? "ON -- [HEAD] lines, read-only, ~1 ms on the first wound of each of"
                       " the first eight targets" : "off",
-        c.headSwap, c.headLock, c.headSkinGate ? "ON" : "off", c.headGain);
+        c.headSwap, c.headLock, c.headGain);
     // the HF row -- whether their own face is read into the lattice.
     Log("      their own face: %s",
         c.targetFace == 3 ? "READ AND CUT (HF 3) -- their face's skin partition is privatised and redrawn like their body's;"
-                         " their face's skin counts towards the head's skin threshold; nothing of it goes into a piece yet"
+                         " their face's skin counts towards the head's skin threshold; a severed section carries it as skin,"
+                         " a shard carries none of it"
       : c.targetFace == 2 ? "READ, and their face's skin counts towards the head's skin threshold (HF 2) -- nothing drawn changes"
       : c.targetFace == 1 ? "READ into the lattice as their skin (HF 1) -- nothing drawn changes, nothing of it counts towards their death"
       : "off (HF 0) -- their FaceGen head is skipped");
     // the FA, FO and FOM rows -- their eyes, brows, mouth and hair.
     if (c.targetAcc)
         Log("      their eyes, brows, mouth and hair: READ AS WARDROBE (FA 1), up to %d vertices a shape"
-            " -- layer 0 and NOT skin, so they forge nothing and count towards no death rule,"
+            " -- layer 0 and NOT skin, so they count towards no death rule and go into a piece"
+            " as plain surfaces with no muscle behind them,"
             " and the sweep that drops a hat drops them with the piece of them they were drawn"
             " over. Head-bind to root is (%.3f %.3f %.3f) for a female body (FO) and (%.3f %.3f %.3f)"
             " for a male body (FOM) unless the actor's own face measures it,"
@@ -4577,6 +4704,8 @@ static bool LoadConfig()
     else
         Log("      their eyes, brows, mouth and hair: off (FA 0) --"
             " read by nothing and cut by nothing");
+    // the FT row.
+    LogFaceLookLine(c);
     // the DC row.
     if (c.dcMode)
         Log("      death camera: ON (DC 1) -- when a wound of theirs posts, third-person zoom offsets +%.2f"
@@ -4585,14 +4714,28 @@ static bool LoadConfig()
         Log("      death camera: off (DC 0)");
     // Say what the shards will be coloured with, so the log answers the
     // question on its own rather than needing the cfg read beside it.
-    if (!c.rigid)
+    if (c.skinShader == 1)
+        Log("      skin tint: ON, the skin shader (S 1) -- skin shells take the game's"
+            " skin-tint shader with their measured colour in it");
+    else if (!c.rigid)
         Log("      skin tint: OFF -- vertex colours are written on the rigid path only");
     else if (c.tintGain <= 0.0f)
         Log("      skin tint: OFF by config (S gain %.2f) -- shards keep the plain texture",
             c.tintGain);
     else
         Log("      skin tint: ON, gain %.2f -- their measured colour goes into the skin"
-            " shells as a vertex colour", c.tintGain);
+            " shells as a vertex colour, the nearest it can come to the game's skin blend"
+            " (it cannot brighten)", c.tintGain);
+    // Absent columns print nothing, so a cfg without them logs as before.
+    if (c.pieceTint == 0 && c.pieceUniq == 1)
+        Log("      live piece colour: off (S col 3 = 0) -- no [TINT] pass; uniqueness nudge (S col 4) ON");
+    else if (c.pieceTint != 0)
+        Log("      live piece colour (S col 3 = %d): when a piece's 3D arrives its materials are"
+            " read back%s -- [TINT] lines; uniqueness nudge (S col 4) %s%s", c.pieceTint,
+            c.pieceTint == 2 ? " and their colour is written into an unshared FacegenTint material"
+                               " once the in-session gate is open" : " and logged, nothing written",
+            c.pieceUniq == 1 ? "ON" : "off",
+            c.place == 0 ? "; E 0: no piece is engine-placed, so no pass will run" : "");
     // NAMED THROUGH THE LATTICE'S OWN BOUNDS-CHECKED ACCESSOR. The local copy
     // of the name table that used to live here is what once crashed the plugin at
     // startup: it had ten entries, Halve is the eleventh form, and printf was
@@ -5159,8 +5302,8 @@ static void ReadTextures(const void* geom, std::vector<std::string>& out, bool* 
     // convention -- and then CHECKED. A derived path is only used if the file
     // actually opens; a guess that cannot be opened is discarded rather than
     // written into a mesh. Where it cannot be recovered the shape simply does
-    // not get the skin block (see chunknif), so the worst case is an untinted
-    // piece rather than a blue one.
+    // not get the skin block (see chunknif), so the worst case is a piece on
+    // the ordinary lighting shader rather than a blue one.
     // ONLY ON THE REAL PASS. ReadTextures is also the eligibility scan, which
     // runs over every shape of every actor that loads and must stay cheap; the
     // recovery below opens files, and two file opens per skin shape per actor
@@ -5228,25 +5371,29 @@ static void ReadTextures(const void* geom, std::vector<std::string>& out, bool* 
 //
 // Three floats at material + 0xA0 -- see facts.h for how that offset was
 // arrived at: by measurement across ten targets.
+//
+// ONLY ON A SKIN-TINT MATERIAL. That measurement was made on feature-5
+// (FaceGenRGBTint) materials, the class a body's skin shader is, and there
+// the twelve bytes are the colour the engine tints their skin with. On any
+// other class those bytes are something else: on a FaceGen face (feature 4)
+// they are tintTexture's two dwords and detailTexture's low dword, which
+// pass the range check below whenever the low half of each pointer happens
+// to read as a float in range, and then usually read as black: every
+// piece taken off the target would be forged that colour. So the material is
+// asked its class on every read, and only feature 5 holds a skin colour here.
+//
 // Refused unless all three are inside [0,2]: the address is
 // derived through two pointer hops on a live game object, and a garbage read
 // that produced a plausible-looking float triple would tint every shard of
 // every body some arbitrary colour, which is worse than the white it replaces.
-// requireFeature: -1 asks the material nothing, which is what every caller did
-// before requireFeature and what every caller still does unless the config says
-// otherwise. A value of 5 refuses any material whose GetFeature is not
-// kFaceGenRGBTint -- see facts.h kMat_skinTint, whose measurement was made on
-// feature-5 materials only, and BSLightingShaderMaterialFacegen, on which the
-// same twelve bytes are two dwords of one NiPointer and the low dword of
-// another.
-static bool ReadSkinTint(const void* geom, float out[3], int requireFeature = -1)
+static bool ReadSkinTint(const void* geom, float out[3])
 {
     if (!geom) return false;
     const void* prop = nullptr;
     if (!Peek(geom, fact::kGeom_shaderProperty, &prop) || !prop) return false;
     const void* mat = nullptr;
     if (!Peek(prop, fact::kShadProp_material, &mat) || !mat) return false;
-    if (requireFeature >= 0 && MatFeature(mat) != requireFeature) return false;
+    if (MatFeature(mat) != int(fact::kMatFeature_FaceGenTint)) return false;
     if (!Readable(static_cast<const std::uint8_t*>(mat) + fact::kMat_skinTint, 12)) return false;
     float c[3];
     std::memcpy(c, static_cast<const std::uint8_t*>(mat) + fact::kMat_skinTint, 12);
@@ -5256,6 +5403,301 @@ static bool ReadSkinTint(const void* geom, float out[3], int requireFeature = -1
     return true;
 }
 
+// AN ACCESSORY'S OWN COLOUR (cfg FT col 2), off the material the face reader
+// already holds and with the feature it already asked for: no second call into
+// the engine. Feature 6 (hair tint): three floats at +0xA0, each in
+// [0, 1.0001] (they are multiples of 1/255). Feature 5 (skin tint): the same
+// offset as ReadSkinTint, held to its [0, 2]. Anything else, or any value out
+// of range, keeps nothing.
+static bool ReadMatColour(const void* mat, int feat, float out[3])
+{
+    if (!mat) return false;
+    float hi = 0.0f;
+    std::uintptr_t off = 0;
+    if (feat == int(fact::kMatFeature_HairTint))         { off = fact::kMatHT_tintColor; hi = 1.0001f; }
+    else if (feat == int(fact::kMatFeature_FaceGenTint)) { off = fact::kMat_skinTint;    hi = 2.0f; }
+    else return false;
+    const std::uint8_t* p = static_cast<const std::uint8_t*>(mat) + off;
+    if (!Readable(p, 12)) return false;
+    float c[3];
+    std::memcpy(c, p, 12);
+    for (int k = 0; k < 3; ++k)
+        if (!(c[k] >= 0.0f && c[k] <= hi)) return false;
+    out[0] = c[0]; out[1] = c[1]; out[2] = c[2];
+    return true;
+}
+
+// THE [FACETEX] PROBE (cfg FT col 6). Log only, and CALL-FREE: every byte is
+// read through Peek/Readable and nothing is called through anything it finds,
+// so a pointer of unknown class costs a line, never a call. What it settles:
+//   texset  the live texture list as read, with the texture set's vtable RVA
+//   alpha   geom+0x120 (UNREAD: taken to be the alpha property), the vtable
+//           RVA of what it points at, and u16 +0x30 / u8 +0x32 there
+//   colour  material+0xA0 on feature 6 (and 5), as floats and x255
+//   texobj  the material's qwords +0x38..+0xB0 and, where one points at
+//           readable memory, that target's vtable RVA (no strings read); on a
+//           FaceGen material also the +0xA0 tint texture's NiObjectNET name
+//
+// THE BUDGET IS KEPT FOR THE HEADS THAT ARE CUT. Pre-warm, the roster and the
+// re-read watch read most actors long before anyone cuts them, and an actor
+// that is cut was usually read then, not at the wound. So a read's lines are
+// written at once only when its actor has already been wounded
+// (FaceTexProbeCut, just before Separate on the wound and the test-strike
+// paths), or when it is one of the first 16 actors read and the lines written
+// that way stay within 1000. Any other read's lines are HELD, by actor, as
+// far as the held-read cap below goes, and written at that actor's first
+// wound. What the code guarantees:
+//   - each (actor, shape) is written at most once a session, at most 4 lines
+//     (a held read that is dropped, below, may be read and held again);
+//   - at most 4000 lines a session: each shape written counts as 4, and the
+//     "wounded:" line that leads an actor's held lines counts as 1; at most
+//     three one-time notices come on top (budget spent, held lines past,
+//     held reads past);
+//   - lines written for an actor not yet wounded take at most 1000 of them,
+//     so at least 3000 are spent only on actors that are wounded;
+//   - THE ENGINE IS READ FOR AT MOST 2000 SHAPES A SESSION, however long it
+//     runs without a wound: a read is made only when it is admitted, at most
+//     1000 are admitted to be written (4 lines each) and at most 1000 to be
+//     held (a held read dropped and read again counts again). Past 1000 held,
+//     only an actor already wounded is read (one line says so, once);
+//   - held lines are capped at 256 actors and 2 MB; past either, the actor
+//     held longest is dropped (one line says so, once).
+// Everything here runs under g_csLog through Guard, and the lines are built
+// before it is taken; nothing is read from the engine under it. A FormID
+// reused for another actor inherits what was held under it; every line names
+// the shape it was read from.
+struct FaceTexBook {
+    static constexpr long        kLines       = 4000;     // a session
+    static constexpr long        kEarlyLines  = 1000;     // of those, for actors not yet wounded
+    static constexpr long        kHeldReads   = 1000;     // reads admitted to be held, a session
+    static constexpr std::size_t kEarlyActors = 16;
+    static constexpr std::size_t kHeldActors  = 256;
+    static constexpr std::size_t kHeldBytes   = std::size_t(2) << 20;
+    static constexpr std::size_t kCutActors   = 4096;
+    struct Shape { std::string name; std::vector<std::string> lines; };
+    struct Held  { std::vector<Shape> shapes; std::size_t bytes = 0; };
+    std::set<std::pair<u32, std::string>> seen;   // (actor, shape) written or held
+    std::set<u32> early;                          // actors written before their first wound
+    std::set<u32> cut;                            // actors wounded
+    std::map<u32, Held> held;
+    std::deque<u32> order;                        // held actors, oldest first
+    std::size_t heldBytes = 0;
+    long lines = 0, earlyLines = 0, heldReads = 0;
+    bool saidSpent = false, saidFull = false, saidReads = false;
+};
+static FaceTexBook* g_ftBook = nullptr;   // made under g_csLog on first use, never freed
+// 0: nothing -- no engine read (written or held already, the session's lines
+//    are spent, or its held reads are spent and the actor is not yet wounded);
+// 1: write now (its 4 lines are counted here); 2: hold until their wound.
+static int FaceTexProbeAdmit(u32 formID, const std::string& shape)
+{
+    int how = 0;
+    bool saySpent = false, sayReads = false;
+    {
+        Guard lk(&g_csLog);
+        if (!g_ftBook) g_ftBook = new FaceTexBook();
+        FaceTexBook& b = *g_ftBook;
+        const std::pair<u32, std::string> key(formID, shape);
+        if (b.seen.count(key)) return 0;
+        if (b.lines + 4 > FaceTexBook::kLines) {
+            if (!b.saidSpent) { b.saidSpent = true; saySpent = true; }
+        } else if (b.cut.count(formID)) {
+            how = 1;
+        } else if (b.earlyLines + 4 <= FaceTexBook::kEarlyLines
+                   && (b.early.count(formID) || b.early.size() < FaceTexBook::kEarlyActors)) {
+            b.early.insert(formID);
+            b.earlyLines += 4;
+            how = 1;
+        } else if (b.heldReads < FaceTexBook::kHeldReads) {
+            ++b.heldReads;
+            how = 2;
+        } else if (!b.saidReads) {
+            b.saidReads = true;
+            sayReads = true;
+        }
+        if (how == 1) b.lines += 4;
+        if (how) b.seen.insert(key);   // a refused read is not marked: after their wound it is written
+    }
+    if (saySpent)
+        Log("[FACETEX] budget spent: %ld line(s) -- the probe writes nothing more this session",
+            long(FaceTexBook::kLines));
+    if (sayReads)
+        Log("[FACETEX] held reads past %ld shape(s) -- from now on only an actor already wounded is read (said once)",
+            long(FaceTexBook::kHeldReads));
+    return how;
+}
+// A read admitted as 2: its lines go into the held store -- or are written at
+// once, if their wound came since FaceTexProbeAdmit answered.
+static void FaceTexProbeHold(u32 formID, const std::string& shape, std::vector<std::string>& lines)
+{
+    std::vector<std::string> now;
+    u32 dropped = 0;
+    bool sayFull = false, saySpent = false;
+    {
+        Guard lk(&g_csLog);
+        if (!g_ftBook) return;            // made by FaceTexProbeAdmit, which answered 2
+        FaceTexBook& b = *g_ftBook;
+        if (b.cut.count(formID)) {
+            if (b.lines + 4 <= FaceTexBook::kLines) { b.lines += 4; now.swap(lines); }
+            else if (!b.saidSpent) { b.saidSpent = true; saySpent = true; }
+        } else {
+            std::size_t add = 0;
+            for (const std::string& s : lines) add += s.size();
+            auto it = b.held.find(formID);
+            if (it == b.held.end()) {
+                it = b.held.emplace(formID, FaceTexBook::Held()).first;
+                b.order.push_back(formID);
+            }
+            FaceTexBook::Shape sh;
+            sh.name = shape;
+            sh.lines.swap(lines);
+            it->second.shapes.push_back(std::move(sh));
+            it->second.bytes += add;
+            b.heldBytes += add;
+            while ((b.held.size() > FaceTexBook::kHeldActors || b.heldBytes > FaceTexBook::kHeldBytes)
+                   && !b.order.empty()) {
+                const u32 old = b.order.front();
+                b.order.pop_front();
+                auto h = b.held.find(old);
+                if (h == b.held.end()) continue;
+                for (const FaceTexBook::Shape& s : h->second.shapes) b.seen.erase(std::make_pair(old, s.name));
+                b.heldBytes -= h->second.bytes;
+                b.held.erase(h);
+                if (!b.saidFull) { b.saidFull = true; sayFull = true; dropped = old; }
+            }
+        }
+    }
+    for (const std::string& s : now) Log("%s", s.c_str());
+    if (saySpent)
+        Log("[FACETEX] budget spent: %ld line(s) -- the probe writes nothing more this session",
+            long(FaceTexBook::kLines));
+    if (sayFull)
+        Log("[FACETEX] held lines past %u actor(s) or %u byte(s) -- dropping those held longest, first 0x%08X (said once)",
+            unsigned(FaceTexBook::kHeldActors), unsigned(FaceTexBook::kHeldBytes), unsigned(dropped));
+}
+// THEIR WOUND (FT col 6): just before Separate, on the wound and the
+// test-strike paths. What was held for them is written now, in the order it
+// was read, as far as the session's lines go; from now on a read of theirs is
+// written at once. Log only: no engine read, no engine call.
+static void FaceTexProbeCut(u32 formID)
+{
+    if (!g_cfg.ftProbe) return;
+    try {
+        std::vector<std::string> now;
+        unsigned nShapes = 0, nLeft = 0;
+        bool saySpent = false;
+        {
+            Guard lk(&g_csLog);
+            if (!g_ftBook) g_ftBook = new FaceTexBook();
+            FaceTexBook& b = *g_ftBook;
+            if (b.cut.size() < FaceTexBook::kCutActors) b.cut.insert(formID);
+            auto it = b.held.find(formID);
+            if (it == b.held.end()) return;
+            for (FaceTexBook::Shape& sh : it->second.shapes) {
+                const long need = nShapes ? 4 : 5;   // the first one also pays for the "wounded:" line
+                if (b.lines + need > FaceTexBook::kLines) { ++nLeft; continue; }
+                b.lines += need;
+                ++nShapes;
+                for (std::string& s : sh.lines) now.push_back(std::move(s));
+            }
+            if (nLeft && !b.saidSpent) { b.saidSpent = true; saySpent = true; }
+            b.heldBytes -= it->second.bytes;
+            b.held.erase(it);
+            for (auto o = b.order.begin(); o != b.order.end(); ++o)
+                if (*o == formID) { b.order.erase(o); break; }
+        }
+        if (nShapes)
+            Log("[FACETEX] 0x%08X wounded: %u shape(s) read before their first wound follow",
+                unsigned(formID), nShapes);
+        for (const std::string& s : now) Log("%s", s.c_str());
+        if (saySpent)
+            Log("[FACETEX] budget spent: %ld line(s) -- the probe writes nothing more this session",
+                long(FaceTexBook::kLines));
+    } catch (...) {
+        // Out of memory in a log-only probe: the wound goes on without it.
+    }
+}
+static std::uint32_t VtRvaOf(const void* obj)
+{
+    const void* vt = nullptr;
+    if (!obj || !Peek(obj, 0, &vt) || !InGameImage(vt)) return 0;
+    return std::uint32_t(reinterpret_cast<std::uintptr_t>(vt) - g_base);
+}
+// One probe line, formatted whole (a path longer than a stack buffer is not cut).
+static void FaceTexLine(std::vector<std::string>& out, const char* fmt, ...)
+{
+    char small[512];
+    va_list ap, ap2;
+    va_start(ap, fmt);
+    va_copy(ap2, ap);
+    const int n = std::vsnprintf(small, sizeof(small), fmt, ap);
+    va_end(ap);
+    if (n >= 0 && std::size_t(n) < sizeof(small)) {
+        out.emplace_back(small, std::size_t(n));
+    } else if (n > 0) {
+        std::vector<char> big(std::size_t(n) + 1, '\0');
+        std::vsnprintf(big.data(), big.size(), fmt, ap2);
+        out.emplace_back(big.data(), std::size_t(n));
+    }
+    va_end(ap2);
+}
+static void FaceTexProbe(u32 formID, const char* nm, int feat, const void* geom, const void* mat,
+                         const std::vector<std::string>& tex)
+{
+    if (!g_cfg.ftProbe) return;
+    try {
+        const std::string shape(nm ? nm : "?");
+        const int how = FaceTexProbeAdmit(formID, shape);
+        if (!how) return;
+        const char* sn = shape.c_str();
+        std::vector<std::string> out;
+        auto slot = [&](std::size_t i) -> const char* { return i < tex.size() ? tex[i].c_str() : ""; };
+        const void* ts = nullptr;
+        if (mat) Peek(mat, fact::kMat_textureSet, &ts);
+        FaceTexLine(out, "[FACETEX] 0x%08X '%s' feat %d texset: +0x78 %p vtable RVA 0x%08X slot0 '%s' slot1 '%s' slot3 '%s' slot6 '%s'",
+            unsigned(formID), sn, feat, ts, unsigned(VtRvaOf(ts)), slot(0), slot(1), slot(3), slot(6));
+        const void* ap = nullptr;
+        Peek(geom, fact::kGeom_alphaProperty, &ap);
+        std::uint16_t af = 0; std::uint8_t at = 0;
+        if (ap && Peek(ap, fact::kAlpha_flags, &af) && Peek(ap, fact::kAlpha_threshold, &at))
+            FaceTexLine(out, "[FACETEX] 0x%08X '%s' feat %d alpha: +0x120 %p vtable RVA 0x%08X flags 0x%04X thr %u",
+                unsigned(formID), sn, feat, ap, unsigned(VtRvaOf(ap)), unsigned(af), unsigned(at));
+        else
+            FaceTexLine(out, "[FACETEX] 0x%08X '%s' feat %d alpha: +0x120 %p vtable RVA 0x%08X no flags",
+                unsigned(formID), sn, feat, ap, unsigned(VtRvaOf(ap)));
+        if (mat && (feat == int(fact::kMatFeature_HairTint) || feat == int(fact::kMatFeature_FaceGenTint))) {
+            float c[3] = { 0, 0, 0 };
+            if (Peek(mat, fact::kMatHT_tintColor, &c))
+                FaceTexLine(out, "[FACETEX] 0x%08X '%s' feat %d colour: +0xA0 (%.6f %.6f %.6f) x255 (%.2f %.2f %.2f)",
+                    unsigned(formID), sn, feat, c[0], c[1], c[2], c[0] * 255.0f, c[1] * 255.0f, c[2] * 255.0f);
+        }
+        if (mat) {
+            char buf[1400];
+            int n = std::snprintf(buf, sizeof(buf), "[FACETEX] 0x%08X '%s' feat %d texobj: material %p RVA 0x%08X;",
+                                  unsigned(formID), sn, feat, mat, unsigned(VtRvaOf(mat)));
+            for (std::uintptr_t o = 0x38; o <= 0xB0 && n > 0 && n < int(sizeof(buf)) - 64; o += 8) {
+                std::uint64_t q = 0;
+                if (!Peek(mat, o, &q)) { n += std::snprintf(buf + n, sizeof(buf) - std::size_t(n), " +%02X ?", unsigned(o)); continue; }
+                const std::uint32_t r = VtRvaOf(reinterpret_cast<const void*>(std::uintptr_t(q)));
+                n += std::snprintf(buf + n, sizeof(buf) - std::size_t(n), " +%02X %016llX", unsigned(o), (unsigned long long)q);
+                if (r) n += std::snprintf(buf + n, sizeof(buf) - std::size_t(n), "/%08X", unsigned(r));
+            }
+            if (feat == int(fact::kMatFeature_FaceGen)) {
+                const void* tt = nullptr;
+                const char* tn = nullptr;
+                if (Peek(mat, fact::kMatFG_tintTexture, &tt) && tt) tn = NodeName(tt);
+                if (n > 0 && n < int(sizeof(buf)) - 8)
+                    std::snprintf(buf + n, sizeof(buf) - std::size_t(n), "; tintTexture %p name '%s'", tt, tn ? tn : "");
+            }
+            if (n > 0) out.emplace_back(buf);
+        }
+        if (how == 1) { for (const std::string& s : out) Log("%s", s.c_str()); }
+        else          FaceTexProbeHold(formID, shape, out);
+    } catch (...) {
+        // Out of memory in a log-only probe: the read goes on without it.
+    }
+}
+
 // ------------------------------------------ WHERE DOES THEIR COLOUR LIVE?
 //
 // A purple-skinned target dropped white-skinned shards, and the reason was not
@@ -5263,9 +5705,9 @@ static bool ReadSkinTint(const void* geom, float out[3], int requireFeature = -1
 // out of Dismembering Framework's limb prop. Its skin-tint colour is the three
 // floats at the end of the 112-byte type-5 block -- (1.0, 1.0, 1.0), white --
 // and nothing wrote anything else there until SetSkinTint. The 100-byte type-0 block
-// the mod actually ships has no tint field at all, which is why chunknif.h
-// records that turning the skin path on made pieces come out BLEACHED: a skin
-// shader with no tint to sample is a skin shader with white skin.
+// the mod actually ships has no tint field at all, and the skin path with no
+// tint written makes pieces come out BLEACHED: a skin shader with no tint to
+// sample is a skin shader with white skin.
 //
 // So both halves of the fault were the same missing number, and this hunts for where
 // it lives.
@@ -5352,8 +5794,8 @@ static void ProbeTint(const void* geom, const char* who, const std::vector<std::
 //   vertexCount 3832        dataSize 61312 == 3832 * 16
 //   positions   x in [-6.17, 6.17], y in [-6.40, 9.59], z in [109.86, 131.62]
 //               and the fourth float 0.0 on every one of the 3,832
-//   material    Feature 4 (kFaceGen) on disk; the LIVE value is what probe #4
-//               exists to read, and eyes 16 / brows 6 are unverified
+//   material    Feature 4 (kFaceGen) on disk, and 4 on every live face read;
+//               eyes 1, 2 or 16; brows 6, or 5 on an Argonian and on Orc horns
 //               -- a 4 on a brow is a surprise and should read as
 //               one.
 static const std::size_t kHeadDynMax = 4u * 1024u * 1024u;   // sanity cap on dataSize
@@ -5624,17 +6066,18 @@ static void HeadProbeMaterial(const void* geom, const char* who)
         " -- a 4 on a brow is a surprise. -2 means the call was refused.)",
         who, prop, mat, unsigned(rva), known, feat);
     if (!mat) return;
-    // The twelve bytes ReadSkinTint would have taken, printed raw AND as the
-    // colour it would have believed, so the defect is visible either way.
+    // The twelve bytes at the colour's offset, printed raw AND as floats,
+    // beside what ReadSkinTint decides for this material.
     if (Readable(static_cast<const std::uint8_t*>(mat) + fact::kMat_skinTint, 12)) {
         std::uint32_t w[3];
         std::memcpy(w, static_cast<const std::uint8_t*>(mat) + fact::kMat_skinTint, 12);
         float c[3];
         std::memcpy(c, static_cast<const std::uint8_t*>(mat) + fact::kMat_skinTint, 12);
-        const bool wouldPass = (c[0] >= 0.0f && c[0] <= 2.0f) && (c[1] >= 0.0f && c[1] <= 2.0f)
+        const bool wouldPass = feat == int(fact::kMatFeature_FaceGenTint)
+                            && (c[0] >= 0.0f && c[0] <= 2.0f) && (c[1] >= 0.0f && c[1] <= 2.0f)
                             && (c[2] >= 0.0f && c[2] <= 2.0f);
         Log("    [HEAD] %s: material+0xA0 raw %08X %08X %08X; as floats (%.6f, %.6f,"
-            " %.6f); the current ReadSkinTint gate [0,2] would %s. On a feature-4"
+            " %.6f); ReadSkinTint (feature 5 only, each in [0,2]) would %s. On a feature-4"
             " material those twelve bytes are tintTexture's two dwords and"
             " detailTexture's low dword -- a heap pointer, not a colour.",
             who, unsigned(w[0]), unsigned(w[1]), unsigned(w[2]), c[0], c[1], c[2],
@@ -6418,8 +6861,8 @@ static void HeadProbeVoxelise(const void* geom, const void* skinInst, u32 formID
     // ---- and arm the sampler on the first face-looking shape found -----
     //
     // BY THE MATERIAL FIRST AND BY THE TEXTURE PATH SECOND. Feature 4 is the
-    // engine's own word for a FaceGen head and is what this reads; but
-    // whether the LIVE material is feature 4 is unverified, so a
+    // engine's own word for a FaceGen head and is what this reads, and every
+    // live face read so far has answered 4; but a
     // head that came back as something else would otherwise never be sampled
     // and this launch would answer nothing. The substring is the fallback, and
     // it is used HERE only -- to decide which shape to watch -- never to decide
@@ -7189,10 +7632,18 @@ struct ShapeSrc {
     // a face shape is READ ONLY: Redraw never privatises it (partTris and
     // drawn are left empty, the phantom-shape idiom). At HF 3
     // partTris carries the partition counts and Redraw cuts
-    // it exactly as it cuts their body's skin. In every mode AssembleCells
-    // never copies it into a piece and BloodQuads never paints a cut across
-    // it.
+    // it exactly as it cuts their body's skin, and AssembleCells copies
+    // what a severed section takes of it into that piece as their skin
+    // (never into a shard). In every mode BloodQuads never paints a cut
+    // across it.
     bool face = false;
+    // THE FACE AND ITS ACCESSORIES IN A PIECE (cfg FT), set by ReadTargetFace
+    // only, after its last refusal. Copied by value to the forge (GeomRef).
+    bool accessory = false;                 // a non-face shape the face reader read
+    int  feature = -2;                      // its material's GetFeature answer at the read
+    bool hasMatTint = false;                // matTint read off its live material (FT col 2)
+    float matTint[3] = { 1.0f, 1.0f, 1.0f };
+    std::vector<std::string> liveTex;       // the face's texture list as read, when it passed FaceGenTexOK (FT col 1)
 };
 struct Body {
     u32 formID = 0;
@@ -7391,8 +7842,8 @@ struct Body {
     // Do not read it as a cache of that count. It is the
     // MEMORY for the single case the count cannot answer: they are not wearing
     // the head fill at all, so there are no Head cells of theirs to measure and
-    // the last known answer has to stand -- a decapitated target stripped for
-    // their scene, whose head cells the ledger is still holding for the moment
+    // the last known answer has to stand -- a decapitated target whose outfit
+    // another mod took off, whose head cells the ledger is still holding for the moment
     // they exist again. Cleared where the ledger is cleared: the un-cut in
     // RestoreEveryBody that makes them whole. Deliberately NOT co-saved -- their
     // gone cells are, and they are what the count is taken from after a load.
@@ -7466,7 +7917,8 @@ struct Body {
         u32 base = 0, verts = 0, triBase = 0, tris = 0;
     };
     std::vector<Canvas> canvases;
-    // THE PRIVATE VERTEX BUFFERS -- one per face shape read, owned
+    // THE PRIVATE VERTEX BUFFERS -- one per face shape read, and one per worn
+    // or skin shape put through its stored frame (ApplyShapeFrames), owned
     // here so a ShapeSrc::raw into it lives exactly as long as the Body. A
     // vector of vectors moves with the Body (the hand-overs are all
     // std::move) and the inner buffers keep their addresses across that;
@@ -8008,7 +8460,8 @@ static u32 InjectFill(Body& B, std::vector<flesh::ShapeData>& sd,
 // WHAT IT DOES NOT DO. Their head is not redrawn below HF 3 (Redraw skips
 // a face shape; its partTris and drawn are left empty, which is also the
 // phantom-shape idiom that keeps every load-restore pass off it), never
-// copied into a piece (AssembleCells skips it), never painted with a cut
+// copied into a shard, and into a severed section only at HF 3, where it is
+// cut from them (AssembleCells), never painted with a cut
 // (BloodQuads skips it), never read for their body tint (the head branch has
 // its own gated read), and never used for eligibility (`sawFemaleSkin`,
 // `sawMaleSkin` and Body::sex are the body's alone). At HF 1 its skin cells
@@ -8133,6 +8586,105 @@ static void LogQuiet(const char*, ...) {}
 static volatile long g_layoutVotesFull  = 0;
 static volatile long g_layoutVotesLocal = 0;
 
+// DOES A TEXTURE FILE OPEN, ASKED ONCE PER PATH. The reader runs on every
+// voxelise, and their face's candidate names are the same on every read of
+// that face, so the answer is kept: a path is normally opened once, not once
+// per voxelise. Two threads that miss the same path together each open it,
+// and past 256 distinct paths the table starts again. The lock is the
+// registry's; this function holds it for the lookup and for the store and
+// not across the open -- but a caller voxelising in place on the game's
+// thread already holds it, so there the open is made under it.
+static std::map<std::string, bool> g_faceTexOpens;
+static bool FaceTexOpens(const std::string& rel)
+{
+    {
+        Guard lk(&g_csBodies);
+        auto it = g_faceTexOpens.find(rel);
+        if (it != g_faceTexOpens.end()) return it->second;
+    }
+    char full[400];
+    std::snprintf(full, sizeof(full), "Data\\%s", rel.c_str());
+    const FileProbe P = ProbeFile(full);
+    const bool opens = P.opened && P.size > 0;
+    Guard lk(&g_csBodies);
+    if (g_faceTexOpens.size() >= 256) g_faceTexOpens.clear();
+    g_faceTexOpens[rel] = opens;
+    return opens;
+}
+
+// THEIR FACE'S TEXTURE LIST, AS A PIECE OF THEM CARRIES IT.
+//
+// A severed section takes their face as skin (AssembleCells), and the forge
+// writes a skin shape with the slots their body's skin shape keeps: diffuse
+// 0, model space normal 1, subsurface 2, specular 7, and nothing else (see
+// ReadTextures, which puts a body shape's list in that order). A FaceGen head
+// file on disk carries more -- a detail map at 3 and its tint mask at 6 -- and
+// on a vanilla FaceGen head the live texture set hands them back at the same
+// indices (measured in an older field log on this runtime: detail at 3, the
+// FaceGenData\FaceTint map at 6; a head built at runtime has neither). The
+// body's subsurface map has come back at index 3, so this list still trusts
+// no index past the first two; the FaceGen route (cfg FT col 1) keeps its own
+// copy of the list as read, checked by name (chunknif::FaceGenTexOK). The
+// specular map are found BY NAME, over every slot from 2 up, by the game's
+// own suffixes (_sk.dds, _s.dds), and put where a NIF means them. One the
+// list does not hold is rebuilt from the diffuse by the same suffix and kept
+// only if that file opens (FaceTexOpens). Every other slot from 2 up is
+// emptied.
+//
+// Slots 0 and 1 are left exactly as they were read. With both of the others
+// present the shape can take the skin shader (cfg S 1); with either missing
+// chunknif keeps it on the ordinary lighting shader, which needs only 0 and
+// 1. The line this logs says which, with every name, on every read.
+static void FaceTexForPiece(std::vector<std::string>& tex, const char* nm,
+                            void (*Say)(const char*, ...))
+{
+    if (tex.empty() || tex[0].empty()) {
+        Say("  [FACE] '%s' in a piece: no diffuse texture was read for it -- it is cut on them"
+            " and goes into no piece", nm);
+        return;
+    }
+    if (tex.size() < 9) tex.resize(9);      // nine slots, as a NIF's texture set has
+    auto endsWith = [](const std::string& s, const char* suffix) -> bool {
+        const std::size_t n = std::strlen(suffix);
+        if (s.size() < n) return false;
+        for (std::size_t i = 0; i < n; ++i)
+            if (char(std::tolower(static_cast<unsigned char>(s[s.size() - n + i]))) != suffix[i]) return false;
+        return true;
+    };
+    struct { std::size_t slot; const char* suffix; } want[2] = { { 2, "_sk.dds" }, { 7, "_s.dds" } };
+    std::string found[2];
+    const char* from[2] = { "not found", "not found" };
+    for (int w = 0; w < 2; ++w) {
+        if (endsWith(tex[want[w].slot], want[w].suffix)) {
+            found[w] = tex[want[w].slot];
+            from[w] = "as read";
+            continue;
+        }
+        for (std::size_t k = 2; k < 9; ++k)
+            if (endsWith(tex[k], want[w].suffix)) {
+                found[w] = tex[k];
+                from[w] = "read at another slot";
+                break;
+            }
+        if (!found[w].empty()) continue;
+        if (tex[0].size() > 4 && endsWith(tex[0], ".dds")) {
+            const std::string cand = tex[0].substr(0, tex[0].size() - 4) + want[w].suffix;
+            if (FaceTexOpens(cand)) {
+                found[w] = cand;
+                from[w] = "rebuilt from the diffuse";
+            }
+        }
+    }
+    for (std::size_t k = 2; k < tex.size(); ++k) tex[k].clear();
+    tex[2] = found[0];
+    tex[7] = found[1];
+    Say("  [FACE] '%s' in a piece: diffuse '%s', normal '%s', subsurface '%s' (%s), specular '%s' (%s)"
+        " -- %s", nm, tex[0].c_str(), tex[1].c_str(), tex[2].c_str(), from[0], tex[7].c_str(), from[1],
+        (!tex[2].empty() && !tex[7].empty())
+            ? "the skin shader can take it (cfg S 1)"
+            : "the ordinary lighting shader only, whatever cfg S says");
+}
+
 static bool ReadTargetFace(Body& B, const void* geom, const void* skin, const void* root,
                         const char* gname, std::vector<flesh::ShapeData>& sd,
                         std::vector<std::vector<flesh::TriRef>>& tris)
@@ -8148,7 +8700,9 @@ static bool ReadTargetFace(Body& B, const void* geom, const void* skin, const vo
     // 16 on another, a mouth answered 0 and 1, brows and hair answered 6, a
     // face scar answered 5 -- so an accessory is defined by what it is not,
     // and held to a vertex ceiling instead of a whitelist.
-    const int  feat   = MatFeature(MaterialOf(geom));
+    // The material is kept: the FT colour read uses it, with no second call.
+    const void* const mat = MaterialOf(geom);
+    const int  feat   = MatFeature(mat);
     const bool isFace = (feat == int(fact::kMatFeature_FaceGen));
     if (!isFace && !g_cfg.targetAcc) return false;   // FA 0: brows 6, hair 6, mouth 1, eyes -- skipped, as at first
     // The log budget: see LogQuiet above. Their face always speaks; the
@@ -8780,11 +9334,12 @@ layoutDecided:
     S.layer = 0; S.solid = false; S.face = isFace;
     // AN ACCESSORY IS NOT THEIR FACE, AND NOT THEM. `face` gates three
     // things and an accessory wants none of them: BloodQuads skips a face
-    // (flesh.cpp, "if (S.face) continue"), AssembleCells never copies a face
-    // into a piece, and Redraw skips a face below HF 3. An accessory is kept
-    // out of the first two by being WARDROBE instead -- BloodQuads wants
-    // `isSkin`, AssembleCells refuses `layer == 0 && !isSkin` -- which is the
-    // same door a hat goes through and needs no new flag. What it does want
+    // (flesh.cpp, "if (S.face) continue"), AssembleCells keeps a face out of
+    // every shard, and Redraw skips a face below HF 3. An accessory is kept
+    // out of the first by being WARDROBE instead -- BloodQuads wants
+    // `isSkin` -- and goes into a piece through the door a hat goes through,
+    // as a plain surface the forge never rinds (chunknif, Solidify); neither
+    // needs a new flag. What it does want
     // is the third: to be cut, which is what `face = false` buys it.
     //
     // partTris and drawn are LEFT EMPTY below HF 3: see ShapeSrc::face. At
@@ -8822,10 +9377,41 @@ layoutDecided:
                 nm, outOfRange);
         }
     }
-    // Quiet (no `who`): the list is for the log line below and nothing else --
-    // no piece is forged from their face in this build -- so the _sk/_s
-    // recovery, which opens files on this thread, is not run for it.
+    // Quiet (no `who`): ReadTextures' own _sk/_s recovery opens files on this
+    // thread on every voxelise, so it is not run here. A face that is cut can
+    // go into a severed section, and FaceTexForPiece puts its list in the
+    // order a piece carries, normally opening a file once per path. A face
+    // that is read and not cut goes into no piece and keeps the list as read.
     ReadTextures(geom, S.tex, &S.isSkin, nullptr, /*forceSkin*/ isFace);
+    // THE [FACETEX] PROBE (FT col 6), on the list as read, before anything
+    // below rewrites it. Call-free and budgeted; see FaceTexProbe.
+    if (g_cfg.ftProbe) FaceTexProbe(B.formID, nm, feat, geom, mat, S.tex);
+    if (isFace && !S.partTris.empty()) {
+        // THE LIVE LIST, KEPT BEFORE FaceTexForPiece REWRITES IT (FT col 1).
+        // A FaceGen head's live set holds its detail map at 3 and its own
+        // FaceTint map at 6; FaceTexForPiece keeps only 0, 1, 2 and 7, and
+        // empties 2 when an overhaul head's subsurface slot is not an _sk. The
+        // FaceGen block takes the set exactly as the game draws this head.
+        std::vector<std::string> live;
+        if (g_cfg.ftMaps) { live = S.tex; if (live.size() < 9) live.resize(9); }
+        FaceTexForPiece(S.tex, nm, Say);
+        if (g_cfg.ftMaps) {
+            // What the forge will do with it: FaceGen faces are always built
+            // skinned on the type-4 block, regardless of D rigid or S gain.
+            if (chunknif::FaceGenTexOK(live)) {
+                S.liveTex = live;
+                Say("  [FACE] '%s' tint maps: detail '%s', tint '%s' -- the FaceGen shader (FT 1), slots 0-3, 6, 7 as read",
+                    nm, live[3].c_str(), live[6].c_str());
+            } else if (live[6].empty()) {
+                Say("  [FACE] '%s' tint maps: none in the live set (a head built at runtime) -- as without"
+                    " FT maps", nm);
+            } else {
+                Say("  [FACE] '%s' tint maps: refused by name (slot 2 '%s', slot 3 '%s', slot 6 '%s', slot 7 '%s')"
+                    " -- as without FT maps", nm, live[2].c_str(), live[3].c_str(),
+                    live[6].c_str(), live[7].c_str());
+            }
+        }
+    }
     // THEIR FACE IS SKIN AND AN ACCESSORY IS NOT, AND NEITHER IS LEFT TO THE SUBSTRING TEST.
     // Their face is forced skin because it is their skin whatever its diffuse path
     // says. An eye is forced NOT skin for the mirror reason: the substring test
@@ -8833,9 +9419,20 @@ layoutDecided:
     // shapes the probe reached, in all 96 blocks, their heads included), but a
     // mod that named an eye texture
     // "...femalehead.dds" would otherwise make their eyeball part of their body --
-    // countable towards their death, forgeable into a piece, paintable with
-    // blood. It is a decoration. It is never them.
+    // countable towards their death, forged and rinded as their skin, paintable
+    // with blood. It is a decoration. It is never them.
     S.isSkin = isFace;
+    // AN ACCESSORY'S FEATURE AND COLOUR (FT col 2). After every refusal in
+    // this function, so a refused shape leaves nothing new behind. Every
+    // non-face shape read here is an accessory -- worn dynamic gear on their
+    // head included -- and gets the accessory rules in a piece.
+    if (!isFace) {
+        S.accessory = true;
+        S.feature = feat;
+        if ((g_cfg.ftHair >= 1 && feat == int(fact::kMatFeature_HairTint))
+            || (g_cfg.ftHair >= 2 && feat == int(fact::kMatFeature_FaceGenTint)))
+            S.hasMatTint = ReadMatColour(mat, feat, S.matTint);
+    }
     const int idx = int(B.shapes.size());
     B.texStore.push_back(S.tex);
     B.vertBone.push_back(std::move(vb));
@@ -8941,6 +9538,406 @@ static std::size_t FaceOnlyCells(const flesh::Lattice& L, const std::vector<fles
         ++n;
     }
     return n;
+}
+
+// ====================================== THE FRAME A WORN SHAPE IS STORED IN
+//
+// WHAT THIS IS. The body path reads a shape's vertex records as they are
+// stored, and the lattice takes them for bind-space positions of the body.
+// Many shipping meshes are not stored that way. A helmet stored around the
+// head bone carries its lift to the head -- about (0, -1.5, 120.3) -- in the
+// shape's own node transform, with the inverse of that in its skin data; a
+// boot can be stored turned half a circle about an axis, with no translate
+// at all. Read as stored, such a shape is voxelised, cut and forged where
+// its records sit: a helmet in the cells at their feet, voting those cells
+// onto the head bone, and forged into whichever piece takes their shins.
+//
+// WHAT IT DOES. For every shape the body path read, it takes the two reads
+// that can say which frame the records are in -- the live node's local
+// transform, and the overall transform of the live NiSkinData -- validates
+// each as a rigid transform, and logs what it found, one [XFORM] line a
+// shape. A shape whose frame is not the body's is then voxelised and forged
+// from a private copy of its records put through that frame: position
+// through rotation, scale and translate, and every packed direction through
+// the rotation (frame_bits.h). The copy lives in Body::privRecs, beside the
+// face reader's, and ShapeSrc::raw and the lattice's ShapeData both point at
+// it. THE ENGINE'S OWN BUFFER IS NEVER WRITTEN: a partition's vertex records
+// are shared by every actor wearing that mesh.
+//
+// WHICH READ. The node's local transform when it is a valid transform that
+// is not the identity; failing that, the inverse of the skin data's. On
+// most meshes measured the two are exact inverses; some carry the frame in
+// the skin data alone, and a few carry a node transform the skin data does
+// not answer. So when both are there, whether they compose to the identity
+// is evidence, and the line says.
+//
+// AND A READ ALONE DECIDES NOTHING. Whether a live node still holds the
+// file's transform is a fact about the engine, and the skin data's offset
+// is recalled rather than measured (facts.h). So the frame is applied only
+// if it puts the shape where its own bones are on the body (frame::Decide).
+// On one read: as read the shape must be out of place, and through the frame
+// it must land on its bones and be clearly nearer to them than it was, so a
+// shape that is in place is not moved by a transform left over on its node.
+// On two reads that agree -- the node's transform and the skin data's, each
+// undoing the other -- the frame is taken wherever it lands the shape on its
+// bones, because the measure cannot see a helmet turned back to front or
+// stored a cell low; a shape that reads in place is taken only if it lands in
+// place too. A frame that does not seat the shape is refused and the shape
+// stays as read. Either way the line carries both distances.
+//
+// WHAT IT IS MEASURED AGAINST. A target in full plate shows no skin: every
+// skin shape of theirs is hidden, and the shape loop skips a hidden
+// surface. What is in bind space on every body is the fill -- so the
+// reference is the fill store of the body's sex, each bone's flesh averaged
+// once (ShapeFrameRefOf). The stores name no head bone; a shape's head and
+// neck vertices are measured against the head-bind point of the FO / FOM
+// row instead, which is where the head bone sits in bind space. A bone
+// neither can place -- a physics bone of the garment's own -- does not vote.
+//
+// WHICH SHAPES. Their skin and what they wear: layer 0 and the armour
+// layer. Not the interior. The fill, the lining and the blood canvas are
+// meshes this mod generates in bind space; a canvas's records are copied
+// into a vertex buffer the engine then skins (PaintCanvas), and a turned
+// copy there would be drawn turned. An interior shape is logged only when
+// its frame is not the identity, which would be a fault in the mesh. Not
+// the face reader's shapes either: those are framed by the two decisions
+// that follow this one in Voxelise.
+//
+// EVERY OTHER READER OF ShapeSrc::raw, AGAINST A PRIVATE COPY. The lattice,
+// the face's neck-ring anchor and the blood quads read positions, and want
+// them in bind space: the copy is what makes them right. The redraw never
+// reads a surface's vertices -- it rewrites index lists from the triangle
+// table the lattice built out of these positions, so a shape moved here
+// loses its triangles with the cells it has been put in. AssembleCells and
+// the forge read whole records, which is why the directions are turned as
+// well as the positions. The copy is sized to ShapeSrc::nVerts, the bound
+// every one of those readers tests an index against. A forge batch can
+// outlive the build it was decided on, and the next voxelise frees
+// privRecs; the hand-off gives the batch its own copy of every shape whose
+// records are in there (GeomRef::ownedRaw).
+#include "frame_bits.h"
+
+// WHERE EACH BONE'S FLESH IS, IN BIND SPACE: for every bone a fill store
+// names, the centre of the store's vertices that ride it. Read once per
+// store and kept: a store is loaded once and never changes. Under the
+// registry lock, because Voxelise runs on three threads; every eighth
+// vertex, because a centre does not need all million and a half of them.
+struct ShapeFrameRefBone { std::string bone; float c[3]; };
+static std::vector<ShapeFrameRefBone> g_shapeFrameRef[2];        // [0] the female store, [1] the male store
+static bool g_shapeFrameRefBuilt[2] = { false, false };
+static const std::vector<ShapeFrameRefBone>& ShapeFrameRefOf(int male)
+{
+    Guard lk(&g_csBodies);
+    const int w = male ? 1 : 0;
+    if (!g_shapeFrameRefBuilt[w]) {
+        g_shapeFrameRefBuilt[w] = true;
+        const FillStore& F = w ? g_fillM : g_fill;
+        if (F.loaded && !F.bones.empty()) {
+            std::vector<double> acc(F.bones.size() * 4, 0.0);
+            for (std::size_t si = 0; si < F.shapes.size() && si < F.vbone.size(); ++si) {
+                const flesh::ShapeData& S = F.shapes[si];
+                const std::vector<const char*>& vb = F.vbone[si];
+                if (!S.verts || !S.vsize) continue;
+                std::size_t last = 0;
+                for (u32 v = 0; v < S.nVerts && v < vb.size(); v += 8) {
+                    const char* bn = vb[v];
+                    if (!bn) continue;
+                    // A vertex's bone is the c_str() of one of the store's own
+                    // names, so the pointer finds it; the text is the fallback.
+                    if (F.bones[last].c_str() != bn) {
+                        std::size_t k = 0;
+                        while (k < F.bones.size() && F.bones[k].c_str() != bn) ++k;
+                        if (k >= F.bones.size()) {
+                            k = 0;
+                            while (k < F.bones.size() && F.bones[k] != bn) ++k;
+                        }
+                        if (k >= F.bones.size()) continue;
+                        last = k;
+                    }
+                    float q[3];
+                    flesh::PosOf(S.verts + std::size_t(v) * S.vsize, S.desc, q);
+                    acc[last * 4] += q[0]; acc[last * 4 + 1] += q[1]; acc[last * 4 + 2] += q[2];
+                    acc[last * 4 + 3] += 1.0;
+                }
+            }
+            for (std::size_t b = 0; b < F.bones.size(); ++b) {
+                const double n = acc[b * 4 + 3];
+                if (!(n > 0.0)) continue;
+                ShapeFrameRefBone R;
+                R.bone = F.bones[b];
+                R.c[0] = float(acc[b * 4] / n); R.c[1] = float(acc[b * 4 + 1] / n); R.c[2] = float(acc[b * 4 + 2] / n);
+                g_shapeFrameRef[w].push_back(R);
+            }
+            Log("  [XFORM] reference: %u bone(s) placed from the %s fill store",
+                unsigned(g_shapeFrameRef[w].size()), w ? "male" : "female");
+        }
+    }
+    return g_shapeFrameRef[w];
+}
+
+// One NiTransform out of engine memory, behind the page test.
+static bool ShapeFrameRead(const void* base, std::uintptr_t off, frame::Xf& out)
+{
+    if (!base) return false;
+    const std::uint8_t* p = static_cast<const std::uint8_t*>(base) + off;
+    if (!Readable(p, fact::kSizeof_NiTransform)) return false;
+    frame::FromBytes(p, out);
+    return true;
+}
+// What a read came to, as the log spells it. `invalid` carries its reason.
+static void ShapeFrameClassText(int c, const char* why, char* out, std::size_t n)
+{
+    const char* s = c == 0 ? "unreadable" : c == 2 ? "identity" : c == 3 ? "rigid"
+                  : c == 4 ? "none" : c == 5 ? "not-skindata" : "invalid";
+    if (c == 1) std::snprintf(out, n, "invalid:%s", (why && *why) ? why : "?");
+    else        std::snprintf(out, n, "%s", s);
+}
+
+// HOW MUCH IT SAYS. One line a shape and one summary a voxelise. A shape
+// with a frame of its own, or out of place as read, is the reason the line
+// exists and is always printed, up to a session budget of six thousand; an
+// ordinary shape is printed for the first forty-eight of a voxelise -- an
+// outfit of many parts fits -- until its own budget of fifteen hundred is
+// spent. The summary is never dropped, and counts what was not said.
+static volatile long g_shapeFrameSaid    = 0;     // ordinary lines this session
+static volatile long g_shapeFrameSaidOdd = 0;     // lines for a shape with a frame, or out of place
+static volatile long g_shapeFrameScans   = 0;     // skin-data scans this session
+static const u32  kShapeFrameLinesPerVox = 48;
+static const long kShapeFrameBudget      = 1500;
+static const long kShapeFrameOddBudget   = 6000;
+static const long kShapeFrameScanBudget  = 64;
+
+// Returns false only when a load began underneath it: the 3D it was reading is
+// being torn down, and the caller must stop reading it too.
+static bool ApplyShapeFrames(Body& B, std::vector<flesh::ShapeData>& sd, const void* root, long stopEpoch)
+{
+    const double t0 = NowMs();
+    const std::size_t nS = sd.size() < B.shapes.size() ? sd.size() : B.shapes.size();
+
+    // THE REFERENCE: the store of the body's own sex, or the other one when
+    // that is not loaded -- the two bodies differ by a few units and the
+    // check is asking about dozens.
+    int male = (B.sex == 0) ? 1 : 0;
+    const std::vector<ShapeFrameRefBone>* ref = &ShapeFrameRefOf(male);
+    if (ref->empty()) { male ^= 1; ref = &ShapeFrameRefOf(male); }
+    const char* refName = ref->empty() ? "none" : (male ? "male" : "female");
+    const float* headRef = (B.sex == 0) ? g_cfg.headOffsetM : g_cfg.headOffset;
+    // Each of their bones against the reference, by name, once a voxelise:
+    // an index into `ref`, -1 for the head-bind point, -2 for a bone nothing
+    // can place.
+    struct RefHit { const char* bone; int idx; };
+    std::vector<RefHit> memo;
+    auto refOf = [&](const char* bn) -> int {
+        for (const RefHit& h : memo) if (h.bone == bn) return h.idx;
+        int idx = -2;
+        for (std::size_t k = 0; k < ref->size(); ++k)
+            if ((*ref)[k].bone == bn) { idx = int(k); break; }
+        if (idx == -2 && flesh::PartOfBone(bn) == flesh::Part::Head) idx = -1;
+        memo.push_back(RefHit{ bn, idx });
+        return idx;
+    };
+
+    // Their root's world transform, for the line only: a shape's world
+    // translate brought back into the root's frame is what its local
+    // translate would be if nothing sat between the two.
+    frame::Xf rootW;
+    const bool haveRootW = ShapeFrameRead(root, fact::kAV_world, rootW) && frame::Valid(rootW, nullptr, 1e9f);
+
+    u32 nBody = 0, nInterior = 0, nInteriorOdd = 0, nFramed = 0, nApplied = 0, nKept = 0, nRefused = 0,
+        nOff = 0, nFar = 0, nUnsaid = 0, saidHere = 0;
+    struct BoneAcc { const char* bone; double s[3]; double n; };
+    std::vector<BoneAcc> acc;
+    std::vector<frame::BonePlace> votes;
+    for (std::size_t i = 0; i < nS; ++i) {
+        ShapeSrc& S = B.shapes[i];
+        if (!S.geom || S.face || B.IsPriv(i)) continue;
+        if (Stale(stopEpoch)) {
+            Log("  [XFORM] 0x%08X stopped at shape %u: a load began underneath it", B.formID, unsigned(i));
+            return false;
+        }
+        const bool interior = S.solid || (S.layer != 0 && S.layer != flesh::kLayerArmour) || B.IsCanvas(int(i));
+        if (interior) ++nInterior; else ++nBody;
+
+        // ---- THE TWO READS. 0 unreadable, 1 invalid, 2 identity, 3 rigid;
+        // for the skin data also 4 no pointer and 5 not an NiSkinData.
+        frame::Xf L, K;
+        const char* lWhy = ""; const char* kWhy = "";
+        int lc = 0, kc = 0;
+        if (ShapeFrameRead(S.geom, fact::kAV_local, L))
+            lc = !frame::Valid(L, &lWhy) ? 1 : (frame::IsIdentity(L) ? 2 : 3);
+        const void* skd = nullptr;
+        if (!Peek(S.skinInst, fact::kSkinI_skinData, &skd) || !skd) kc = 4;
+        else if (!IsA(skd, "NiSkinData")) kc = 5;
+        else if (ShapeFrameRead(skd, fact::kSkinD_rootParentToSkin, K))
+            kc = !frame::Valid(K, &kWhy) ? 1 : (frame::IsIdentity(K) ? 2 : 3);
+        // The recalled offset did not hold a transform: say where one does.
+        // -2 not looked for, -1 looked for and not found, else the offset.
+        int scanAt = -2;
+        if (kc == 1 && InterlockedIncrement(&g_shapeFrameScans) <= kShapeFrameScanBudget) {
+            scanAt = -1;
+            for (std::uintptr_t o = fact::kSkinD_scanFirst; o <= fact::kSkinD_scanLast; o += 4) {
+                frame::Xf T;
+                if (o != fact::kSkinD_rootParentToSkin && ShapeFrameRead(skd, o, T) && frame::Valid(T)) {
+                    scanAt = int(o);
+                    break;
+                }
+            }
+        }
+
+        // ---- THE CANDIDATE FRAME
+        frame::Xf F;
+        bool haveF = false;
+        const char* src = "none";
+        if (lc == 3) { F = L; haveF = true; src = "local"; }
+        else if (kc == 3) {
+            F = frame::Inverse(K);
+            haveF = frame::Valid(F) && !frame::IsIdentity(F);
+            if (haveF) src = "skindata";
+        }
+        const char* comp = "na";
+        bool agreed = false;        // both reads rigid, each undoing the other, and the frame moves the shape
+        if ((lc == 2 || lc == 3) && (kc == 2 || kc == 3)) {
+            const bool undone = frame::IsIdentity(frame::Compose(L, K), 0.05f, 5e-3f, 5e-3f);
+            comp = undone ? "identity" : "differs";
+            agreed = undone && lc == 3 && kc == 3 && frame::Moves(L);
+        }
+
+        // ---- WHERE IT IS AGAINST ITS OWN BONES, as read and through the
+        // frame. One pass over its vertices (every one up to eight thousand,
+        // a stride above that): the centre of each bone's share. A centre
+        // goes through a transform as a point does, so the second answer
+        // needs no second pass.
+        frame::Placement P;
+        const std::size_t bytes = std::size_t(S.nVerts) * S.vsize;
+        const bool readable = !interior && S.raw && bytes && Readable(S.raw, bytes);
+        if (readable) {
+            acc.clear();
+            const std::vector<const char*>& vb = sd[i].vertBone;
+            const u32 step = 1u + S.nVerts / 8192u;
+            std::size_t last = 0;
+            double boned = 0.0;
+            for (u32 v = 0; v < S.nVerts && v < vb.size(); v += step) {
+                const char* bn = vb[v];
+                if (!bn) continue;
+                float q[3];
+                flesh::PosOf(S.raw + std::size_t(v) * S.vsize, S.desc, q);
+                if (!(std::fabs(q[0]) < 1e5f && std::fabs(q[1]) < 1e5f && std::fabs(q[2]) < 1e5f)) continue;
+                if (last >= acc.size() || acc[last].bone != bn) {
+                    last = 0;
+                    while (last < acc.size() && acc[last].bone != bn) ++last;
+                    if (last == acc.size()) acc.push_back(BoneAcc{ bn, { 0.0, 0.0, 0.0 }, 0.0 });
+                }
+                acc[last].s[0] += q[0]; acc[last].s[1] += q[1]; acc[last].s[2] += q[2];
+                acc[last].n += 1.0;
+                boned += 1.0;
+            }
+            votes.clear();
+            for (const BoneAcc& a : acc) {
+                const int r = refOf(a.bone);
+                if (r == -2) continue;
+                const float* rc = (r >= 0) ? (*ref)[std::size_t(r)].c : headRef;
+                frame::BonePlace bp;
+                for (int k = 0; k < 3; ++k) { bp.c[k] = a.s[k] / a.n; bp.ref[k] = rc[k]; }
+                bp.n = a.n;
+                votes.push_back(bp);
+            }
+            P = frame::Measure(votes, boned, haveF ? &F : nullptr);
+        }
+
+        // ---- THE VERDICT, AND THE COPY
+        const char* verdict = "as-read";
+        const char* why = "no-frame";
+        bool applied = false, kept = false;
+        if (haveF) {
+            const frame::Verdict vd = frame::Decide(true, P, agreed);
+            const char* lay = "";
+            if (interior)                         { verdict = "refused"; why = "interior"; }
+            else if (!readable)                   { verdict = "refused"; why = "unreadable"; }
+            else if (vd == frame::kKeptInPlace)   { verdict = "kept";    why = (agreed && P.xf > frame::kNear) ? "in-place-lands-off" : "in-place"; kept = true; }
+            else if (vd == frame::kRefusedNoRef)  { verdict = "refused"; why = "no-reference"; }
+            else if (vd != frame::kApply)         { verdict = "refused"; why = "not-on-its-bones"; }
+            else if (!frame::CanTransform(S.desc, S.vsize, F, &lay)) { verdict = "refused"; why = lay; }
+            else {
+                // Out of the engine's buffer into one of this Body's own,
+                // and only the copy is rewritten.
+                std::vector<std::uint8_t> priv(S.raw, S.raw + bytes);
+                frame::TransformRecords(priv.data(), S.nVerts, S.vsize, S.desc, F);
+                B.privRecs.push_back(std::move(priv));
+                S.raw = B.privRecs.back().data();
+                sd[i].verts = S.raw;
+                applied = true;
+                verdict = "applied";
+                why = (P.raw > frame::kNear && P.raw - P.xf >= frame::kMargin) ? "on-its-bones" : "reads-agree";
+            }
+        }
+        if (interior) {
+            if (lc == 3 || kc == 3) ++nInteriorOdd;
+        } else {
+            if (haveF) ++nFramed;
+            if (applied) ++nApplied;
+            else if (kept) ++nKept;
+            else if (haveF) ++nRefused;
+            // Left as read and not on its bones: `far` is a shape in another
+            // frame altogether; `off` is nearer, and is also what a small
+            // plate at one end of a long bone reads.
+            if (!applied && P.have && P.raw > frame::kReach) ++nFar;
+            else if (!applied && P.have && P.raw > frame::kNear) ++nOff;
+        }
+
+        // ---- THE LINE
+        const bool odd = lc == 3 || kc == 3 || (P.have && P.raw > frame::kNear);
+        bool say = false;
+        if (odd) say = InterlockedIncrement(&g_shapeFrameSaidOdd) <= kShapeFrameOddBudget;
+        else if (!interior && saidHere < kShapeFrameLinesPerVox) {
+            say = InterlockedIncrement(&g_shapeFrameSaid) <= kShapeFrameBudget;
+            if (say) ++saidHere;
+        }
+        if (!say) {
+            if (odd || !interior) ++nUnsaid;
+            continue;
+        }
+        float wT[3] = { 0.0f, 0.0f, 0.0f }, rel[3] = { 0.0f, 0.0f, 0.0f };
+        const std::uint8_t* gp = static_cast<const std::uint8_t*>(S.geom);
+        const bool haveW = Readable(gp + fact::kAV_worldTranslate, 12);
+        if (haveW) std::memcpy(wT, gp + fact::kAV_worldTranslate, 12);
+        if (haveW && haveRootW) {
+            const double d[3] = { double(wT[0]) - rootW.t[0], double(wT[1]) - rootW.t[1], double(wT[2]) - rootW.t[2] };
+            for (int k = 0; k < 3; ++k)     // transpose(rotate) * d / scale
+                rel[k] = float((double(rootW.r[k]) * d[0] + double(rootW.r[3 + k]) * d[1]
+                              + double(rootW.r[6 + k]) * d[2]) / double(rootW.s));
+        }
+        char lcs[48], kcs[48], scan[16];
+        ShapeFrameClassText(lc, lWhy, lcs, sizeof(lcs));
+        ShapeFrameClassText(kc, kWhy, kcs, sizeof(kcs));
+        if (scanAt == -2)      std::snprintf(scan, sizeof(scan), "-");
+        else if (scanAt == -1) std::snprintf(scan, sizeof(scan), "none");
+        else                   std::snprintf(scan, sizeof(scan), "+0x%X", unsigned(scanAt));
+        float lAx[3] = { 0.0f, 0.0f, 0.0f }, kAx[3] = { 0.0f, 0.0f, 0.0f };
+        double lDeg = 0.0, kDeg = 0.0;
+        if (lc == 2 || lc == 3) { lDeg = frame::AngleDeg(L); frame::Axis(L, lAx); }
+        if (kc == 2 || kc == 3) { kDeg = frame::AngleDeg(K); frame::Axis(K, kAx); }
+        const char* place = !P.have ? "noref"
+                          : (P.raw <= frame::kNear ? "near" : (P.raw <= frame::kReach ? "off" : "far"));
+        Log("  [XFORM] 0x%08X #%u layer=%d skin=%d verts=%u vsize=%u desc=%016llX"
+            " local=%s lt=(%.6g %.6g %.6g) ls=%.6g lrot=%.3f laxis=(%.3f %.3f %.3f)"
+            " skindata=%s st=(%.6g %.6g %.6g) ss=%.6g srot=%.3f saxis=(%.3f %.3f %.3f) sdscan=%s"
+            " compose=%s world=(%.6g %.6g %.6g) root=(%.6g %.6g %.6g) rel=(%.6g %.6g %.6g)"
+            " place=%s raw=%.2f xf=%.2f lift=(%.2f %.2f %.2f) bones=%u cover=%u"
+            " frame=%s verdict=%s why=%s name=%s",
+            B.formID, unsigned(i), S.layer, S.isSkin ? 1 : 0, unsigned(S.nVerts), unsigned(S.vsize),
+            (unsigned long long)S.desc,
+            lcs, L.t[0], L.t[1], L.t[2], L.s, lDeg, lAx[0], lAx[1], lAx[2],
+            kcs, K.t[0], K.t[1], K.t[2], K.s, kDeg, kAx[0], kAx[1], kAx[2], scan,
+            comp, wT[0], wT[1], wT[2], rootW.t[0], rootW.t[1], rootW.t[2], rel[0], rel[1], rel[2],
+            place, P.raw, P.xf, P.lift[0], P.lift[1], P.lift[2], P.bones, unsigned(P.cover * 100.0 + 0.5),
+            src, verdict, why, sd[i].name.c_str());
+    }
+    Log("  [XFORM] 0x%08X summary shapes=%u interior=%u interior-framed=%u framed=%u applied=%u kept=%u"
+        " refused=%u off=%u far=%u unsaid=%u ref=%s refbones=%u ms=%.2f",
+        B.formID, unsigned(nBody), unsigned(nInterior), unsigned(nInteriorOdd), unsigned(nFramed),
+        unsigned(nApplied), unsigned(nKept), unsigned(nRefused), unsigned(nOff), unsigned(nFar),
+        unsigned(nUnsaid), refName, unsigned(ref->size()), NowMs() - t0);
+    return true;
 }
 
 // `notEligible`, when given, is set true for the ONE failure that is not
@@ -9163,7 +10160,7 @@ static bool Voxelise(Body& B, const void* root, bool* notEligible = nullptr,
         // not in the buffer everything here reads, so they are not voxelised
         // from it: their face, and with FA on their accessories, go through
         // ReadTargetFace below (HF 1 and up) instead.
-        // ---- THEIR COLOUR COMES OFF THEIR HEAD, AND ONLY ONCE ---------------
+        // ---- THEIR COLOUR: A SKIN-TINT HEAD SHAPE OR THEIR BODY, ONLY ONCE ---
         //
         // FIELD REPORT: a purple target's first pieces came off purple, and
         // after a large part of them was gone the later ones came off beige.
@@ -9176,12 +10173,12 @@ static bool Voxelise(Body& B, const void* root, bool* notEligible = nullptr,
         // them is missing and they are wearing the mod's own anatomy shells; the order
         // is simply not the same list any more.
         //
-        // The fix is to take it from
-        // their HEAD. The head is a BSDynamicTriShape, read apart from the
-        // body path and never cut below HF 3 -- it is
-        // always present, it is unambiguously their own skin,
-        // and it is the one shape on them that cannot be shot off. It is
-        // therefore the only stable answer to "what colour is this target".
+        // A head shape's answer outranks their body's: head shapes are
+        // BSDynamicTriShapes, read apart from the body path. One answers only
+        // where its material is skin-tint (feature 5), as a scar's is: their
+        // FaceGen face (feature 4) carries no colour at all -- see ReadSkinTint
+        // -- so for most targets the colour is their body's. What keeps
+        // one target one colour across re-voxelises is the memo after this loop.
         //
         // Read here, BEFORE the shape is skipped, because this loop is the
         // one place their live head is already in hand.
@@ -9201,8 +10198,8 @@ static bool Voxelise(Body& B, const void* root, bool* notEligible = nullptr,
                 if (!htex.empty() && !htex[0].empty()) {
                     std::string d = htex[0];
                     for (char& ch : d) ch = char(std::tolower(ch));
-                    // Their face. Not hair, not brows, not eyes -- those are
-                    // BSDynamicTriShape too and none of them is skin.
+                    // Their face or a face scar. Not hair, not brows, not eyes --
+                    // those are BSDynamicTriShape too and none of them is skin.
                     headish = (d.find("head") != std::string::npos ||
                                d.find("face") != std::string::npos) &&
                               d.find("hair") == std::string::npos;
@@ -9210,21 +10207,15 @@ static bool Voxelise(Body& B, const void* root, bool* notEligible = nullptr,
                 // ---- ...OFF A MATERIAL THAT ACTUALLY HAS A COLOUR IN IT ----
                 //
                 // facts.h's 0xA0 was measured on FEATURE-5 (FaceGenRGBTint)
-                // materials, which is what a body's skin shader is. The head
-                // NIF on disk declares FEATURE 4 (FaceGen), and on that class
-                // those twelve bytes are tintTexture's two dwords and
-                // detailTexture's low dword -- a heap pointer, whose dwords
-                // read as small positive floats and pass the [0,2] gate some
-                // of the time, giving them a near-black "colour off their head"
-                // that is then memoised for the rest of the session.
-                //
-                // WHETHER THE LIVE MATERIAL IS FEATURE 4 IS UNVERIFIED, and probe
-                // #4 above is what reads it -- so the gate is OFF by default
-                // and this line behaves exactly as it did before. `HD 1 0 0 1`
-                // turns it on once the log has been read.
-                const int wantFeat = g_cfg.headSkinGate
-                                   ? int(fact::kMatFeature_FaceGenTint) : -1;
-                if (headish && ReadSkinTint(geom, rgb, wantFeat)) {
+                // materials, which is what a body's skin shader is. Their live
+                // face is FEATURE 4 (FaceGen) -- the [FACE] line logs it -- and
+                // on that class those twelve bytes are tintTexture's two dwords
+                // and detailTexture's low dword: two heap pointers, which pass
+                // the [0,2] check whenever the low half of each happens to read
+                // as a float in that range, and then usually read as black.
+                // ReadSkinTint refuses all but feature 5, so their face never
+                // answers; a skin-tint head shape such as a scar does.
+                if (headish && ReadSkinTint(geom, rgb)) {
                     B.tint[0] = rgb[0]; B.tint[1] = rgb[1]; B.tint[2] = rgb[2];
                     B.hasTint = true;
                     tintHead = true; tintMain = true;   // nothing outranks the head
@@ -9668,8 +10659,8 @@ static bool Voxelise(Body& B, const void* root, bool* notEligible = nullptr,
     // refusing a clothed target for being clothed.
     // ---- ONE TARGET, ONE COLOUR, FOR THE WHOLE FIGHT --------------------
     //
-    // The head read above is the right answer, and this is a second
-    // safeguard for it. They can be re-voxelised between wounds, and the fault seen in play was
+    // The head read above answers only on a skin-tint head shape, so this is
+    // what holds their colour steady. They can be re-voxelised between wounds, and the fault seen in play was
     // that a later read disagreed with an earlier one -- so the
     // remedy is not only a better source but a source that is consulted ONCE.
     //
@@ -9741,6 +10732,15 @@ static bool Voxelise(Body& B, const void* root, bool* notEligible = nullptr,
         sd[i].tex = B.texStore[i];
         sd[i].vertBone = B.vertBone[i];
     }
+    // ---- THE FRAME EACH WORN SHAPE IS STORED IN ---------------------------
+    //
+    // Here, and not in the shape loop: every shape is in and carries its
+    // bones, the body's sex is settled (it picks the reference), and nothing
+    // has yet read a position of a shape this can move -- their face's
+    // neck-ring anchor just below and the lattice after it both read the
+    // records this may replace. See ApplyShapeFrames. It stops when a load
+    // begins underneath it, and so does this build, as the shape loop does.
+    if (!ApplyShapeFrames(B, sd, root, stopEpoch)) return false;
     // AFTER their own shapes are complete and BEFORE the lattice is built, so
     // the lent lumps are ordinary geometry to everything downstream.
     //
@@ -9864,6 +10864,11 @@ static bool Voxelise(Body& B, const void* root, bool* notEligible = nullptr,
             float(ax), float(ay), float(az), unsigned(an), dRaw, dXf,
             anchored ? "" : " -- NO ANCHOR");
         if (withdraw) {
+            // The reader has already said which textures their face would
+            // wear in a piece; withdrawn, it goes into none.
+            if (!B.shapes[fs].partTris.empty())
+                Log("  [FACE] '%s': withdrawn, so it goes into NO piece -- the 'in a piece' line"
+                    " above does not hold for this voxelise", sd[fs].name.c_str());
             // No triangles, no vertices, not skin: nothing of it reaches the
             // lattice -- not a cell, and not a clearance point either (the
             // clearance rule indexes every vertex of every skin shape).
@@ -10246,11 +11251,11 @@ static bool Voxelise(Body& B, const void* root, bool* notEligible = nullptr,
                     // AND HERE IS WHAT THAT COSTS.
                     // A blanked strand is not simply cut and carried off
                     // with the piece.
-                    // Nothing of an accessory is ever copied into a
-                    // forged piece -- AssembleCells refuses `layer == 0 &&
-                    // !isSkin` -- so a strand does not travel on the chunk; it
-                    // is removed from the ACTOR by Redraw if the section that
-                    // claims it goes. And in the head-only section walk it is
+                    // An accessory's triangles are copied into a forged
+                    // piece cell by cell (AssembleCells), so a strand
+                    // travels on a chunk only where that chunk takes its
+                    // cells; it is removed from the ACTOR by Redraw if the
+                    // section that claims it goes. And in the head-only section walk it is
                     // not claimed at all, because that pass is parts-filtered
                     // and Unknown is filtered out of it: blanked hair over a
                     // piece of skull that comes loose stays skinned to them,
@@ -11889,8 +12894,8 @@ static void Redraw(Body& B, void* dev, bool force = false)
     // every rebuild, which is what makes it durable: the ledger re-cuts their head
     // cells on every voxelise, so the answer survives a reload without anything
     // having to be carried. B.headOff is only the MEMORY for the one case the
-    // lattice cannot answer -- they are not wearing the head fill at all (stripped
-    // for a scene), where there are no Head cells of theirs to count and the last
+    // lattice cannot answer -- they are not wearing the head fill at all (their
+    // outfit taken off by another mod), where there are no Head cells of theirs to count and the last
     // known answer must stand.
     OpenGrid openGrid;
     {
@@ -12498,6 +13503,7 @@ struct ForgeJob {
     int slot = 0;             // be gone by the time this is read
     std::size_t cells = 0;
     bool section = false;     // a severed part of the body, not a shard off their
+    bool rindWorn = false;    // every section a cut drops, its half above all: its worn shells are rinded beside their skin (chunknif::Chunk::rindWorn)
     // PROVENANCE: the piece's dominant part and the
     // layers the wound took, for the wound line's P block.
     int part = 0;
@@ -12513,6 +13519,9 @@ struct ForgeJob {
 // Body. `raw` is an address in their live 3D (or in the lent-fill store, which
 // outlives everything); it is read on the forge thread behind Readable(), a
 // few milliseconds after the game's thread read it behind the same test.
+// `ownedRaw` is the batch's own copy of the records, filled at the hand-off
+// for a shape whose `raw` lies in one of the Body's private buffers; where it
+// is filled the forge reads it and never `raw`.
 struct GeomRef {
     const std::uint8_t* raw = nullptr;
     std::vector<std::uint8_t> ownedRaw;
@@ -12521,9 +13530,15 @@ struct GeomRef {
     std::uint64_t desc = 0;
     u32 nVerts = 0;
     bool isSkin = false;
+    bool face = false;                 // their face (ShapeSrc::face): skin to the forge, and see chunknif::Shape::face
     bool solid = false;
     int  layer = 0;
     std::vector<std::string> tex;
+    bool accessory = false;            // ShapeSrc::accessory .. liveTex, by value (cfg FT)
+    int  feature = -2;
+    bool hasMatTint = false;
+    float matTint[3] = { 1.0f, 1.0f, 1.0f };
+    std::vector<std::string> liveTex;
 };
 struct ForgeBatch {
     std::vector<ForgeJob> jobs;
@@ -12576,14 +13591,16 @@ static std::vector<ForgeBatch> g_forgeQ;
 static HANDLE g_forgeSem = nullptr;
 static volatile long g_forgeDepth = 0;
 //
-// AND FOR THEIR FACE AND THEIR ACCESSORIES IT IS NEITHER.
-// Those shapes' `raw` points into Body::privRecs, which the NEXT voxelise
-// frees while a forge batch may still be in flight. Nothing dereferences them
-// today because AssembleCells refuses both classes before a recipe can name
-// one -- `if (S.layer == 0 && !S.isSkin) continue;` takes every accessory and
-// `if (S.face) continue;` takes their face -- and ForgeStillTheirs cannot see the
-// difference. Relax either of those two lines and this becomes a use-after-free
-// on a worker thread. With the accessory reader (FA) on, that is a dozen shapes, not one.
+// AND FOR A SHAPE READ INTO A PRIVATE BUFFER IT IS NEITHER.
+// Their face and their accessories have a `raw` that points into
+// Body::privRecs, and so does any other shape whose records the plugin built
+// for itself. The NEXT voxelise frees those buffers while a forge batch may
+// still be in flight, and ForgeStillTheirs cannot see it: the skin instance is
+// still on them, and a freed heap block still reads. So the forge never reads
+// one. At the hand-off, every shape a recipe names whose `raw` lies inside a
+// privRecs buffer is copied whole into GeomRef::ownedRaw, and AssembleChunk
+// reads the copy. The test is the address range, not a list of which shapes
+// are private, so a buffer is covered by being in privRecs.
 
 // ONE FILE PER WOUND, WRITTEN ONCE, READ ONCE.
 //
@@ -12661,6 +13678,9 @@ struct AssembleScratch {
 // (the game's thread took them when it decided the piece), which is the one
 // difference from the old order and the price of the frame.
 // Returns false when the piece cannot be built.
+// Solidify (chunknif.cpp) reads a worn shell as layer 4 by number, and the
+// layer reaches it from here unchanged: the two must not drift apart.
+static_assert(flesh::kLayerArmour == 4, "chunknif.cpp Solidify reads worn shells as layer 4");
 static bool AssembleChunk(const std::vector<GeomRef>& geom, const ForgeJob& J,
                           AssembleScratch& X, chunknif::Chunk& C, const char** why)
 {
@@ -12695,6 +13715,10 @@ static bool AssembleChunk(const std::vector<GeomRef>& geom, const ForgeJob& J,
             chunknif::Shape sh;
             sh.name = nm; sh.desc = S.desc; sh.vsize = S.vsize;
             sh.skin = S.isSkin; sh.tex = S.tex; sh.layer = S.layer; sh.solid = S.solid;
+            sh.face = S.face;
+            sh.accessory = S.accessory; sh.feature = S.feature; sh.hasMatTint = S.hasMatTint;
+            sh.matTint[0] = S.matTint[0]; sh.matTint[1] = S.matTint[1]; sh.matTint[2] = S.matTint[2];
+            sh.liveTex = S.liveTex;
             run.push_back(C.shapes.size());
             C.shapes.push_back(std::move(sh));
             activeSerial = ++X.serial;
@@ -12767,6 +13791,50 @@ static bool ForgeStillTheirs(const ForgeBatch& B, const char** why)
     return true;
 }
 
+// A TEXTURE PATH AS THE COLOUR PASS COMPARES IT: lower case, '/' as '\', and a
+// leading "data\" and then "textures\" taken off. Whether the engine keeps the
+// path a forged piece's NIF names in the form the forge copied it (from their
+// live texture set) is UNREAD, so both sides are put in this one form. Pure.
+static std::string TintTexKey(const std::string& s)
+{
+    std::string k;
+    k.reserve(s.size());
+    for (char ch : s) k += (ch == '/') ? '\\' : char(std::tolower(static_cast<unsigned char>(ch)));
+    std::size_t p = 0;
+    while (p < k.size() && k[p] == '\\') ++p;
+    if (k.compare(p, 5, "data\\") == 0) p += 5;
+    if (k.compare(p, 9, "textures\\") == 0) p += 9;
+    return k.substr(p);
+}
+// WHAT THE COLOUR PASS NEEDS TO TELL A PIECE'S FEATURE-5 ACCESSORIES FROM ITS
+// SKIN. FT col 2 = 2 puts a feature-5 accessory with a colour read off its live
+// material on the same type-5 skin-tint block as their skin (chunknif
+// useAccSkin), so the engine makes a feature-5 FacegenTint material for both.
+// acc: the slot-0 texture of every shape that can be such an accessory (a
+// superset of useAccSkin: hasMatTint for feature 5 is read only at FT col 2 = 2);
+// skin: the slot-0 texture of every skin shape, kept only beside a non-empty
+// acc. Each once, in TintTexKey form. Pure: the forge's own by-value chunk.
+// An accessory whose slot-0 texture was not read still gets a type-5 block
+// (useAccSkin asks for no texture), so it puts kTintNoSlot0 in acc: the piece
+// still counts as one with accessories, and every feature-5 material on it
+// that is not one of its skin textures is set aside (merged verify R2).
+static const char* const kTintNoSlot0 = "|slot 0 not read|";   // '|' is in no texture path
+static void PieceTexKeys(const chunknif::Chunk& C, std::vector<std::string>& acc, std::vector<std::string>& skin)
+{
+    acc.clear(); skin.clear();
+    auto put = [](std::vector<std::string>& v, std::string k) {
+        if (!k.empty() && std::find(v.begin(), v.end(), k) == v.end()) v.push_back(std::move(k));
+    };
+    for (const chunknif::Shape& sh : C.shapes) {
+        const std::string k = sh.tex.empty() ? std::string() : TintTexKey(sh.tex[0]);
+        if (sh.accessory && !sh.skin && sh.feature == int(fact::kMatFeature_FaceGenTint) && sh.hasMatTint)
+            put(acc, k.empty() ? std::string(kTintNoSlot0) : k);
+        else if (sh.skin)
+            put(skin, k);
+    }
+    if (acc.empty()) skin.clear();
+}
+
 static DWORD WINAPI ForgeThreadBody(LPVOID);
 static DWORD WINAPI ForgeThread(LPVOID p) { return GuardedThread("ForgeThread", ForgeThreadBody, p); }
 static DWORD WINAPI ForgeThreadBody(LPVOID)
@@ -12787,14 +13855,17 @@ static DWORD WINAPI ForgeThreadBody(LPVOID)
         std::string line; std::string prov;
         std::vector<PlacePiece> written;    // what the engine may place
         int made = 0, nSection = 0;
-        // WHY A PIECE CAME OUT THE WRONG COLOUR, summed over the wound.
+        // WHY A PIECE CAME OUT THE WRONG COLOUR, summed over the wound's pieces.
         //
         // From the outside an untinted shard and a shard with no skin in it
-        // are the same beige. These three numbers separate them: a piece that
-        // failed to go rigid cannot be tinted at all (the colour lives where
-        // the skin block used to be), and a skin shape that was not tinted
-        // when the file DID go rigid is a different fault entirely.
-        int nRigid = 0, nSkinShapes = 0, nTinted = 0;
+        // are the same beige. These numbers separate them: how many pieces
+        // went rigid (a vertex colour needs a rigid file), how many skin
+        // shapes there were and how many carry their colour, how many of those
+        // are on the skin shader, and how many are cut off at white -- their
+        // skin is lighter than a vertex colour can make the texture, so the
+        // piece is darker than they are.
+        int nRigid = 0, nSkinShapes = 0, nTinted = 0, nSkinBlock = 0, nClipped = 0;
+        int nFaceGen = 0, nHairTint = 0, nAccSkin = 0, nCutout = 0, nNormals = 0, nDedup = 0;   // cfg FT
         AssembleScratch scratch(B.geom.size());
         // Once per batch, before the first copy -- see ForgeStillTheirs. A batch
         // with no jobs copies nothing and is not tested.
@@ -12824,13 +13895,11 @@ static DWORD WINAPI ForgeThreadBody(LPVOID)
             }
             // A shard is debris and a severed limb is not -- see SetDebris.
             chunknif::SetDebris(!J.section);
+            C.rindWorn = J.rindWorn;
             std::vector<std::uint8_t> nif = chunknif::Build(C, &mass);
-            {
-                const chunknif::BuildStat bs = chunknif::LastBuild();
-                if (bs.rigid) ++nRigid;
-                nSkinShapes += bs.skinShapes;
-                nTinted     += bs.tinted;
-            }
+            // Read now, summed only once the piece is written: a piece that
+            // was refused, or whose file could not be written, is in no count.
+            const chunknif::BuildStat bs = chunknif::LastBuild();
             if (nif.empty()) {
                 // NOT SILENT. Build refuses a piece that is degenerate,
                 // implausibly large, or past sixty-five thousand vertices in
@@ -12898,6 +13967,18 @@ static DWORD WINAPI ForgeThreadBody(LPVOID)
                 made, unsigned(J.cells), unsigned(C.shapes.size()), nv, nt, mass,
                 unsigned(nif.size() / 1024), J.slot,
                 J.anchor.empty() ? "<none>" : J.anchor.c_str(), J.rel.c_str());
+            // The shape count, V and T above are what was handed to Build. With
+            // the FT row on, this piece's own face-look counts follow ON A LINE
+            // OF THEIR OWN, named by the piece's file, so a reader can take a
+            // dropped duplicate off that count (and tell a face on the FaceGen
+            // shader). The chunk line itself is never lengthened: log readers
+            // take its file name as everything after "-> ", or up to the next
+            // space. With every count zero -- always, without an FT row -- no
+            // line is written.
+            if (bs.faceGen || bs.hairTint || bs.accSkin || bs.cutout || bs.normals || bs.dedup)
+                Log("      face look of %s: %d FaceGen face(s), %d hair tinted, %d feature-5 on the skin shader,"
+                    " %d cut out, %d given normals, %d duplicate(s) dropped",
+                    J.rel.c_str(), bs.faceGen, bs.hairTint, bs.accSkin, bs.cutout, bs.normals, bs.dedup);
             // "slot|anchor" per chunk. The slot is carried EXPLICITLY now
             // rather than being derived as start+k on the script side: a piece
             // the forge refuses no longer shifts every piece after it onto the
@@ -12917,9 +13998,18 @@ static DWORD WINAPI ForgeThreadBody(LPVOID)
                 PlacePiece P;
                 P.slot = J.slot; P.rel = J.rel; P.anchor = J.anchor; P.section = J.section;
                 P.part = J.part; P.layers = J.layers; P.cells = J.cells;
+                P.skinBlocks = bs.skinBlock;
+                PieceTexKeys(C, P.accTex0, P.skinTex0);   // the colour pass's accessory test
                 written.push_back(std::move(P));
             }
             ++made;
+            if (bs.rigid) ++nRigid;
+            nSkinShapes += bs.skinShapes;
+            nTinted     += bs.tinted;
+            nSkinBlock  += bs.skinBlock;
+            nClipped    += bs.clipped;
+            nFaceGen += bs.faceGen; nHairTint += bs.hairTint; nAccSkin += bs.accSkin;
+            nCutout  += bs.cutout;  nNormals  += bs.normals;  nDedup   += bs.dedup;
             if (J.section) ++nSection;
         }
         char head[80];
@@ -12935,7 +14025,7 @@ static DWORD WINAPI ForgeThreadBody(LPVOID)
         // is left of the body. flags bits 2-7: the wound's kick -- the script multiplies
         // its launch force by it, 0 meaning "as you were". Bits 8-9: the mark
         // the pieces should wear regardless of what they wore (0 theirs, 1
-        // blood, 2 alt). Both ride here rather than in a new field, for the
+        // blood, 2-3 a registered DecalCore kind). Both ride here rather than in a new field, for the
         // reason below. A BIT rather than a new field on
         // purpose -- FL_Watch splits this line on '|' and indexes the
         // slot/anchor pairs by position, so a field inserted between the head
@@ -12967,6 +14057,8 @@ static DWORD WINAPI ForgeThreadBody(LPVOID)
             PJ.dismembered = B.dismembered; PJ.trunk = B.trunk; PJ.t0 = B.t0;
             PJ.nolethal = B.nolethal;
             PJ.blast = B.blast;
+            PJ.tint[0] = B.tint[0]; PJ.tint[1] = B.tint[1]; PJ.tint[2] = B.tint[2];
+            PJ.hasTint = B.hasTint;
             // THE BATCH'S epoch, not the current one: a wound decided before a
             // load must be refused by PlaceRun's own test, and stamping it with
             // the new epoch here laundered it past that test.
@@ -12985,12 +14077,16 @@ static DWORD WINAPI ForgeThreadBody(LPVOID)
             PlaceEnqueue(std::move(PJ));
             InterlockedDecrement(&g_forgeDepth);
             if (made > 0) {
-                const bool allWell = (nRigid == made) && (nTinted == nSkinShapes)
+                const bool allWell = (nTinted == nSkinShapes)
                                      && (B.hasTint ? nSkinShapes > 0 : true);
-                Log("    colour: %d/%d piece(s) rigid, %d skin shape(s), %d tinted%s%s",
-                    nRigid, made, nSkinShapes, nTinted,
+                Log("    colour: %d/%d piece(s) rigid, %d skin shape(s), %d tinted, %d on the skin shader, %d clipped at white%s%s",
+                    nRigid, made, nSkinShapes, nTinted, nSkinBlock, nClipped,
                     B.hasTint ? "" : " -- NO TINT was read from them, so none could be",
                     allWell ? "" : "  <-- SOME PIECES WILL BE UNTINTED BEIGE");
+                if (nFaceGen || nHairTint || nAccSkin || nCutout || nNormals || nDedup)
+                    Log("    face look: %d face(s) on the FaceGen shader, %d hair shape(s) tinted, %d feature-5"
+                        " accessory shape(s) on the skin shader, %d cut out, %d given normals, %d duplicate(s) dropped",
+                        nFaceGen, nHairTint, nAccSkin, nCutout, nNormals, nDedup);
             }
             continue;
         }
@@ -13011,12 +14107,16 @@ static DWORD WINAPI ForgeThreadBody(LPVOID)
                           : "",
             NowMs() - f0, NowMs() - B.t0);
         if (made > 0) {
-            const bool allWell = (nRigid == made) && (nTinted == nSkinShapes)
+            const bool allWell = (nTinted == nSkinShapes)
                                  && (B.hasTint ? nSkinShapes > 0 : true);
-            Log("    colour: %d/%d piece(s) rigid, %d skin shape(s), %d tinted%s%s",
-                nRigid, made, nSkinShapes, nTinted,
+            Log("    colour: %d/%d piece(s) rigid, %d skin shape(s), %d tinted, %d on the skin shader, %d clipped at white%s%s",
+                nRigid, made, nSkinShapes, nTinted, nSkinBlock, nClipped,
                 B.hasTint ? "" : " -- NO TINT was read from them, so none could be",
                 allWell ? "" : "  <-- SOME PIECES WILL BE UNTINTED BEIGE");
+            if (nFaceGen || nHairTint || nAccSkin || nCutout || nNormals || nDedup)
+                Log("    face look: %d face(s) on the FaceGen shader, %d hair shape(s) tinted, %d feature-5"
+                    " accessory shape(s) on the skin shader, %d cut out, %d given normals, %d duplicate(s) dropped",
+                    nFaceGen, nHairTint, nAccSkin, nCutout, nNormals, nDedup);
         }
     }
     return 0;
@@ -13220,6 +14320,27 @@ static void AssembleCells(Body& B, const std::vector<flesh::Key>& cells,
                 }
             }
         }
+        // A CUT THAT REMOVED NO CELL LEAVES NO EMPTIED NEIGHBOUR TO FIND. The
+        // loop above reads a cut face off what is missing beside a cell, and
+        // Form::CutX takes nothing: it parts the links across a plane, so the
+        // cells either side of it are whole and are not neighbours. Those
+        // links are kept in Lattice::severed, marked bare. A cell of this
+        // piece at one end of one, with the other end outside the piece, is
+        // on the cut face and keeps its meat -- without this the flat face of
+        // a half is a hollow shell. A body that carries no bare link skips
+        // the walk.
+        if (B.lat.bareLinks) {
+            for (const flesh::Lattice::SeveredLink& s : B.lat.severed) {
+                if (!s.bare) continue;
+                const std::uint64_t pa = PackCellKey(s.a);
+                if (!inSet.count(pa) || inSet.count(PackCellKey(s.b))) continue;
+                if (keepFill.count(pa)) continue;
+                auto ca = B.lat.cells.find(s.a);
+                if (ca == B.lat.cells.end() || ca->second.Empty()) continue;
+                keepFill.insert(pa);
+                frontier.push_back(s.a);
+            }
+        }
         std::vector<flesh::Key> nextFrontier;
         for (int r = 0; r < rings && !frontier.empty(); ++r) {
             nextFrontier.clear();
@@ -13271,7 +14392,18 @@ static void AssembleCells(Body& B, const std::vector<flesh::Key>& cells,
         const ShapeSrc& S = B.shapes[sh];
         if (!(mask & (1u << S.layer))) continue;
         if ((S.layer == flesh::kLayerArmour || (S.layer == 0 && !S.isSkin)) && !S.geom) continue;
-        if (S.face) continue;
+        // THEIR FACE GOES INTO A SEVERED SECTION, AND INTO NOTHING ELSE. A
+        // section is a part of them that came off whole, and without the skin
+        // of their head a severed head is hair round a few lumps of fill. A
+        // shard takes none of their face. Two things must hold for a section
+        // as well. Redraw is cutting their face -- HF 3, and partTris is
+        // filled only for a face that can be cut -- or what went into the
+        // piece would still be drawn on them. And a diffuse texture was read
+        // for it, or the piece would carry their face with no skin to wear.
+        // Its records are in a private buffer; the hand-off copies them for
+        // the forge (GeomRef::ownedRaw).
+        if (S.face && !(section && g_cfg.targetFace >= 3 && !S.partTris.empty()
+                        && !S.tex.empty() && !S.tex[0].empty())) continue;
         shapeBaseOk[sh] = 1;
     }
 
@@ -13703,7 +14835,7 @@ struct OutEvent { std::string name; int sender = 0; float num = 0.0f; std::strin
 // receives these from FlushOutbox, with no lock held, beside the Papyrus
 // events. Parts are lattice.h's enumeration (Head = 1 ... RFoot = 15; masks
 // are 1 << part); origins are (spell 0, hit 1, command 2, vortex
-// 3, drain 4, scene 5). The messages are built from the event lines so the
+// 3, drain 4). The messages are built from the event lines so the
 // two channels cannot disagree.
 static SKSEMessagingInterface* g_msg = nullptr;
 static u32 g_pluginHandle = 0;
@@ -13775,14 +14907,14 @@ static void FlushOutbox()
     }
 }
 // The origin numbering for consumers: spell 0, hit 1, command 2,
-// vortex 3, drain 4, scene 5. Internally the Wound carries 1 spell, 2 hit,
-// 3 command, 4 vortex, 5 drain, 6 scene (0 = unsaid, reported as spell).
+// vortex 3, drain 4. Internally the Wound carries 1 spell, 2 hit,
+// 3 command, 4 vortex, 5 drain (0 = unsaid, reported as spell).
 static int OriginOut(int internal) { return internal > 0 ? internal - 1 : 0; }
 static const char* OriginName(int internal)
 {
     switch (OriginOut(internal)) {
         case 0: return "spell"; case 1: return "hit"; case 2: return "command";
-        case 3: return "vortex"; case 4: return "drain"; case 5: return "scene";
+        case 3: return "vortex"; case 4: return "drain";
         default: return "spell";
     }
 }
@@ -13949,7 +15081,15 @@ static int Separate(Body& B, const float pIn[3], const Wound& W)
     // The piece loop needs no special case, because it already stops at
     // `made >= takeable` and takeable is zero. Only the SELECTION cap has to
     // be lifted, and the marking has to happen without a piece to hang it on.
-    const bool strip = (W.budget == 0);
+    //
+    // A CUT REMOVES NOTHING, SO IT IS NEVER A STRIP. Form::CutX selects no
+    // cell: it names a plane between two columns of cells and the sever pass
+    // below parts every link across it. There is no selection to cap, no
+    // island to forge and no cell to mark, whatever budget its row carries --
+    // and with nothing selected, a strip would report a wound that changed
+    // them when nothing had.
+    const bool cutOnly = (W.form == flesh::Lattice::Form::CutX);
+    const bool strip = (W.budget == 0) && !cutOnly;
     const bool isPlaneOrSeverForm = (W.form == flesh::Lattice::Form::Neck ||
                                      W.form == flesh::Lattice::Form::Halve ||
                                      W.form == flesh::Lattice::Form::Detonate ||
@@ -13967,8 +15107,9 @@ static int Separate(Body& B, const float pIn[3], const Wound& W)
                                      W.form == flesh::Lattice::Form::BoreX ||
                                      W.form == flesh::Lattice::Form::BoreY ||
                                      W.form == flesh::Lattice::Form::BoreZ ||
-                                     W.form == flesh::Lattice::Form::Grind);
-    const bool isDirectSpellOrCmd = (W.origin == 1 || (W.origin == 3 && W.caller != "Tester") || W.origin == 4 || W.origin == 6);
+                                     W.form == flesh::Lattice::Form::Grind ||
+                                     W.form == flesh::Lattice::Form::CutX);
+    const bool isDirectSpellOrCmd = (W.origin == 1 || (W.origin == 3 && W.caller != "Tester") || W.origin == 4);
     const int effPeel = (W.peelOverride > 0) ? W.peelOverride : g_hq.peelStages;
     const bool isFullSever = (W.peelOverride == 0) && (isPlaneOrSeverForm || isDirectSpellOrCmd);
     const int cap = (strip || blast || isPlaneOrSeverForm) ? int(B.lat.cells.size()) + 1 : takeable * W.maxCells;
@@ -13990,7 +15131,51 @@ static int Separate(Body& B, const float pIn[3], const Wound& W)
         return B.lat.Select(W.form, at, W.size, W.count, cap, mask, W.parts);
     };
     std::vector<flesh::Key> sel = selectAt(p);
-    if (sel.empty()) {
+    // ---- A CUT IS MADE WHOLE OR NOT AT ALL --------------------------------
+    //
+    // An empty selection is the form's design here, not a miss, so the
+    // re-seed below is not for it. What it has to have is a plane, and a way
+    // for one side of that plane to leave. Every other plane form shows what
+    // it did in the cells it removed; this one removes none, so a plane
+    // severed and then not swept is a body drawn whole that is two sections,
+    // and the next scratch would sweep half of them away. Each case in which
+    // the sweep cannot follow is therefore refused HERE, before a link is
+    // parted:
+    //   no plane       fewer than two columns of them are alive to part;
+    //   nosever        the wound may not let a whole part leave, and a half
+    //                  body is nothing but whole parts;
+    //   not one body   the sweep is off for a body that arrived in pieces;
+    //   named parts    a plane through some of their parts leaves the rest of
+    //                  them joining its two sides, so what it parts cannot all
+    //                  be swept off them.
+    // And a cut that parts links and still sets nothing loose is taken back:
+    // in the fold when other sections are loose beside it, after the section
+    // pass when it left one (see there).
+    std::int32_t cutColumn = 0;         // the column that begins the cut's +x side
+    if (cutOnly) {
+        sel.clear();
+        if (!B.lat.haveLastPlane || !B.lat.lastPlaneOnColumn) {
+            Log("  cut: fewer than two columns of their living cells -- no plane has"
+                " anything of theirs on both sides, so nothing is cut");
+            return 0;
+        }
+        cutColumn = B.lat.lastPlaneColumn;
+        if (W.noSever || B.baseSections != 1 || W.parts != 0) {
+            B.lat.haveLastPlane = false;
+            B.lat.lastPlaneOnColumn = false;
+            if (W.noSever)
+                Log("  cut: this wound may not sever, and a cut that removes nothing"
+                    " does nothing else -- nothing is cut");
+            else if (B.baseSections != 1)
+                Log("  cut: they arrived in %d section(s), so what a cut parts could not"
+                    " be swept off them -- nothing is cut", B.baseSections);
+            else
+                Log("  cut: this wound names parts, and a plane through some of their parts"
+                    " leaves the rest of them joining its two sides -- nothing is cut");
+            return 0;
+        }
+    }
+    if (sel.empty() && !cutOnly) {
         // A NECK WOUND THAT FOUND NO HEAD OF THEIRS SAYS SO, AND STOPS.
         // The re-seed below is for a form that reads the
         // seed; Form::Neck does not read `p` at all, so re-seeding it runs the
@@ -14028,7 +15213,7 @@ static int Separate(Body& B, const float pIn[3], const Wound& W)
         Log("  re-seeded onto the nearest living cell");
         p[0] = q[0]; p[1] = q[1]; p[2] = q[2];
     }
-    if (!isFullSever && effPeel < 4 && B.armourAny && (mask & flesh::kArmourBit)) {
+    if (!cutOnly && !isFullSever && effPeel < 4 && B.armourAny && (mask & flesh::kArmourBit)) {
         armour::Hit sepAh = armour::Probe(B.lat.cells, B.lat.cell, B.armourOf, p, g_hq.armour.reach);
         if (sepAh.cls != armour::kNone) {
             const float arReach = std::max(W.size, g_hq.armour.reach);
@@ -14056,9 +15241,10 @@ static int Separate(Body& B, const float pIn[3], const Wound& W)
     // their face into the lattice and into B.shapes, FA puts their eyes, brows and
     // mouth there, and the accessory ceiling decides whether their hair is read.
     //
-    // Accessories are swept like anything else: they forge nothing (clothing
-    // never rides a piece), so a hat cut free simply stops being drawn, which
-    // is what should happen to a hat that is no longer on anybody.
+    // Accessories are swept like anything else. Where a forged piece takes
+    // their cells they go into it as plain surfaces (AssembleCells); where
+    // none does, a hat cut free simply stops being drawn, which is what
+    // should happen to a hat that is no longer on anybody.
     //
     // ---- THE TEAR ------------------------------------------------
     //
@@ -14383,11 +15569,23 @@ static int Separate(Body& B, const float pIn[3], const Wound& W)
                 unsigned(peelRep.boneExposed));
         }
     }
+    // WHERE THIS WOUND'S OWN SEVERED LINKS BEGIN in the lattice's record of
+    // them, so that a cut which has to be taken back (see the section pass)
+    // takes back these and no earlier wound's.
+    const std::size_t severMark = B.lat.severed.size();
     if (isPlaneOrSeverForm && !W.noSever) {
         const std::size_t severedLinks = B.lat.SeverPlane();
         if (severedLinks)
             Log("  cut plane severed %u cross-plane link(s)", unsigned(severedLinks));
     }
+    // WHERE THE CUT WENT, in the two numbers that fix it: the plane's x and
+    // the column that begins its far side. No cell is named because none was
+    // taken; the sections below say what each side holds.
+    if (cutOnly)
+        Log("  cut: plane at x %.1f, between cell columns %d and %d -- no cell is removed%s",
+            double(cutColumn) * double(B.lat.cell), int(cutColumn) - 1, int(cutColumn),
+            B.lat.severed.size() == severMark
+              ? ", and no link crossed it, so nothing is parted" : "");
     if (dropped)
         Log("  discarded %d speck(s) under %d cell(s) (%d cell(s) in all) -- nothing"
             " to merge them into and not worth an object each. The flesh is still"
@@ -15225,16 +16423,89 @@ static int Separate(Body& B, const float pIn[3], const Wound& W)
             //
             // SECTION [0] IS NEVER SPLIT. It is the mass that stays on the
             // actor; splitting it would mean forging them.
+            //
+            // AND ONE WOUND IS EXEMPT: THE CUT. Form::CutX exists to leave
+            // them in two halves with nothing between, and a half split at
+            // every second joint is an arm, a leg and a strip of trunk -- not
+            // a half. So for this form alone the span is 0, which
+            // SplitBySpan reads as "off" and returns the section whole. Every
+            // other wound passes the D row's partSpan. The coalescing below
+            // is bound by the same number, as it is bound to whatever the
+            // split allowed.
+            const int spanLimit = cutOnly ? 0 : g_cfg.partSpan;
             std::vector<flesh::Section> pieces;
             pieces.push_back(secs[0]);
             for (std::size_t i = 1; i < secs.size(); ++i) {
                 std::vector<flesh::Section> sub =
-                    flesh::SplitBySpan(B.lat, secs[i], g_cfg.partSpan);
+                    flesh::SplitBySpan(B.lat, secs[i], spanLimit);
                 if (sub.size() > 1)
                     Log("    section %u spans %d joint(s) -- split into %u piece(s)"
                         " (limit %d)", unsigned(i), flesh::PartSpan(secs[i].parts),
-                        unsigned(sub.size()), g_cfg.partSpan);
+                        unsigned(sub.size()), spanLimit);
                 for (flesh::Section& t : sub) pieces.push_back(std::move(t));
+            }
+            // ---- WHAT NO SECTION HOLDS, ON THE SIDE THAT LEAVES ------------
+            //
+            // Sections() leaves out unnamed geometry that no flesh of theirs
+            // reaches -- a worn thing on a bone with no name, a cell or more
+            // clear of them -- and makes a loose section of it only where it
+            // borders a destroyed cell. A cut destroys none, so after one that
+            // geometry is in no section, and on the side that leaves it would
+            // stay drawn in the air where the half was. A whole-body cut
+            // leaves no link across its plane, so the mass that stays lies
+            // wholly on one side; every living cell no section holds on the
+            // OTHER side goes with the largest piece there, and is forged and
+            // removed with it. A cut that names parts never reaches here: it
+            // is refused before a link is parted.
+            //
+            // NOTHING OF THEM ON THE FAR SIDE. Every piece here may lie on the
+            // side that stays: a limb an earlier wound left loose, and beyond
+            // the plane only geometry no section holds. Then the cut parted
+            // nothing of their named flesh, and it is taken back as the
+            // else-if after the section pass takes back a cut that left one
+            // section; the loose pieces beside it go on as this wound's
+            // sections.
+            //
+            // THE HALF IS MET FIRST. It moves to the front of the pieces, so
+            // the forge loop reaches it before any piece an earlier wound left
+            // loose: it takes the first pool record under the blow's cap, and
+            // a torn read of it finds nothing of the cut gone yet and can take
+            // the cut back.
+            if (cutOnly && W.parts == 0 && pieces.size() > 1 && !pieces[0].cells.empty()) {
+                const bool stayBelow = pieces[0].cells[0].x < cutColumn;
+                std::size_t half = 0;
+                for (std::size_t i = 1; i < pieces.size(); ++i) {
+                    if (pieces[i].cells.empty()) continue;
+                    if ((pieces[i].cells[0].x < cutColumn) == stayBelow) continue;
+                    if (!half || pieces[i].cells.size() > pieces[half].cells.size()) half = i;
+                }
+                if (half)
+                    Log("    cut: the mass that stays on them is the %s side of the plane"
+                        " (%u cell(s)); the other side leaves", stayBelow ? "-x" : "+x",
+                        unsigned(pieces[0].cells.size()));
+                else if (B.lat.severed.size() > severMark) {
+                    const std::size_t back = B.lat.RejoinFrom(severMark);
+                    Log("    cut: nothing of them lies on the %s side of the plane -- the cut is"
+                        " TAKEN BACK (%u link(s) rejoined); the loose pieces beside it go on as"
+                        " this wound's sections", stayBelow ? "+x" : "-x", unsigned(back));
+                }
+                if (half) {
+                    if (half > 1) {
+                        std::rotate(pieces.begin() + 1, pieces.begin() + std::ptrdiff_t(half),
+                                    pieces.begin() + std::ptrdiff_t(half) + 1);
+                        half = 1;
+                    }
+                    const std::vector<flesh::Key> loose =
+                        flesh::LooseBeside(B.lat, pieces, flesh::kAllLayers, cutColumn, !stayBelow);
+                    if (!loose.empty()) {
+                        std::vector<flesh::Key> all = pieces[half].cells;
+                        all.insert(all.end(), loose.begin(), loose.end());
+                        pieces[half] = RebuildSection(B.lat, all);
+                        Log("    cut: %u cell(s) no section held lie on the side that leaves"
+                            " -- they go with the piece of %u cell(s) there",
+                            unsigned(loose.size()), unsigned(pieces[half].cells.size()));
+                    }
+                }
             }
             // ---- A nosever WOUND KEEPS WHOLE PARTS AND DROPS FRAGMENTS ----
             //
@@ -15492,8 +16763,8 @@ static int Separate(Body& B, const float pIn[3], const Wound& W)
                         // ASKED OF THE MASKS, NOT OF THE TWO DOMINANTS -- see
                         // `reach` above, computed once for this pick.
                         if (!(reach & pieces[j].parts)) continue;
-                        if (g_cfg.partSpan >= 1 &&
-                            flesh::PartSpan(pieces[pick].parts | pieces[j].parts) > g_cfg.partSpan) continue;
+                        if (spanLimit >= 1 &&
+                            flesh::PartSpan(pieces[pick].parts | pieces[j].parts) > spanLimit) continue;
                         int gap = maxGap + 1;
                         for (const flesh::Key& a : pieces[pick].cells) {
                             for (const flesh::Key& b : pieces[j].cells) {
@@ -15647,6 +16918,38 @@ static int Separate(Body& B, const float pIn[3], const Wound& W)
                     // survive every rebuild -- an arm deleted by one bad
                     // frame, with no gib. They keep it; the re-read watch is
                     // what resolves a body whose geometry moved.
+                    //
+                    // A CUT THAT CANNOT BE READ IS TAKEN BACK, WHOLE. A limb
+                    // left on them like this is still parted from them by the
+                    // cells its wound removed, so the next wound finds it and
+                    // tries again. Form::CutX removed none: with its half
+                    // left on them the plane would stay severed on a body
+                    // drawn whole, and the next scratch would sweep half of
+                    // them away. So while nothing of this cut has left them
+                    // yet, the links it parted go back, the specks it set
+                    // loose stay, and the parts the tally above counted as
+                    // freshly lost are given back -- nothing left them, so
+                    // nothing was lost and nothing kills. The pass stops:
+                    // every other piece of the cut is joined to them again.
+                    // The half is the first piece met (see the fold), so
+                    // nothing having been forged yet means nothing of the
+                    // cut has left. Once a piece HAS been forged before this
+                    // one, or the cut was already taken back above, this is a
+                    // limb's case and the lines below handle it as they
+                    // handle a limb.
+                    if (cutOnly && severed == 0 && lost.size() == orphaned.size()
+                        && B.lat.severed.size() > severMark) {
+                        const std::size_t back = B.lat.RejoinFrom(severMark);
+                        lost.clear();
+                        B.partsLost &= ~freshLostAll;
+                        freshLostAll = 0;
+                        lostAPart = false; dismembered = false; nolethal = false;
+                        Log("    section %u: geometry went away mid-copy -- the cut is TAKEN BACK:"
+                            " %u link(s) rejoined, every cell left on them, and the losses"
+                            " counted above for this wound withdrawn. Nothing is cut",
+                            unsigned(i), unsigned(back));
+                        break;
+                    }
                     Log("    section %u: geometry went away mid-copy -- abandoned,"
                         " and its cells are LEFT ON THEM rather than deleted on a"
                         " read we could not trust", unsigned(i));
@@ -15677,33 +16980,62 @@ static int Separate(Body& B, const float pIn[3], const Wound& W)
                 // WHAT THE FORGE HAS TO WORK WITH, counted over the PIECE's own
                 // triangles and not the body's shape list, so a hollow section
                 // names itself in the log: the lump triangles it kept,
-                // the cap they were kept under, and the skin and worn shells
-                // Solidify will have to rind. FIELD: a guard's thigh
+                // the cap they were kept under, the skin Solidify will rind, and
+                // the worn shells with whether it will rind them. FIELD: a guard's thigh
                 // ("chunk 6: 415 cell(s), 6 shape(s)") had 0 skin shapes and
                 // one of its four shells rinded, and read as hollow; this line
-                // would have said so.
-                u32 secSkin = 0, secShells = 0, secLumpTris = 0;
+                // would have said so. Their hair, eyes, brows and mouth are
+                // counted on their own, because the forge never rinds them, and
+                // the line says whether their face went in: their face counts
+                // among the skin shapes, and a head section without it has no
+                // skin of their head at all.
+                u32 secSkin = 0, secBodySkin = 0, secShells = 0, secLumpTris = 0, secAcc = 0, secFaceTris = 0;
                 {
                     std::vector<std::uint8_t> seen(B.shapes.size(), 0);
                     for (const flesh::TriRef& t : A.tris) {
                         if (t.shape >= B.shapes.size()) continue;
                         const ShapeSrc& SS = B.shapes[t.shape];
                         if (SS.solid) { ++secLumpTris; continue; }
+                        if (SS.face) ++secFaceTris;
                         if (seen[t.shape]) continue;
                         seen[t.shape] = 1;
-                        if (SS.isSkin) ++secSkin;
+                        if (SS.isSkin) { ++secSkin; if (!SS.face) ++secBodySkin; }
                         else if (SS.layer == flesh::kLayerArmour) ++secShells;
+                        else if (SS.layer == 0) ++secAcc;
                     }
                 }
                 char capTxt[24];
                 if (A.lumpCap == 0xFFFFFFFFu) std::snprintf(capTxt, sizeof capTxt, "none");
                 else std::snprintf(capTxt, sizeof capTxt, "%u", unsigned(A.lumpCap));
+                // WHY THEIR FACE IS OR IS NOT IN THE PIECE, by the tests
+                // AssembleCells made, in its order.
+                char faceTxt[112];
+                if (secFaceTris)
+                    std::snprintf(faceTxt, sizeof faceTxt, "in the piece as skin, %u triangle(s)%s", unsigned(secFaceTris),
+                                  B.hasTint ? "" : " -- UNTINTED, no skin colour was read from them");
+                else if (B.faceShape < 0 || std::size_t(B.faceShape) >= B.shapes.size()) {
+                    // A face the frame decision withdrew is still in the shape
+                    // list, marked as their face, with no triangle left.
+                    bool withdrawn = false;
+                    for (const ShapeSrc& WS : B.shapes) if (WS.face) { withdrawn = true; break; }
+                    std::snprintf(faceTxt, sizeof faceTxt, "%s",
+                                  withdrawn ? "read, then withdrawn by the frame decision" : "not read");
+                } else {
+                    const ShapeSrc& FS = B.shapes[std::size_t(B.faceShape)];
+                    std::snprintf(faceTxt, sizeof faceTxt, "%s",
+                        (g_cfg.targetFace < 3 || FS.partTris.empty()) ? "withheld, it is not cut from them"
+                      : (FS.tex.empty() || FS.tex[0].empty())         ? "withheld, no diffuse texture was read for it"
+                                                                      : "none of it in these cells");
+                }
                 Log("    section %u: %u cell(s) of %s (%u kept meat), T=%u -> pool %d"
-                    " -- %u lump triangle(s) (cap %s lump(s)/cell/layer), %u skin shape(s), %u worn shell(s) to rind",
+                    " -- %u lump triangle(s) (cap %s lump(s)/cell/layer), %u skin shape(s), %u worn shell(s) %s,"
+                    " %u accessory shape(s) left bare; their face: %s",
                     unsigned(i), unsigned(pieces[i].cells.size()),
                     flesh::PartName(pieces[i].dominant), unsigned(A.fillCells),
                     unsigned(A.tris.size()), poolSlot, unsigned(secLumpTris),
-                    capTxt, unsigned(secSkin), unsigned(secShells));
+                    capTxt, unsigned(secSkin), unsigned(secShells),
+                    (secBodySkin && !cutOnly) ? "left one-sided beside their body's skin" : "to rind",
+                    unsigned(secAcc), faceTxt);
                 ForgeJob J;
                 J.tris = std::move(A.tris);
                 J.splitAt = 30000;
@@ -15712,6 +17044,11 @@ static int Separate(Body& B, const float pIn[3], const Wound& W)
                 J.slot = poolSlot;
                 J.cells = pieces[i].cells.size();
                 J.section = true;
+                // A CUT'S HALF IS A WHOLE SIDE OF THEM: a bare hand and an
+                // armoured trunk in one piece. The hand's skin closes nothing
+                // under the cuirass, so the forge rinds the worn shells of
+                // this piece as well as its skin.
+                J.rindWorn = cutOnly;
                 J.part = int(pieces[i].dominant); J.layers = flesh::kAllLayers;
                 batch.jobs.push_back(std::move(J));
                 for (const flesh::Key& k : pieces[i].cells) lost.push_back(k);
@@ -15723,6 +17060,15 @@ static int Separate(Body& B, const float pIn[3], const Wound& W)
             // stays skinned to their skeleton and follows them around, detached
             // and floating; that is worse than a missing gib.
             if (!lost.empty()) { B.lat.MarkGone(lost, 0xFFFFFFFFu); changed = true; }
+        } else if (cutOnly && B.lat.severed.size() > severMark) {
+            // A CUT THAT SET NOTHING LOOSE IS TAKEN BACK, WHOLE. Everything of
+            // theirs is still one section -- what lies beyond the plane is only
+            // geometry no section holds -- so nothing can be swept, and links
+            // left parted on a body drawn whole would stop a later wound
+            // spreading across them.
+            const std::size_t back = B.lat.RejoinFrom(severMark);
+            Log("  cut: the plane parted %u link(s) and nothing of them came loose -- the cut is"
+                " TAKEN BACK and nothing is cut", unsigned(back));
         }
     } else if (B.baseSections != 1) {
         Log("  loose flesh not swept: they arrived in %d section(s), so 'the largest"
@@ -15746,14 +17092,47 @@ static int Separate(Body& B, const float pIn[3], const Wound& W)
                 for (const flesh::TriRef& t : J.tris)
                     if (t.shape < used.size()) used[t.shape] = 1;
             batch.geom.resize(B.shapes.size());
+            u32 ownedShapes = 0, ownedShort = 0;
+            std::size_t ownedBytes = 0;
             for (std::size_t i = 0; i < B.shapes.size(); ++i) {
                 const ShapeSrc& S = B.shapes[i];
                 GeomRef& G = batch.geom[i];
                 G.raw = S.raw; G.vsize = S.vsize; G.desc = S.desc; G.nVerts = S.nVerts;
                 G.isSkin = S.isSkin; G.solid = S.solid; G.layer = S.layer; G.tex = S.tex;
+                G.face = S.face;
+                G.accessory = S.accessory; G.feature = S.feature; G.hasMatTint = S.hasMatTint;
+                G.matTint[0] = S.matTint[0]; G.matTint[1] = S.matTint[1]; G.matTint[2] = S.matTint[2];
+                G.liveTex = S.liveTex;
                 G.skinInst = S.skinInst;
-                (void)used;
+                // THE FORGE OWNS WHAT IT READS OUT OF A PRIVATE BUFFER. A
+                // shape a recipe names whose records lie inside one of
+                // Body::privRecs' buffers is copied here, whole, because the
+                // next voxelise frees that buffer and the forge may not have
+                // run yet (see the note at the forge queue, g_forgeQ).
+                // By address range, so any buffer in privRecs is covered,
+                // whoever put it there. Only shapes a job uses are copied: a
+                // wound nowhere near their head copies nothing. The copy is
+                // bounded by the buffer's own end; a shape that claims more
+                // vertices than its buffer holds is handed over with the
+                // count that fits, and AssembleChunk refuses the whole piece
+                // if a triangle names a vertex past it.
+                if (!used[i] || !S.raw || !S.vsize || !S.nVerts) continue;
+                const std::uintptr_t at = reinterpret_cast<std::uintptr_t>(S.raw);
+                for (const std::vector<std::uint8_t>& buf : B.privRecs) {
+                    const std::uintptr_t lo = reinterpret_cast<std::uintptr_t>(buf.data());
+                    if (buf.empty() || at < lo || at - lo >= buf.size()) continue;
+                    const std::size_t room = (buf.size() - std::size_t(at - lo)) / S.vsize;
+                    if (room < S.nVerts) { G.nVerts = u32(room); ++ownedShort; }
+                    G.ownedRaw.assign(S.raw, S.raw + std::size_t(G.nVerts) * S.vsize);
+                    ++ownedShapes;
+                    ownedBytes += G.ownedRaw.size();
+                    break;
+                }
             }
+            if (ownedShapes)
+                Log("  forge hand-off: %u private-buffer shape(s) copied for the forge, %u B"
+                    " (%u cut short at the end of its buffer)",
+                    unsigned(ownedShapes), unsigned(ownedBytes), unsigned(ownedShort));
         }
         batch.seq = seq;
         batch.victim = int(B.formID);
@@ -15807,6 +17186,18 @@ static int Separate(Body& B, const float pIn[3], const Wound& W)
             for (const flesh::Key& k : taken) {
                 auto ck = B.lat.cells.find(k);
                 if (ck != B.lat.cells.end()) touched |= 1u << unsigned(ck->second.part);
+            }
+            // A CUT TAKES NO CELL AND STILL WENT THROUGH THEM. `taken` is
+            // empty for Form::CutX, and an empty parts column is a field a
+            // reader that drops empty fields miscounts. The parts the plane
+            // passed through are the ones found on BOTH sides of it: in the
+            // mass that stayed and in a section that did not. Asked only
+            // while the cut's own links are still parted -- a cut that was
+            // taken back touched nothing.
+            if (cutOnly && severRan && secsKept.size() > 1 && B.lat.severed.size() > severMark) {
+                u32 beyond = 0;
+                for (std::size_t si = 1; si < secsKept.size(); ++si) beyond |= secsKept[si].parts;
+                touched |= secsKept[0].parts & beyond;
             }
             touched &= ~1u;
             std::string remain;
@@ -16525,7 +17916,7 @@ static int WoundActor(const void* refr, const char* seedBone, Aim* aim, const Wo
         // The revive block above has already run, so a target the Restore handed
         // back comes to the worker with an EMPTY carry and is rebuilt whole
         // there too. WD 1 defers what the world does to them (origin 2, 5); WD 2
-        // adds the spells (origin 1); API, command, vortex and scene origins
+        // adds the spells (origin 1); API, command and vortex origins
         // stay synchronous because CommandWound answers from g_sepRan. A
         // replayed wound never defers again (g_inReplay): "stale again" is the
         // SWEEP's business -- it re-reads their 3D with the tick's three signs
@@ -16543,8 +17934,8 @@ static int WoundActor(const void* refr, const char* seedBone, Aim* aim, const Wo
         // found no worker to hand them to (R 0; eight rebuilds already in flight
         // -- the tick stops at four, so the other four were blows; a walk that
         // found nothing); and a WD 1 spell, since origin 1 is not deferable
-        // below WD 2. NEVER a command, API, vortex or scene wound (origin 3, 4,
-        // 6): CommandWound answers FL_Api from g_sepRan the moment WoundActor
+        // below WD 2. NEVER a command, API or vortex wound (origin 3,
+        // 4): CommandWound answers FL_Api from g_sepRan the moment WoundActor
         // returns, and one parked here would be a "no separation ran" that
         // lied -- it still COUNTS, so the blow after it in the same frame
         // waits. At most voxPerFrame of these on one frame -- REPLAYS INCLUDED
@@ -16723,7 +18114,7 @@ static int WoundActor(const void* refr, const char* seedBone, Aim* aim, const Wo
     // Worn armour does not scale a wound: any physical weapon deals full flesh
     // damage directly (no weapon-vs-armour resistance multipliers). What is
     // limited here is origin 2 alone -- a blow, a typed effect, a window; a
-    // spell, a command, a scene and a vortex are deliberate. Below 85, a wound
+    // spell, a command and a vortex are deliberate. Below 85, a wound
     // that is neither a cleave nor under a weapon's own limit is capped at 12.
     //
     // A BLOW'S SLAB IS A CLEAVE, AT EVERY INTENSITY. FIELD:
@@ -16842,7 +18233,7 @@ static int WoundActor(const void* refr, const char* seedBone, Aim* aim, const Wo
     // not they are dead -- this file has no life-state fact -- and FL_Watch leaves
     // a standing target alone ("is not down ... -- left alone"), so their stamp would
     // sit for 60 s and read their next ordinary 3D change (an equip, the interior the
-    // dress request above just asked for, a cell change, a scene strip) as the
+    // dress request above just asked for, a cell change, an outfit strip) as the
     // revive and wipe THIS cut. Spent here, under g_csBodies, which every caller
     // holds (Hit, Magic, Replay, HookRunBody).
     // KNOWN GAP: a corpse struck by a stray blow (an arrow, a follower's
@@ -16850,6 +18241,8 @@ static int WoundActor(const void* refr, const char* seedBone, Aim* aim, const Wo
     // old behaviour for that narrow case; the cause seen in play, the Restore's own
     // impact, is refused by the Hit hook's no-weapon projectile filter. Closing it
     // needs to know who FL_Watch actually revives (see the script note).
+    // The [FACETEX] probe (FT col 6) writes what it held for them: log only.
+    FaceTexProbeCut(formID);
     const int sepR = Separate(B, p, Wm);
     if ((sepR > 0 || g_sepChanged) && !g_reviving.empty()) g_reviving.erase(formID);
     return sepR;
@@ -17192,7 +18585,7 @@ static void LoadTriggers()
 // is worth 1.3 to one mod and 2.0 to another. Applied in exactly two places,
 // both only to what the WORLD does to them: a trigger row's threshold is
 // divided by it, and a blow's or a drain's wound is scaled by it in
-// WoundActor. A spell, a command, a vortex wave and a scene action are
+// WoundActor. A spell, a command and a vortex wave are
 // deliberate and are never scaled.
 //     FleshCore.scalars.txt     <formID>|<factor>|<caller>
 static std::map<u32, float> g_scalar;
@@ -17558,9 +18951,12 @@ static u32 Load_ProcessEventBody(void*, const void* ev, void*)
             // reads, printed where it changes, so a test log's peak is a
             // line and not a count of lines (an earlier test log could not say).
             double since = 0;
-            if (PlacedNote3D(fid, on != 0, &since))
+            if (PlacedNote3D(fid, on != 0, &since)) {
                 Log("[PLACE] 0x%08X %s %.1f ms after the engine placed it (%d of ours with 3D)", fid,
                     on ? "GOT its 3D" : "lost its 3D", since, LivePieceCount());
+                // Bookkeeping only: this thread never touches the piece's 3D.
+                TintOnGot(fid, on != 0);
+            }
         }
         if (g_probe.loads && InterlockedIncrement(&seen) <= 4000) {
             // Ask the reference itself, rather than trusting the event: a form
@@ -17854,7 +19250,8 @@ static bool PreWarmActor(u32 fid, const char* why, long stopEpoch)
         // an interior on them and they pass -- so caching it would keep the
         // pre-warm away from exactly the target who most needs warming. They
         // cost one walk per load until they are dressed, and then they pass.
-        if (!notEligible) {
+        // Nor is a build that a load stopped: that says nothing about them.
+        if (!notEligible && !Stale(stopEpoch)) {
             Guard lk(&g_csBodies);
             if (g_notFlesh.size() < 512) g_notFlesh.insert(fid);
         }
@@ -18381,7 +19778,7 @@ static void RestoreEveryBody(std::vector<u32>* untouched = nullptr);
 
 // RESTORE, AND WHY IT REACHES EVERYONE RATHER THAN THE ONE YOU AIM AT.
 //
-// A scene can leave a dozen
+// A fight can leave a dozen
 // targets in pieces, and clearing it one cast at a time is a chore rather than a
 // tool. So a Restore un-cuts EVERY body the registry holds -- the same work,
 // on the same proven path, that PreLoadGame already uses -- and then
@@ -18413,7 +19810,7 @@ static void RestoreEverything()
     // Eleven or twelve targets at 300-650 ms each, serialised on one warm
     // thread, is a four-to-six second window after EVERY Restore in which
     // nobody is warm and every blow pays for the whole lattice on the frame
-    // that has to draw it, and a Restore is how a scene is reset. Field report:
+    // that has to draw it, and a Restore is how a test is reset. Field report:
     // the first detonate went off perfectly; after that one, it
     // hitched on the next ones.
     //
@@ -20021,7 +21418,6 @@ static const char* kFeatures[] = {
     "drain",      // drain rows paid out by the tick
     "scalar",     // FL_Api.SetScalar: per-actor product over thresholds and world wounds
     "verdict",    // registry headfatal/trunkfatal/limbfatal/limbstodie at the death rule
-    "scenes",     // scene rule table on the hooks quest
     "effects",    // FL_Effects rules and the FL_WoundedFX marker
     "shards",     // provenance on every piece; activation and consumption
     "plugin",     // SKSE messages FCWoundedMsg / FCPartLostMsg to "FleshCore" listeners
@@ -20150,8 +21546,8 @@ static bool RestoreOneBody(u32 fid, Body& B, void* dev, RestoreStats& st)
             // wrong about the head the moment the re-read tick started
             // writing the cull onto the LIVE tree.
             //
-            // The body it strands is the case this is for: a target
-            // stripped for a scene whose rebuild the worker then REFUSED
+            // The body it strands is the case this is for: a target whose
+            // outfit another mod took off, whose rebuild the worker then REFUSED
             // ("nothing of ours on them"). A refusal never advances B.root,
             // so nowRoot != B.root is true for them for the rest of the
             // session, Restore skipped them here, and RestoreEverything's
@@ -21224,6 +22620,8 @@ static void RunPendingTestStrike()
         if (rem & 0x08u)             ++preBone;
     }
 
+    // The [FACETEX] probe (FT col 6) writes what it held for them: log only.
+    FaceTexProbeCut(fid);
     const int sepR = Separate(B, p, W);
     // A test strike on an unchanged 3D spends the revive stamp as WoundActor's
     // exit does, so it is not wiped by their next 3D change.
@@ -22186,14 +23584,14 @@ static void RereadTickRunBody(void*)
         // frame; sixty-four bodies are all seen inside sixteen seconds, and the
         // ones that just changed are seen at once.
         //
-        // WHY FOUR. The hot set was uncapped at first, and a scene that strips
+        // WHY FOUR. The hot set was uncapped at first, and another mod that strips
         // and re-dresses five targets keeps all five hot for fifteen seconds past
         // the last equip -- seven walks a tick, twice a second, against a goal of
         // no stutter. Being walked on EVERY tick buys a hot body
         // nothing over being walked at all: the settle gate below wants two
         // looks one rereadMs apart, and the tick period IS rereadMs. So the
         // fifth waits a tick, oldest hotTick going first, and the frame is
-        // bounded at six walks whatever the scene does.
+        // bounded at six walks whatever that mod does.
         const double k0 = NowMs();
         auto it = g_bodies.upper_bound(g_rereadCursor);
         if (it == g_bodies.end()) it = g_bodies.begin();
@@ -22376,7 +23774,7 @@ static void RereadTickRunBody(void*)
             // ABOVE THE REFUSED-REBUILD MEMO, NOT BELOW IT.
             // That memo means "the worker could not BUILD from
             // this", and its commonest reason -- "nothing of ours on them" -- is a
-            // target stripped for a scene, which is this block's own case. A
+            // target whose outfit another mod took off, which is this block's own case. A
             // refusal has no bearing on one flag write, and below the memo this
             // could never run again for exactly the body it was written for.
             //
@@ -23041,6 +24439,7 @@ static void DeathCamForget()
 }
 
 static void PlaceWatchdog();
+static void TintWatchdog();
 static DWORD WINAPI RereadTickerBody(LPVOID);
 static DWORD WINAPI RereadTicker(LPVOID p) { return GuardedThread("RereadTicker", RereadTickerBody, p); }
 static DWORD WINAPI RereadTickerBody(LPVOID)
@@ -23049,6 +24448,7 @@ static DWORD WINAPI RereadTickerBody(LPVOID)
         Sleep(DWORD(g_cfg.rereadMs > 0 ? g_cfg.rereadMs : 500));
         if (!g_cfg.ok || !g_task || !g_task->AddTask) continue;
         if (g_cfg.place >= 1) PlaceWatchdog();
+        if (g_cfg.pieceTint >= 1) TintWatchdog();
         DeathCamTick();
         HeartbeatTick();
         RosterTick();
@@ -23142,8 +24542,43 @@ static volatile long g_placeInFlight = 0;
 // forgets an entry that has had no 3D for ten seconds (it never arrived, or
 // it is finally gone). Guarded by g_csPlace like the placer's queue; cleared
 // with the registry on a load, because the pieces belong to that timeline.
-struct PlacedInfo { double when; bool has3D; };
+//
+// GROWN FOR THE PIECE-COLOUR READ-BACK (S column 3). LivePieceCount and
+// PlacedNote3D still read only `when` and `has3D`. The rest is filled ONLY by
+// the full constructor, which PlaceOne calls; a struct with a constructor is
+// not an aggregate, so the old two-field brace form no longer compiles, and
+// `filled` lets TintOnGot say once if an entry ever arrives without it.
+// PlaceOne's reference pointer is NOT kept: the colour pass finds the
+// reference through the form map only.
+struct PlacedInfo {
+    double when = 0; bool has3D = false;
+    bool filled = false;                        // set by the full constructor only
+    float tint[3] = {1.0f, 1.0f, 1.0f}; bool hasTint = false; int skinBlocks = 0;
+    bool section = false;
+    long seq = 0; int victim = 0; std::string rel;
+    const void* acti = nullptr;                 // the pool record: the identity check and the model path
+    // WHICH PLACEMENT this entry is. Created-ref FormIDs are reused, and a
+    // reuse overwrites the entry (got and lostSeq start again at 0), so every
+    // colour ask and every material owner record carries this number beside
+    // the FormID, and a later placement is never taken for an earlier piece.
+    unsigned long long place = 0;
+    int got = 0;                                // GOT events that asked for a pass
+    int lostSeq = 0;                            // lost events: an ask from before one is dropped
+    const void* root = nullptr;                 // the 3D the last pass walked
+    int rewrites = 0;
+    std::vector<const void*> mats, prevMats;    // FacegenTint materials seen on this 3D / the last one
+    std::vector<std::string> accTex0, skinTex0; // PlacePiece's: the accessory test (TintAccessoryVerdict)
+    PlacedInfo() = default;
+    PlacedInfo(double w, const PlaceJob& PJ, const PlacePiece& P, const void* a, unsigned long long pl)
+        : when(w), has3D(false), filled(true), hasTint(PJ.hasTint), skinBlocks(P.skinBlocks),
+          section(P.section), seq(PJ.seq), victim(PJ.victim), rel(P.rel), acti(a), place(pl)
+    {
+        tint[0] = PJ.tint[0]; tint[1] = PJ.tint[1]; tint[2] = PJ.tint[2];
+        accTex0 = P.accTex0; skinTex0 = P.skinTex0;
+    }
+};
 static std::map<u32, PlacedInfo> g_placedLive;
+static unsigned long long g_placeSerial = 0;    // g_csPlace: one number per PlaceOne entry
 static bool g_placeSaid = false;
 
 // The created-ref sink's one question: is this piece FleshCore's -- and if so, note
@@ -23179,11 +24614,13 @@ static int LivePieceCount()
     }
     return n;
 }
+static void TintForgetAllLocked();     // the piece-colour state; caller holds g_csPlace
 static void PlacedForgetAll()
 {
     if (!g_locksReady) return;
     Guard lk(&g_csPlace);
     g_placedLive.clear();
+    TintForgetAllLocked();
 }
 
 static void PlaceRun(void*);
@@ -23218,6 +24655,935 @@ static void PlaceWatchdog()
         }
     }
     if (post) PlacePost();
+}
+
+// ============================================================================
+// PIECE COLOUR READ-BACK (cfg S column 3; issue #95, pale pieces).
+//
+// The forge writes their colour into every type-5 block of their skin. With
+// FT col 2 = 2 a feature-5 accessory (horns, frills, brows, scars) takes the
+// same type-5 block in its OWN colour; such materials are set aside by their
+// slot-0 texture, never judged against their skin and never written
+// (TintAccessoryVerdict). Whether the
+// engine's live material of the placed piece holds it is not known. When an
+// engine-placed piece's 3D arrives, the sink (which never touches 3D) queues
+// an ask; a game-thread task walks the piece's own 3D, reads its materials,
+// and logs them. Mode 1 writes nothing. Mode 2 may write 12 bytes, their
+// colour, at +0xA0 of a material proven to be a FacegenTint (vtable RVA
+// 0x01AB7200, facts.h kVT_MaterialFacegenTint, also seen live on this runtime
+// in a field log with GetFeature 5 and +0xAC = 0, so 12 bytes stay inside the
+// object), feature 5, unshared, and only once the in-session gate is open.
+// Never beside FT col 2 = 2: LoadConfig runs 2 as 1 there, because a material
+// one piece sets aside as an accessory is not seen as held by another piece.
+//
+// SAFETY, in order: an ask is dropped unless its piece is still the same
+// placement (the PlaceOne number, beside the FormID) and still has the 3D the
+// ask was made for (got and lostSeq unchanged, has3D); the reference comes
+// from the form map ONLY -- PlaceOne looks its new reference up there before
+// the piece is recorded, and until one such lookup has returned the placed
+// pointer itself no pass runs this session; after that a miss means the ref
+// was destroyed. PlaceOne's own pointer is never used here. The reference
+// must be ours by FormID and base == the pool record (created-ref FormIDs are
+// reused, and g_placedLive keeps entries after a piece dies, so this check is
+// load-bearing); no engine call is made under any lock; HandsOff, TearingDown
+// and Stale are re-tested before every walk (the task stops and its asks go
+// back to the queue) and immediately before every write and restore.
+//
+// Material words logged raw and never decided on (UNREAD meanings):
+// +0x08 (refcount?), +0x0C (uvOffset?), +0x2C (hash key?); property +0x38
+// (shader flags?).
+static constexpr std::uintptr_t kTintProbe_propFlags = 0x38;   // UNREAD, log only
+static constexpr std::uintptr_t kTintProbe_matW08    = 0x08;   // UNREAD, log only
+static constexpr std::uintptr_t kTintProbe_matW0C    = 0x0C;   // UNREAD, log only
+static constexpr std::uintptr_t kTintProbe_matW2C    = 0x2C;   // UNREAD, log only
+
+// `place` is PlacedInfo::place of the piece the ask is for (FormIDs are reused).
+struct TintAsk { u32 fid; double due; int got; int lostSeq; bool recheck; int tries; long epoch;
+                 unsigned long long place; };
+struct TintMat {
+    u32 owner = 0; unsigned long long ownerPlace = 0;   // the owner is the PAIR (FormID, placement)
+    bool ownerGone = false;
+    float orig[3] = {0, 0, 0}; float wrote[3] = {0, 0, 0};
+    bool written = false; bool shared = false;
+    u32 w2cAtWrite = 0;
+    std::string rel;
+    unsigned long long seq = 0;            // insertion order, for the cap
+};
+struct TintGateObs { u32 fid; unsigned long long place; int lostSeq; const void* mat; float want[3]; };
+struct TintGate { bool open = false; u32 byA = 0, byB = 0; std::vector<TintGateObs> obs; };
+static std::deque<TintAsk> g_tintQ;                        // g_csPlace
+static std::map<const void*, TintMat> g_tintMats;          // g_csPlace (cap 4096)
+static unsigned long long g_tintMatSeq = 0;                // g_csPlace
+static std::map<std::string, TintGate> g_tintGate;         // g_csPlace
+static volatile long g_tintInFlight = 0;
+static DWORD g_tintPostedAt = 0;                           // g_csPlace
+// U9, settled by PlaceOne (TintNoteFormMap): 1 once LookupForm has returned
+// a just-placed reference's own pointer this process. Until then no colour
+// pass runs; after it, a reference missing from the form map is gone.
+static volatile long g_tintMapHoldsCreated = 0;
+static volatile long g_tintLines = 0;                      // material and drop lines written (cap 3000)
+struct TintTally { long passes, mats, wrote, right, would, shared, restored, notft, unwritable,
+                   repointed, staleBody, incomplete, gateClosed, checks, held, rewrote, reset,
+                   deferred, accessory; };
+static TintTally g_tintTally = {};                         // game thread only
+// The actor set per task (reviews F3, F6): bodies copied at most 8 (victims
+// always), actor walks at most 4; a pass whose bodies of interest were not
+// all walked is INCOMPLETE and never written.
+static constexpr std::size_t kTintBodyCopy = 8;
+static constexpr int kTintActorWalks = 4;
+
+static void TintForgetAllLocked()
+{
+    g_tintQ.clear();
+    g_tintMats.clear();
+    g_tintGate.clear();
+    InterlockedExchange(&g_tintInFlight, 0);
+    g_tintPostedAt = 0;
+}
+static bool TintDiffers(const float* a, const float* b)
+{
+    for (int k = 0; k < 3; ++k)
+        if (!(std::fabs(a[k] - b[k]) <= 0.5f / 255.0f)) return true;   // NaN counts as different
+    return false;
+}
+
+static void TintRun(void*);
+static void TintDispose(void* self) { delete static_cast<TaskObj*>(self); }
+static const TaskVtbl g_tintVtbl = { TintRun, TintDispose };
+static void TintPost()
+{
+    if (!g_task || !g_task->AddTask) { InterlockedExchange(&g_tintInFlight, 0); return; }
+    TaskObj* t = new TaskObj{ &g_tintVtbl };
+    g_task->AddTask(t);
+}
+
+// The sink's thread: bookkeeping only, g_csPlace alone, no engine memory.
+static void TintOnGot(u32 fid, bool on)
+{
+    if (g_cfg.pieceTint < 1 || !g_locksReady) return;
+    static volatile long saidThread = 0, saidUnfilled = 0;
+    if (InterlockedExchange(&saidThread, 1) == 0)
+        Log("[TINT] piece 3D events arrive on thread %lu (first game task thread %ld)",
+            GetCurrentThreadId(), InterlockedCompareExchange(&g_taskThread, 0, 0));
+    bool post = false, unfilled = false;
+    {
+        Guard lk(&g_csPlace);
+        auto it = g_placedLive.find(fid);
+        if (it == g_placedLive.end()) return;
+        PlacedInfo& I = it->second;
+        if (!on) {
+            ++I.lostSeq;
+            I.prevMats = std::move(I.mats); I.mats.clear(); I.root = nullptr;
+            for (auto& kv : g_tintMats)
+                if (kv.second.owner == fid && kv.second.ownerPlace == I.place) kv.second.ownerGone = true;
+            return;
+        }
+        if (!I.filled) unfilled = true;
+        else if ((I.hasTint && I.skinBlocks > 0) || I.section) {
+            ++I.got;
+            g_tintQ.push_back(TintAsk{ fid, NowMs(), I.got, I.lostSeq, false, 0,
+                                       InterlockedCompareExchange(&g_loadEpoch, 0, 0), I.place });
+            if (InterlockedCompareExchange(&g_tintInFlight, 1, 0) == 0) {
+                post = true; g_tintPostedAt = GetTickCount();
+            }
+        }
+    }
+    if (unfilled && InterlockedExchange(&saidUnfilled, 1) == 0)
+        Log("[TINT] <<< 0x%08X: an engine-placed piece's record was made without the full"
+            " constructor -- no colour pass can run for such pieces", fid);
+    if (post) TintPost();
+}
+
+// The re-read ticker: post when an ask is due and nothing is in flight; re-post
+// a task that has not run for 5 s (the same recovery as PlaceWatchdog).
+static void TintWatchdog()
+{
+    if (!g_locksReady) return;
+    bool post = false; DWORD waited = 0; std::size_t n = 0;
+    {
+        Guard lk(&g_csPlace);
+        if (g_tintQ.empty()) return;
+        const double now = NowMs();
+        bool due = false;
+        for (const auto& a : g_tintQ) if (a.due <= now) { due = true; break; }
+        if (!due) return;
+        if (InterlockedCompareExchange(&g_tintInFlight, 1, 0) == 0) {
+            post = true; g_tintPostedAt = GetTickCount();
+        } else if (g_tintPostedAt && LONG(GetTickCount() - g_tintPostedAt) > 5000) {
+            waited = GetTickCount() - g_tintPostedAt; n = g_tintQ.size();
+            g_tintPostedAt = GetTickCount();
+            post = true;
+        }
+    }
+    if (waited)
+        Log("[TINT] the colour task has not run for %u ms with %u ask(s) waiting -- posting it again",
+            unsigned(waited), unsigned(n));
+    if (post) TintPost();
+}
+
+// The piece's own 3D: at most 512 nodes, depth 16, 128 shapes. The root was
+// read off the reference this frame, behind the gates in TintRunBody.
+struct TintWalkOut { int nodes = 0, geoms = 0; std::vector<const void*> geom; };
+static void TintWalk(const void* o, int depth, TintWalkOut& W)
+{
+    if (!o || depth > 16 || W.nodes >= 512) return;
+    ++W.nodes;
+    if (IsA(o, "BSGeometry")) {
+        ++W.geoms;
+        if (W.geom.size() < 128) W.geom.push_back(o);
+        return;
+    }
+    if (!IsA(o, "NiNode")) return;
+    const void* data = nullptr; std::uint16_t used = 0;
+    const void* arr = static_cast<const std::uint8_t*>(o) + fact::kNode_children;
+    if (!Peek(arr, fact::kNiTArr_data, &data) || !data) return;
+    if (!Peek(arr, fact::kNiTArr_freeIdx, &used) || used > 4096) return;
+    for (std::uint16_t i = 0; i < used && W.nodes < 512; ++i) {
+        const void* c = nullptr;
+        if (!Peek(data, i * sizeof(void*), &c)) break;
+        if (c) TintWalk(c, depth + 1, W);
+    }
+}
+
+// A texture-set path, call-free: material +0x78 -> set +0x10 + 8*slot -> chars,
+// read by SafeStr (page-tested, at most 260 bytes). Only on a material whose
+// class is proven by its vtable (FacegenTint or Facegen).
+static std::string TintTexSlot(const void* mat, int slot)
+{
+    if (slot < 0 || slot >= fact::kTexSet_count) return std::string();
+    const void* ts = nullptr;
+    if (!Peek(mat, fact::kMat_textureSet, &ts) || !ts) return std::string();
+    const void* p = nullptr;
+    if (!Peek(ts, fact::kTexSet_paths + std::uintptr_t(slot) * sizeof(void*), &p) || !p) return std::string();
+    const char* s = SafeStr(p);
+    return s ? std::string(s) : std::string();
+}
+static std::string TintLower(std::string s)
+{
+    for (auto& ch : s) ch = char(std::tolower(static_cast<unsigned char>(ch)));
+    return s;
+}
+// `s` against an already lower-case `lower`, case-insensitively, with no
+// allocation (it runs under g_csBodies).
+static bool TintEqLower(const std::string& s, const std::string& lower)
+{
+    if (s.size() != lower.size()) return false;
+    for (std::size_t i = 0; i < s.size(); ++i)
+        if (char(std::tolower(static_cast<unsigned char>(s[i]))) != lower[i]) return false;
+    return true;
+}
+
+// A FEATURE-5 ACCESSORY IS NOT THEIR SKIN (FT col 2 = 2). The forge puts it on
+// the same type-5 skin-tint block as their skin, in its own colour, so its
+// live material is a feature-5 FacegenTint like their skin's. Judged against
+// their skin tint it is false evidence; written in mode 2 it would be painted
+// with their skin, and the actor set (their skin and face shapes only) cannot
+// see who else draws it. On a piece whose forge recorded accessory textures
+// (`acc`, PieceTexKeys), a feature-5 material is judged as their skin only when
+// its slot 0 is one of the piece's skin textures and none of its accessory
+// textures; anything else is set aside: logged, never in g_tintMats, the gate
+// or a write, and not counted with the skin-tint materials.
+//   ACCESSORY            slot 0 is an accessory texture of this piece;
+//   ACCESSORY-AMBIGUOUS  it is an accessory and a skin texture of this piece;
+//   ACCESSORY-UNMATCHED  it is neither, or was not read: the path the engine
+//                        holds may differ from the forged one (UNREAD), so it
+//                        cannot be told from an accessory.
+// nullptr: judge it as before -- always on a piece with no accessory texture,
+// which is every piece without FT col 2 = 2.
+static const char* TintAccessoryVerdict(const std::vector<std::string>& acc,
+                                        const std::vector<std::string>& skin, const std::string& slot0)
+{
+    if (acc.empty()) return nullptr;
+    const std::string k = TintTexKey(slot0);
+    const bool a = !k.empty() && std::find(acc.begin(), acc.end(), k) != acc.end();
+    const bool s = !k.empty() && std::find(skin.begin(), skin.end(), k) != skin.end();
+    if (a && s) return "ACCESSORY-AMBIGUOUS";
+    if (a) return "ACCESSORY";
+    if (!s) return "ACCESSORY-UNMATCHED";
+    return nullptr;
+}
+
+// U9 AT PLACEMENT (review F1). Game thread, called by PlaceOne once the new
+// reference's FormID is known and BEFORE its g_placedLive entry exists, so no
+// colour ask for it can exist yet; no lock is held. The same LookupForm the
+// created-ref sink's probe and AnswerAsk make on created refs. Only a lookup
+// that returns the placed reference's own pointer lets the colour pass trust
+// the form map; each answer is said once per process.
+static void TintNoteFormMap(u32 fid, const void* refr)
+{
+    void* found = LookupForm(fid, 0);
+    if (found && found == refr) {
+        if (InterlockedExchange(&g_tintMapHoldsCreated, 1) == 0)
+            Log("[TINT] created refs are in the form map (0x%08X)", fid);
+        return;
+    }
+    static volatile long saidMiss = 0;
+    if (InterlockedExchange(&saidMiss, 1) == 0)
+        Log("[TINT] created ref 0x%08X was not found in the form map at placement (lookup gave %p, placed %p)",
+            fid, found, refr);
+}
+
+struct TintMatSeen {
+    const void* mat = nullptr; const void* prop = nullptr; int shapes = 0;
+    int feature = -2; std::uintptr_t vrva = 0; bool vtFT = false, vtFG = false;
+    std::uint64_t pf = 0; u32 w08 = 0; float w0C = 0; u32 w2C = 0;
+    bool haveA0 = false; float a0[3] = {0, 0, 0};
+    std::string slot0;                       // lower case, proven classes only
+    const void* f4tint = nullptr; std::string slot6;
+    const char* acc = nullptr;               // feature 5: TintAccessoryVerdict, null = judged as their skin
+};
+struct TintWork {
+    TintAsk ask{}; PlacedInfo info;
+    bool drop = false;
+    bool abort = false;                      // a gate closed before a walk: the task stops (F4)
+    bool back = false;                       // handed back to the queue for the next task (walk cap)
+    const char* via = "";
+    void* refr = nullptr; std::uint8_t type = 0; const void* root = nullptr;
+    TintWalkOut walk;
+    std::vector<TintMatSeen> seen;
+    std::map<int, int> otherFeatures;        // feature -> materials not printed
+    std::string model; bool repointed = false;
+    std::uint64_t slotMask = 0;              // its FacegenTint slot-0 paths, as bits of the task's list
+    bool slotOver = false;                   // one of them did not fit the list: never complete
+};
+struct TintBodySnap {
+    u32 fid = 0; const void* root = nullptr; int nGeom = 0; std::uint64_t walkMix = 0;
+    float tint[3] = {1, 1, 1}; bool hasTint = false;
+    std::vector<const void*> geoms;
+    std::uint64_t slotMask = 0;              // the task's slot-0 paths its skin/face tex[0] equals
+    int state = 0;                           // 0 not walked (cap), 1 current, 2 stale, 3 away (no 3D)
+    std::vector<const void*> mats;           // Peek-only, current bodies only
+    const void* firstMat = nullptr; std::uint64_t pf = 0;
+};
+// The gates a walk must not start past (review F4; the rule of the block
+// comment above Stale).
+static bool TintWalkBlocked(long epoch) { return HandsOff() || TearingDown() || Stale(epoch); }
+// A drop line, inside the material-line cap.
+static bool TintSay() { return InterlockedIncrement(&g_tintLines) <= 3000; }
+
+// Steps 1-6: gates, the reference, its 3D, the walk and the reads. No lock is
+// held across an engine call.
+static void TintPrepare(TintWork& W)
+{
+    TintAsk& A = W.ask;
+    if (Stale(A.epoch)) { W.drop = true; return; }
+    {
+        Guard lk(&g_csPlace);
+        auto it = g_placedLive.find(A.fid);
+        if (it == g_placedLive.end()) { W.drop = true; W.via = "forgotten"; }
+        else W.info = it->second;
+    }
+    if (W.drop) {
+        Log("[TINT] 0x%08X forgotten before its %s pass -- dropped", A.fid, A.recheck ? "CHECK" : "GOT");
+        return;
+    }
+    if (W.info.place != A.place) {                                  // F5: the FormID was placed again
+        W.drop = true;
+        if (TintSay())
+            Log("[TINT] 0x%08X was placed again (a reused FormID) before its %s pass -- dropped",
+                A.fid, A.recheck ? "CHECK" : "GOT");
+        return;
+    }
+    if (W.info.got != A.got) { W.drop = true; return; }            // a newer 3D has its own pass
+    if (!W.info.has3D || W.info.lostSeq != A.lostSeq) {             // B1: the 3D this ask was for is gone
+        W.drop = true;
+        Log("[TINT] 0x%08X lost its 3D before its %s pass -- dropped", A.fid, A.recheck ? "CHECK" : "GOT");
+        return;
+    }
+    // THE REFERENCE, FROM THE FORM MAP ONLY (review F1). PlaceOne looked every
+    // new reference up there before recording it; until one of those lookups
+    // returned the placed pointer itself, the form map is not proven to hold
+    // created refs and no pass runs. After it, a miss means the ref is gone.
+    if (!InterlockedCompareExchange(&g_tintMapHoldsCreated, 0, 0)) {
+        W.drop = true;
+        static volatile long saidNoMap = 0;
+        if (InterlockedExchange(&saidNoMap, 1) == 0)
+            Log("[TINT] read-back unavailable this session: created refs were not found in the form map");
+        return;
+    }
+    void* refr = LookupForm(A.fid, 0);
+    W.via = "form map";
+    if (!refr) {
+        W.drop = true;
+        if (TintSay())
+            Log("[TINT] 0x%08X is not in the form map -- gone, dropped", A.fid);
+        return;
+    }
+    u32 id = 0; const void* base = nullptr;
+    if (!refr || !Readable(refr, fact::kREFR_size) || !Peek(refr, fact::kForm_formID, &id) || id != A.fid ||
+        !Peek(refr, fact::kREFR_baseForm, &base) || !base || base != W.info.acti) {
+        W.drop = true;
+        Log("[TINT] 0x%08X (via %s) is not ours any more (FormID 0x%08X, base %p, pool record %p) -- dropped",
+            A.fid, W.via, id, base, W.info.acti);
+        return;
+    }
+    W.refr = refr;
+    Peek(refr, fact::kForm_formType, &W.type);
+    // The pool record's CURRENT model path: ClaimPool re-points it on every
+    // claim, so a later 3D of this piece may be another victim's file.
+    {
+        const void* ms = nullptr;
+        const char* s = (W.info.acti && Peek(W.info.acti, fact::kACTI_modelStr, &ms) && ms) ? SafeStr(ms) : nullptr;
+        W.model = s ? s : "<unreadable>";
+        W.repointed = !s || _stricmp(s, W.info.rel.c_str()) != 0;
+    }
+    const void* loaded = nullptr; const void* root = nullptr;
+    if (!Peek(refr, fact::kREFR_loadedData, &loaded) || !loaded ||
+        !Peek(loaded, fact::kLoaded_data3D, &root) || !root) {
+        W.drop = true;
+        if (A.tries < 3) {
+            Guard lk(&g_csPlace);
+            g_tintQ.push_back(TintAsk{ A.fid, NowMs() + 100.0, A.got, A.lostSeq, A.recheck, A.tries + 1, A.epoch,
+                                       A.place });
+        } else {
+            Log("[TINT] 0x%08X no 3D on the reference after %d tries -- dropped", A.fid, A.tries + 1);
+        }
+        return;
+    }
+    W.root = root;
+    // F4: a load may have begun since the task's first test; the walk makes
+    // IsA calls, so it does not start past a closed gate.
+    if (TintWalkBlocked(A.epoch)) { W.abort = true; return; }
+    TintWalk(root, 0, W.walk);
+    std::map<const void*, std::size_t> idx;
+    for (const void* g : W.walk.geom) {
+        const void* prop = nullptr; const void* mat = nullptr;
+        if (!Peek(g, fact::kGeom_shaderProperty, &prop) || !prop) continue;
+        if (!Peek(prop, fact::kShadProp_material, &mat) || !mat) continue;
+        auto f = idx.find(mat);
+        if (f != idx.end()) { ++W.seen[f->second].shapes; continue; }
+        idx[mat] = W.seen.size();
+        TintMatSeen S; S.mat = mat; S.prop = prop; S.shapes = 1;
+        W.seen.push_back(S);
+    }
+    // And again before the GetFeature calls on what the walk found.
+    if (TintWalkBlocked(A.epoch)) { W.abort = true; return; }
+    for (auto& S : W.seen) {
+        void* vt = nullptr;
+        if (Peek(S.mat, 0, &vt) && vt) S.vrva = reinterpret_cast<std::uintptr_t>(vt) - g_base;
+        S.vtFT = S.vrva == fact::kVT_MaterialFacegenTint;
+        S.vtFG = S.vrva == fact::kVT_MaterialFacegen;
+        // GetFeature through MatFeature's own guards (vtable bounded to the
+        // image, slot readable), on a material reached from a BSGeometry of a
+        // 3D read this frame -- the route ReadTextures takes on actors.
+        S.feature = MatFeature(S.mat);
+        Peek(S.prop, kTintProbe_propFlags, &S.pf);
+        Peek(S.mat, kTintProbe_matW08, &S.w08);
+        Peek(S.mat, kTintProbe_matW0C, &S.w0C);
+        Peek(S.mat, kTintProbe_matW2C, &S.w2C);
+        if ((S.feature == 5 || S.feature == 6) &&
+            Readable(static_cast<const std::uint8_t*>(S.mat) + fact::kMat_skinTint, 12)) {
+            std::memcpy(S.a0, static_cast<const std::uint8_t*>(S.mat) + fact::kMat_skinTint, 12);
+            S.haveA0 = true;
+        }
+        if (S.vtFT || S.vtFG) S.slot0 = TintLower(TintTexSlot(S.mat, 0));
+        if (S.feature == 4 && S.vtFG) {
+            Peek(S.mat, fact::kMatFG_tintTexture, &S.f4tint);
+            S.slot6 = TintTexSlot(S.mat, 6);
+        }
+        if (S.feature != 4 && S.feature != 5 && S.feature != 6) ++W.otherFeatures[S.feature];
+    }
+}
+
+// Writes three floats into a proven material, re-testing the load gates first.
+static bool TintStore(const void* mat, const float v[3], long epoch)
+{
+    if (Stale(epoch) || HandsOff() || TearingDown()) return false;
+    float* t = reinterpret_cast<float*>(const_cast<std::uint8_t*>(static_cast<const std::uint8_t*>(mat)) + fact::kMat_skinTint);
+    if (!Writable(t, 12)) return false;
+    volatile float* p = t;
+    p[0] = v[0]; p[1] = v[1]; p[2] = v[2];
+    return true;
+}
+
+// Mode-2 gate (review B3): opened for a key (slot-0 texture + property word)
+// once two live pieces wanting DIFFERENT colours have been seen on DIFFERENT
+// material pointers. Caller holds g_csPlace.
+static bool TintGateNote(const std::string& key, u32 fid, unsigned long long place, int lostSeq,
+                         const void* mat, const float want[3])
+{
+    TintGate& G = g_tintGate[key];
+    if (G.open) return true;
+    bool have = false;
+    for (auto& o : G.obs)
+        if (o.fid == fid && o.place == place && o.mat == mat) { o.lostSeq = lostSeq; have = true; }
+    if (!have) {
+        if (G.obs.size() >= 32) G.obs.erase(G.obs.begin());
+        TintGateObs o{ fid, place, lostSeq, mat, { want[0], want[1], want[2] } };
+        G.obs.push_back(o);
+    }
+    for (const auto& o : G.obs) {
+        if (o.fid == fid || o.mat == mat || !TintDiffers(o.want, want)) continue;
+        auto it = g_placedLive.find(o.fid);
+        if (it == g_placedLive.end() || it->second.place != o.place || !it->second.has3D ||
+            it->second.lostSeq != o.lostSeq) continue;
+        if (std::find(it->second.mats.begin(), it->second.mats.end(), o.mat) == it->second.mats.end()) continue;
+        G.open = true; G.byA = o.fid; G.byB = fid;
+        return true;
+    }
+    return false;
+}
+
+// Asks back to the FRONT of the queue, in their order (an ask of a dead
+// timeline is left out). `postNow`: post the task if none is in flight (the
+// walk cap's next task); otherwise the queue is left exactly as a task that met
+// a load leaves it, for TintWatchdog to re-post once the gates open again.
+static unsigned TintHandBack(const std::vector<TintAsk>& asks, bool postNow)
+{
+    if (asks.empty()) return 0;
+    bool post = false; unsigned n = 0;
+    {
+        Guard lk(&g_csPlace);
+        for (auto r = asks.rbegin(); r != asks.rend(); ++r)
+            if (!Stale(r->epoch)) { g_tintQ.push_front(*r); ++n; }
+        if (postNow && n && InterlockedCompareExchange(&g_tintInFlight, 1, 0) == 0) {
+            post = true; g_tintPostedAt = GetTickCount();
+        }
+    }
+    if (post) TintPost();
+    return n;
+}
+// F4: a gate closed before a walk. The task stops; every ask not dropped on
+// its own merits (and every ask set back for the walk cap) goes back.
+static void TintStopTask(const std::vector<TintWork>& work)
+{
+    std::vector<TintAsk> back;
+    for (const auto& W : work) if (!W.drop || W.back) back.push_back(W.ask);
+    const unsigned n = TintHandBack(back, false);
+    if (TintSay())
+        Log("[TINT] a load began (or failed) during the colour task -- stopped before a walk; %u ask(s) back in the queue",
+            n);
+}
+
+static void TintRunBody(void*);
+static void TintRun(void* self) { GuardedTask("TintRun", TintRunBody, self); }
+static void TintRunBody(void*)
+{
+    ForgetMemory();
+    static volatile long saidThread = 0;
+    if (InterlockedExchange(&saidThread, 1) == 0)
+        Log("[TINT] the colour task runs on thread %lu", GetCurrentThreadId());
+    // During a load nothing is touched; the asks and the in-flight flag stay
+    // for TintWatchdog to re-post once the gates open again.
+    if (LoadScreenUp() || HandsOff() || TearingDown()) return;
+    std::vector<TintWork> work;
+    bool repost = false;
+    {
+        Guard lk(&g_csPlace);
+        const double now = NowMs();
+        for (auto it = g_tintQ.begin(); it != g_tintQ.end() && work.size() < 6; ) {
+            if (it->due <= now) { TintWork w; w.ask = *it; work.push_back(std::move(w)); it = g_tintQ.erase(it); }
+            else ++it;
+        }
+        for (const auto& a : g_tintQ) if (a.due <= now) { repost = true; break; }
+        // Due asks left: the flag stays up and the task is posted again (next
+        // frame). None due: the flag comes down and the ticker posts later asks.
+        if (repost) g_tintPostedAt = GetTickCount();
+        else InterlockedExchange(&g_tintInFlight, 0);
+    }
+    if (repost) TintPost();
+    if (work.empty()) return;
+    // F4: every piece walk re-tests the gates first; a closed gate stops the task.
+    for (auto& W : work) {
+        TintPrepare(W);
+        if (W.abort) { TintStopTask(work); return; }
+    }
+
+    // THE ACTOR SET (reviews B2, F3, F6). Under g_csBodies only plain copies
+    // are made and no engine memory is read; the bodies' tex[0] are compared
+    // with the pieces' slot-0 paths (lower-cased once, in TintPrepare)
+    // case-insensitively, with no allocation. Outside the lock, a body counts
+    // as current only by the full test RecheckParkedBody uses (root, shape
+    // count and the identity mix of a walk of the root read this frame); only
+    // a current body's skin and face materials are read, by Peek, never by a
+    // call.
+    std::set<u32> want;
+    std::vector<std::string> slot0v;         // the task's FacegenTint slot-0 paths, at most 64 (one bit each)
+    for (auto& W : work) {
+        if (W.drop) continue;
+        want.insert(u32(W.info.victim));
+        for (const auto& S : W.seen) {
+            if (!S.vtFT || S.slot0.empty()) continue;
+            std::size_t k = 0;
+            while (k < slot0v.size() && slot0v[k] != S.slot0) ++k;
+            if (k == slot0v.size()) {
+                if (slot0v.size() >= 64) { W.slotOver = true; continue; }
+                slot0v.push_back(S.slot0);
+            }
+            W.slotMask |= std::uint64_t(1) << k;
+        }
+    }
+    std::vector<TintBodySnap> bodies;
+    std::uint64_t cutMask = 0;               // slot-0 paths of qualifying bodies past the copy cap (F3)
+    if (!want.empty()) {
+        bodies.reserve(kTintBodyCopy + 8);
+        Guard lk(&g_csBodies);
+        // Victims first, every one (a task holds at most six asks), then the
+        // bodies whose skin or face tex[0] equals one of the slot-0 paths, up
+        // to eight in all. A sharer past the cap is not copied, but the paths
+        // it matches are noted: every pass with one of them is incomplete.
+        for (int pass = 0; pass < 2; ++pass)
+        for (const auto& kv : g_bodies) {
+            const Body& B = kv.second;
+            if (!B.live) continue;
+            const bool isVictim = want.count(kv.first) != 0;
+            if ((pass == 0) != isVictim) continue;
+            std::uint64_t mask = 0;
+            if (!slot0v.empty())
+                for (const auto& S : B.shapes) {
+                    if (!(S.isSkin || S.face) || S.tex.empty()) continue;
+                    for (std::size_t k = 0; k < slot0v.size(); ++k)
+                        if (TintEqLower(S.tex[0], slot0v[k])) mask |= std::uint64_t(1) << k;
+                }
+            if (!isVictim && !mask) continue;
+            if (!isVictim && bodies.size() >= kTintBodyCopy) { cutMask |= mask; continue; }
+            TintBodySnap T; T.fid = kv.first; T.root = B.root; T.nGeom = B.nGeom; T.walkMix = B.walkMix;
+            T.tint[0] = B.tint[0]; T.tint[1] = B.tint[1]; T.tint[2] = B.tint[2]; T.hasTint = B.hasTint;
+            T.slotMask = mask;
+            for (const auto& S : B.shapes)
+                if (S.isSkin || S.face) T.geoms.push_back(S.geom);
+            bodies.push_back(std::move(T));
+        }
+    }
+    // A body concerns a pass when it is that pass's victim or shares one of
+    // its slot-0 paths.
+    auto interest = [](const TintWork& W, const TintBodySnap& T) {
+        return T.fid == u32(W.info.victim) || (T.slotMask & W.slotMask) != 0;
+    };
+    // THE WALKS (F6): at most four per task, for the passes in order. A pass
+    // whose unwalked bodies of interest fit the walks left gets them. One that
+    // a fresh task could walk completely, but this one cannot, goes back to
+    // the queue for the next task. Otherwise it takes the walks left, and the
+    // bodies it could not walk make it INCOMPLETE below, never complete.
+    std::map<const void*, u32> actorMats;
+    int walks = 0;
+    for (auto& W : work) {
+        if (W.drop) continue;
+        int total = 0;
+        std::vector<std::size_t> need;
+        for (std::size_t b = 0; b < bodies.size(); ++b) {
+            if (!interest(W, bodies[b])) continue;
+            ++total;
+            if (bodies[b].state == 0) need.push_back(b);
+        }
+        if (int(need.size()) > kTintActorWalks - walks && total <= kTintActorWalks && walks > 0) {
+            W.drop = true; W.back = true; ++g_tintTally.deferred;
+            continue;
+        }
+        for (std::size_t b : need) {
+            if (walks >= kTintActorWalks) break;
+            // F4: the walk below makes IsA calls on their tree.
+            if (TintWalkBlocked(W.ask.epoch)) { TintStopTask(work); return; }
+            ++walks;
+            TintBodySnap& T = bodies[b];
+            void* refr = LookupForm(T.fid, fact::kFormType_ACHR);
+            const void* loaded = nullptr; const void* root = nullptr;
+            if (!refr || !Peek(refr, fact::kREFR_loadedData, &loaded) || !loaded ||
+                !Peek(loaded, fact::kLoaded_data3D, &root) || !root) { T.state = 3; continue; }
+            if (root != T.root) { T.state = 2; continue; }
+            std::uint64_t ids = 0;
+            const int count = WalkQuiet(root, &ids);
+            if (count != T.nGeom || (count <= kMaxShapes && ids != T.walkMix)) { T.state = 2; continue; }
+            T.state = 1;
+            for (const void* g : T.geoms) {
+                const void* m = MaterialOf(g);
+                if (!m) continue;
+                T.mats.push_back(m);
+                if (!T.firstMat) {
+                    T.firstMat = m;
+                    const void* prop = nullptr;
+                    if (Peek(g, fact::kGeom_shaderProperty, &prop) && prop) Peek(prop, kTintProbe_propFlags, &T.pf);
+                }
+                actorMats.emplace(m, T.fid);
+            }
+        }
+    }
+    {
+        // The passes set back for the walk cap: first in the queue, and the
+        // next task is posted now if none is in flight.
+        std::vector<TintAsk> back;
+        for (const auto& W : work) if (W.back) back.push_back(W.ask);
+        TintHandBack(back, true);
+    }
+
+    for (auto& W : work) {
+        if (W.drop) continue;
+        TintAsk& A = W.ask;
+        PlacedInfo& I = W.info;
+        // Step 7: the 3D must still be the one walked.
+        {
+            const void* loaded = nullptr; const void* root = nullptr;
+            if (!Peek(W.refr, fact::kREFR_loadedData, &loaded) || !loaded ||
+                !Peek(loaded, fact::kLoaded_data3D, &root) || root != W.root) {
+                Log("[TINT] 0x%08X 3D replaced during the pass -- nothing written; the new 3D brings its own pass", A.fid);
+                continue;
+            }
+        }
+        // Bodies of interest that could not be proven current: their
+        // materials are not in the actor set, so no write may rely on it.
+        // INCOMPLETE (F3, F6) is the same for bodies never examined: a sharer
+        // past the copy cap, one past the walk cap, or a slot-0 path that did
+        // not fit the task's list.
+        u32 staleBody = 0;
+        bool incomplete = W.slotOver || (cutMask & W.slotMask) != 0;
+        for (const auto& T : bodies) {
+            if (!interest(W, T)) continue;
+            if (T.state == 2 && !staleBody) staleBody = T.fid;
+            if (T.state == 0) incomplete = true;
+        }
+        const float want3[3] = { I.tint[0], I.tint[1], I.tint[2] };
+        int nf5 = 0, nAcc = 0;
+        for (auto& S : W.seen) {
+            if (S.feature != 5) continue;
+            ++nf5;
+            S.acc = TintAccessoryVerdict(I.accTex0, I.skinTex0, S.slot0);
+            if (S.acc) ++nAcc;
+        }
+        const bool quiet = InterlockedCompareExchange(&g_tintLines, 0, 0) >= 3000;
+        ++g_tintTally.passes;
+        if (A.recheck) ++g_tintTally.checks;
+        if (!quiet) {
+            std::string other;
+            for (const auto& kv : W.otherFeatures) {
+                char b[32]; std::snprintf(b, sizeof(b), "%sf%d x%d", other.empty() ? "" : " ", kv.first, kv.second);
+                other += b;
+            }
+            // Only on a piece with accessory textures (FT col 2 = 2), at the very end:
+            // why the f5 count can exceed the skin-tint blocks forged.
+            char accb[96] = "";
+            if (!I.accTex0.empty())
+                std::snprintf(accb, sizeof(accb), "; %d f5 set aside as feature-5 accessory (%u accessory texture(s))",
+                              nAcc, unsigned(I.accTex0.size()));
+            Log("[TINT] 0x%08X %s wound %ld victim 0x%08X %s#%d +%.0f ms: want (%.1f,%.1f,%.1f), ref via %s,"
+                " type %u, 3D %p, %d node(s), %d geom, %d skin-tint block(s) forged, %d f5 mat(s),"
+                " other features [%s], model now %s%s%s%s", A.fid, I.rel.c_str(), I.seq, u32(I.victim),
+                A.recheck ? "CHECK" : "GOT", A.got, NowMs() - I.when,
+                want3[0] * 255.0f, want3[1] * 255.0f, want3[2] * 255.0f, W.via, unsigned(W.type), W.root,
+                W.walk.nodes, W.walk.geoms, I.skinBlocks, nf5, other.c_str(), W.model.c_str(),
+                W.repointed ? " (RE-POINTED: not this piece's file)" : "",
+                I.hasTint ? "" : " (no tint forged)", accb);
+        }
+        std::vector<const void*> ftMats;
+        for (auto& S : W.seen) {
+            if (S.feature == 4 || S.feature == 6) {
+                // Read-only (face review M1, M2): never written.
+                if (!quiet) {
+                    InterlockedIncrement(&g_tintLines);
+                    if (S.feature == 6)
+                        Log("[TINT]   0x%08X m %p f6 vt +0x%08llX shapes %d pf %016llX +0xA0 %s(%g,%g,%g) read-only",
+                            A.fid, S.mat, (unsigned long long)S.vrva, S.shapes, (unsigned long long)S.pf,
+                            S.haveA0 ? "" : "unreadable ", S.a0[0], S.a0[1], S.a0[2]);
+                    else {
+                        // The vtable is one token (conformance M2): Facegen, or its RVA.
+                        char vt4[24];
+                        if (S.vtFG) std::snprintf(vt4, sizeof(vt4), "Facegen");
+                        else std::snprintf(vt4, sizeof(vt4), "+0x%08llX", (unsigned long long)S.vrva);
+                        Log("[TINT]   0x%08X m %p f4 vt %s shapes %d pf %016llX tintTexture %s slot6 '%s' read-only",
+                            A.fid, S.mat, vt4, S.shapes, (unsigned long long)S.pf,
+                            !S.vtFG ? "not read" : S.f4tint ? "non-null" : "null", S.slot6.c_str());
+                    }
+                }
+                continue;
+            }
+            if (S.feature != 5) continue;
+            if (S.acc) ++g_tintTally.accessory;   // set aside below: not one of their skin-tint materials
+            else ++g_tintTally.mats;
+            char vtb[24];
+            if (S.vtFT) std::snprintf(vtb, sizeof(vtb), "FacegenTint");
+            else std::snprintf(vtb, sizeof(vtb), "+0x%08llX", (unsigned long long)S.vrva);
+            const char* verdict = "";
+            char detail[200] = "";
+            std::size_t dl = 0;
+            auto add = [&](const char* fmt, auto... a) {
+                if (dl < sizeof(detail)) {
+                    int k = std::snprintf(detail + dl, sizeof(detail) - dl, fmt, a...);
+                    if (k > 0) dl += std::size_t(k);
+                }
+            };
+            // `before` is +0xA0 NOW, read as `after` is, not S.a0: an earlier
+            // pass of this task may have written or restored it since
+            // TintPrepare read S.a0, and every test below asks what is there.
+            float before[3] = { S.a0[0], S.a0[1], S.a0[2] };
+            const bool haveNow = S.haveA0 && Readable(static_cast<const std::uint8_t*>(S.mat) + fact::kMat_skinTint, 12);
+            if (haveNow) std::memcpy(before, static_cast<const std::uint8_t*>(S.mat) + fact::kMat_skinTint, 12);
+            if (S.vtFT) ftMats.push_back(S.mat);      // what this 3D holds, whatever the verdict
+            // A feature-5 accessory of this piece (or one that cannot be told from
+            // one): logged, and nothing below -- no owner record, no gate, no write.
+            if (S.acc) { verdict = S.acc; }
+            else if (!S.vtFT) { verdict = "NOT-FACEGENTINT"; ++g_tintTally.notft; }
+            else if (!haveNow) {
+                verdict = "UNWRITABLE"; ++g_tintTally.unwritable;
+                add(S.haveA0 ? " (+0xA0 unreadable now)" : " (+0xA0 unreadable)");
+            }
+            else if (actorMats.count(S.mat)) {
+                verdict = "SHARED-ACTOR"; ++g_tintTally.shared;
+                add(" 0x%08X", actorMats[S.mat]);
+            } else {
+                Guard lk(&g_csPlace);
+                auto pit = g_placedLive.find(A.fid);
+                const bool ours = pit != g_placedLive.end() && pit->second.place == A.place &&
+                                  pit->second.got == A.got && pit->second.has3D && pit->second.lostSeq == A.lostSeq;
+                std::string key = S.slot0 + "|";
+                { char b[20]; std::snprintf(b, sizeof(b), "%016llX", (unsigned long long)S.pf); key += b; }
+                // A re-pointed piece's 3D may be another file: its `want` is no
+                // evidence for the gate, and nothing is written or restored for it.
+                const bool gate = ours && !W.repointed && I.hasTint &&
+                                  TintGateNote(key, A.fid, A.place, A.lostSeq, S.mat, want3);
+                auto it = g_tintMats.find(S.mat);
+                // The owner is this piece only by the PAIR (FormID, placement) (F5).
+                const bool mine = it != g_tintMats.end() && it->second.owner == A.fid &&
+                                  it->second.ownerPlace == A.place;
+                if (!ours) { verdict = "LOST-DURING-PASS"; }
+                else if (it != g_tintMats.end() && it->second.shared) { verdict = "SHARED-KNOWN"; ++g_tintTally.shared; }
+                else {
+                    bool sharedPiece = false;
+                    // F2: the live truth alone -- the owner placement still has
+                    // 3D and its last pass found this material in it (`mats` is
+                    // cleared on lost). `ownerGone` is not consulted here.
+                    if (it != g_tintMats.end() && !mine) {
+                        auto o = g_placedLive.find(it->second.owner);
+                        const bool holds = o != g_placedLive.end() && o->second.place == it->second.ownerPlace &&
+                            o->second.has3D &&
+                            std::find(o->second.mats.begin(), o->second.mats.end(), S.mat) != o->second.mats.end();
+                        if (holds) {
+                            TintMat& T = it->second; T.shared = true; sharedPiece = true;
+                            bool restored = false;
+                            // `before` is the value now (above): a write by an earlier
+                            // pass of this task is restored too.
+                            if (g_cfg.pieceTint >= 2 && !W.repointed && T.written && !TintDiffers(before, T.wrote))
+                                restored = TintStore(S.mat, T.orig, A.epoch);
+                            verdict = "SHARED-PIECE"; ++g_tintTally.shared;
+                            if (restored) ++g_tintTally.restored;
+                            add(" 0x%08X (wound %ld)%s", T.owner, o->second.seq, restored ? " RESTORED" : "");
+                        }
+                    }
+                    if (!sharedPiece) {
+                        if (it == g_tintMats.end()) {
+                            if (g_tintMats.size() >= 4096) {
+                                auto victimIt = g_tintMats.end();
+                                for (auto e = g_tintMats.begin(); e != g_tintMats.end(); ++e)
+                                    if (e->second.ownerGone && (victimIt == g_tintMats.end() || e->second.seq < victimIt->second.seq)) victimIt = e;
+                                if (victimIt == g_tintMats.end())
+                                    for (auto e = g_tintMats.begin(); e != g_tintMats.end(); ++e)
+                                        if (victimIt == g_tintMats.end() || e->second.seq < victimIt->second.seq) victimIt = e;
+                                if (victimIt != g_tintMats.end()) g_tintMats.erase(victimIt);
+                            }
+                            TintMat T; T.owner = A.fid; T.ownerPlace = A.place; T.rel = I.rel; T.seq = ++g_tintMatSeq;
+                            std::memcpy(T.orig, before, 12);
+                            it = g_tintMats.emplace(S.mat, T).first;
+                            add(" new");
+                        } else if (!mine) {
+                            // Reclaimed: the same ADDRESS. It is the same object only if
+                            // FleshCore's written value is still there AND that value is not
+                            // what this piece's own file carries (same wound, same tint
+                            // proves nothing).
+                            TintMat& T = it->second;
+                            const bool same = T.written && !TintDiffers(before, T.wrote) && TintDiffers(T.wrote, want3);
+                            add(" reclaimed from 0x%08X (%s, same address, %s)", T.owner, T.rel.c_str(),
+                                same ? "same object: our value still there" : "not proven the same object");
+                            if (!same) { std::memcpy(T.orig, before, 12); T.written = false; }
+                            T.owner = A.fid; T.ownerPlace = A.place; T.ownerGone = false; T.rel = I.rel;
+                        }
+                        TintMat& T = it->second;
+                        // F2: this piece (ours: 3D now, this lostSeq) holds the
+                        // material again, so its owner is not gone.
+                        T.ownerGone = false;
+                        if (std::find(I.prevMats.begin(), I.prevMats.end(), S.mat) != I.prevMats.end())
+                            add(" kept-from-previous-3D (same address)");
+                        if (A.recheck && T.written) {
+                            if (!TintDiffers(before, T.wrote)) { verdict = "HELD"; ++g_tintTally.held; }
+                            else if (pit->second.rewrites < 1 && g_cfg.pieceTint >= 2 && gate && !staleBody &&
+                                     !incomplete && !W.repointed &&
+                                     TintStore(S.mat, want3, A.epoch)) {
+                                ++pit->second.rewrites; verdict = "REWROTE"; ++g_tintTally.rewrote;
+                            } else { verdict = "RESET"; ++g_tintTally.reset; }
+                            add(" w2C at write %08X", T.w2cAtWrite);
+                        } else if (!TintDiffers(before, want3)) { verdict = "RIGHT"; ++g_tintTally.right; }
+                        else if (W.repointed) {
+                            verdict = "RE-POINTED"; ++g_tintTally.repointed;
+                            add(" (model now %s)", W.model.c_str());
+                        }
+                        else if (!I.hasTint) { verdict = "NO-TINT"; }
+                        else if (g_cfg.pieceTint < 2) {
+                            verdict = "WOULD-WRITE"; ++g_tintTally.would;
+                            if (staleBody) add(" actor-set-incomplete(stale body 0x%08X)", staleBody);
+                            if (incomplete) add(" actor-set-incomplete(cap)");
+                        }
+                        else if (staleBody) { verdict = "SHARED-ACTOR-STALE-BODY"; ++g_tintTally.staleBody; add(" 0x%08X", staleBody); }
+                        else if (incomplete) { verdict = "SHARED-ACTOR-INCOMPLETE"; ++g_tintTally.incomplete; }
+                        else if (!gate) { verdict = "GATE-CLOSED"; ++g_tintTally.gateClosed; }
+                        else if (!TintStore(S.mat, want3, A.epoch)) { verdict = "UNWRITABLE"; ++g_tintTally.unwritable; }
+                        else {
+                            T.written = true; std::memcpy(T.wrote, want3, 12); T.w2cAtWrite = S.w2C;
+                            verdict = "WROTE"; ++g_tintTally.wrote;
+                        }
+                    }
+                }
+                {
+                    const TintGate& G = g_tintGate[key];
+                    if (G.open) add(" gate open (0x%08X/0x%08X)", G.byA, G.byB);
+                    else add(" gate closed");
+                }
+            }
+            float after[3] = { before[0], before[1], before[2] };
+            if (haveNow && Readable(static_cast<const std::uint8_t*>(S.mat) + fact::kMat_skinTint, 12))
+                std::memcpy(after, static_cast<const std::uint8_t*>(S.mat) + fact::kMat_skinTint, 12);
+            if (!quiet) {
+                InterlockedIncrement(&g_tintLines);
+                // +0xA0 unreadable: before and after are (-,-,-), never numbers (conformance m1).
+                char bb[64] = "(-,-,-)", ab[64] = "(-,-,-)";
+                if (haveNow) {
+                    std::snprintf(bb, sizeof(bb), "(%.1f,%.1f,%.1f)", before[0] * 255.0f, before[1] * 255.0f, before[2] * 255.0f);
+                    std::snprintf(ab, sizeof(ab), "(%.1f,%.1f,%.1f)", after[0] * 255.0f, after[1] * 255.0f, after[2] * 255.0f);
+                }
+                // On a piece with accessory textures only, the slot 0 the verdict was
+                // decided on ends the line ('' = not read).
+                Log("[TINT]   0x%08X m %p f%d vt %s shapes %d pf %016llX w08 %u w0C %g w2C %08X"
+                    " before %s after %s %s%s%s%s%s",
+                    A.fid, S.mat, S.feature, vtb, S.shapes, (unsigned long long)S.pf, S.w08, double(S.w0C), S.w2C,
+                    bb, ab, verdict, detail, I.accTex0.empty() ? "" : " slot0 '",
+                    I.accTex0.empty() ? "" : S.slot0.c_str(), I.accTex0.empty() ? "" : "'");
+            }
+        }
+        // Their body: the stored tint, and Peek-only pointers when current.
+        if (!quiet) {
+            const TintBodySnap* T = nullptr;
+            for (const auto& b : bodies) if (b.fid == u32(I.victim)) { T = &b; break; }
+            if (!T)
+                Log("[TINT]   0x%08X their body 0x%08X: not in the registry", A.fid, u32(I.victim));
+            else if (T->state == 1)
+                Log("[TINT]   0x%08X their body: m %p tint (%.1f,%.1f,%.1f) pf %016llX (stored tint%s, current)",
+                    A.fid, T->firstMat, T->tint[0] * 255.0f, T->tint[1] * 255.0f, T->tint[2] * 255.0f,
+                    (unsigned long long)T->pf, T->hasTint ? "" : ", none read");
+            else
+                Log("[TINT]   0x%08X their body 0x%08X: stored tint (%.1f,%.1f,%.1f)%s, %s -- materials not read",
+                    A.fid, u32(I.victim), T->tint[0] * 255.0f, T->tint[1] * 255.0f, T->tint[2] * 255.0f,
+                    T->hasTint ? "" : " (none read)",
+                    T->state == 2 ? "stale (re-dressed or rebuilt)" : T->state == 3 ? "no 3D now" : "not walked (walk cap)");
+        }
+        // Step 9: record, and the re-check one second on.
+        {
+            Guard lk(&g_csPlace);
+            auto pit = g_placedLive.find(A.fid);
+            if (pit != g_placedLive.end() && pit->second.place == A.place && pit->second.got == A.got &&
+                pit->second.lostSeq == A.lostSeq) {
+                pit->second.mats = ftMats;
+                pit->second.root = W.root;
+                if (!A.recheck)
+                    g_tintQ.push_back(TintAsk{ A.fid, NowMs() + 1000.0, A.got, A.lostSeq, true, 0, A.epoch, A.place });
+            }
+        }
+        if (g_tintTally.passes % 25 == 0) {
+            const TintTally& t = g_tintTally;
+            Log("[TINT] tally: %ld passes, %ld skin-tint mats: %ld written, %ld right, %ld would-write, %ld shared"
+                " (%ld restored), %ld not FacegenTint, %ld unwritable, %ld re-pointed, %ld stale-body,"
+                " %ld incomplete-set, %ld gate-closed; re-checks %ld: %ld held, %ld rewrote, %ld reset;"
+                " %ld set back (walk cap); %ld feature-5 accessory mat(s) set aside",
+                t.passes, t.mats, t.wrote, t.right, t.would, t.shared, t.restored, t.notft, t.unwritable,
+                t.repointed, t.staleBody, t.incomplete, t.gateClosed, t.checks, t.held, t.rewrote, t.reset,
+                t.deferred, t.accessory);
+        }
+    }
 }
 
 static void PlaceEnqueue(PlaceJob&& job)
@@ -23408,9 +25774,14 @@ static void PlaceOne(PlaceJob& PJ, PlacePiece& P, void* victimRefr, const void* 
         rot.y, code, P.section ? ", section" : ", shard", PJ.kick, PJ.mark, cell, ws,
         invalidHandle, m1 - m0, after[0], after[1], after[2], aang[0], aang[1], aang[2], "");
     P.refID = fid;
+    // U9 for the colour read-back (S column 3 only), before the entry below
+    // exists, so before any colour ask for this piece can; no lock is held.
+    if (g_cfg.pieceTint >= 1) TintNoteFormMap(fid, refr);
     {
         Guard lk(&g_csPlace);
-        g_placedLive[fid] = PlacedInfo{ NowMs(), false };   // counted once its 3D arrives
+        // counted once its 3D arrives; `place` tells this placement from an
+        // earlier one that had the same (reused) FormID
+        g_placedLive[fid] = PlacedInfo(NowMs(), PJ, P, acti, ++g_placeSerial);
     }
 }
 
@@ -23420,6 +25791,10 @@ static void PlaceRunBody(void*)
 {
     ForgetMemory();
     const double t0 = NowMs();
+    // Shards go onto the engine a frame before sections, so small shards never
+    // wait in the same frame's 3D-load batch behind a large skinned section.
+    bool framePlacedShard   = false;
+    bool framePlacedSection = false;
     for (;;) {
         PlaceJob* PJ = nullptr;
         {
@@ -23442,7 +25817,7 @@ static void PlaceRunBody(void*)
         if (!g_placeSaid) {
             g_placeSaid = true;
             Log("[PLACE] the engine is placing pieces on thread %lu (the game's thread; the data"
-                " loaded on thread %lu), %d per frame",
+                " loaded on thread %lu), %d per frame, shards a frame before sections",
                 (unsigned long)GetCurrentThreadId(), (unsigned long)g_mainThread, g_cfg.placePerFrame);
         }
         void* victimRefr = LookupForm(u32(PJ->victim), fact::kFormType_ACHR);
@@ -23454,10 +25829,17 @@ static void PlaceRunBody(void*)
         int placedNow = 0;
         while (PJ->next < PJ->pieces.size() && PJ->next < PJ->engineCount &&
                placedNow < g_cfg.placePerFrame) {
-            if (victimRefr) PlaceOne(*PJ, PJ->pieces[PJ->next], victimRefr, root);
-            else if (PJ->next == 0)
+            const bool isSect = PJ->pieces[PJ->next].section;
+            if (victimRefr && ((isSect && framePlacedShard) || (!isSect && framePlacedSection)))
+                break;
+            if (victimRefr) {
+                PlaceOne(*PJ, PJ->pieces[PJ->next], victimRefr, root);
+                if (isSect) framePlacedSection = true;
+                else        framePlacedShard   = true;
+            } else if (PJ->next == 0) {
                 Log("    [PLACE] victim 0x%08X is not a loaded actor -- the script places this wound",
                     u32(PJ->victim));
+            }
             ++PJ->next;
             ++placedNow;
         }
@@ -23555,6 +25937,7 @@ static void RetireAcrossLoad(const char* why)
         wounds = int(g_placeQ.size());
         g_placeQ.clear();
         g_placedLive.clear();            // the pieces belong to the timeline being left
+        TintForgetAllLocked();           // and so do their colour asks and material notes
         // The placer's task, if one is queued, finds nothing and clears the flag
         // itself; if the load dropped the task, the flag must not stay up.
         InterlockedExchange(&g_placeInFlight, 0);
@@ -24600,8 +26983,6 @@ static bool IsMutableRuntimeSubtree(const char* relLower, std::size_t len)
         std::strncmp(relLower, "mcm\\settings", 12) == 0 ||
         std::strncmp(relLower, "mcmrecorder", 11) == 0 ||
         std::strncmp(relLower, "skse\\plugins\\storageutildata", 28) == 0 ||
-        std::strncmp(relLower, "skse\\plugins\\skyrimnet\\custom_logs", 35) == 0 ||
-        std::strncmp(relLower, "skse\\plugins\\skyrimnet\\cache", 30) == 0 ||
         std::strncmp(relLower, "skse\\plugins\\skyrimnet\\prompts\\_saves", 37) == 0 ||
         std::strncmp(relLower, "skse\\plugins\\skyrimnet\\data", 27) == 0 ||
         std::strncmp(relLower, "skse\\plugins\\skyrimnet\\screenshots", 34) == 0) {

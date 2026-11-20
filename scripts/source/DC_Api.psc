@@ -37,11 +37,36 @@ Scriptname DC_Api Hidden
  failing whole.}
 
 ; ---- kinds ---------------------------------------------------------------
+;
+; BLOOD is the one kind built in. Another mod can add kinds of its own (1-7) with
+; RegisterKind, handing over the same set of records blood has; every call below
+; that takes a kind then marks with them. A kind nobody registered marks nothing.
 Int Function BLOOD() global
     Return 0
 EndFunction
-Int Function ALT() global
-    Return 1
+
+Bool Function RegisterKind(Int kind, FormList setsS, FormList setsM, FormList setsL, \
+                           EffectShader coat, FormList skinCoat, String skinStem) global
+    {Add a kind of mark, or refresh one. setsS / setsM / setsL: the impact sets
+     per size, a random member of the list per cast. coat: the flat-atlas shader
+     Coat plays. skinCoat: the body-UV shaders CoatSkin plays, lightest first.
+     skinStem: the overlay art under textures\DecalCore\, variant v being
+     skinStem + v + ".dds" for v 0-5. Kept in the save; call it again on every
+     load. False if DecalCore did not answer or the kind is out of range.}
+    DC_Core c = Core()
+    If c == None
+        Return false
+    EndIf
+    Return c.RegisterKind(kind, setsS, setsM, setsL, coat, skinCoat, skinStem)
+EndFunction
+
+Bool Function HasKind(Int kind) global
+    {Is this kind blood, or one something registered?}
+    DC_Core c = Core()
+    If c == None
+        Return false
+    EndIf
+    Return c.HasKind(kind)
 EndFunction
 
 ; ---- sizes ---------------------------------------------------------------
@@ -230,8 +255,8 @@ Int Function MarkOn(Actor who) global
      FleshCore works to keep short. Thirty calls in it to
      answer the same question five times would be a poor trade.
 
-     Kind is taken from the heaviest layer, so a target hit with both wears
-     whichever fluid was applied deepest.}
+     Kind is taken from the heaviest layer, so a target marked with more than
+     one kind wears whichever was applied deepest.}
     If who == None || !PaintReady()
         Return -1
     EndIf
@@ -241,23 +266,27 @@ Int Function MarkOn(Actor who) global
     EndIf
     Int best = -1
     Int bestKind = -1
+    Int top = c.TopKind()
     Int n = LayerCount(BODY())
     Int i = 0
     While i < n
         String cur = NiOverride.GetNodePropertyString(who, false, NodeName(BODY(), i), 9, 0)
         Int v = 0
         While v < c.SkinVariants
-            If cur == c.SkinFor(0, v)
-                If v > best
-                    best = v
-                    bestKind = 0
+            ; A layer holds one texture, so the first kind it matches is the only
+            ; one: the kind loop stops there.
+            Int k = 0
+            While k <= top
+                If c.HasKind(k) && cur == c.SkinFor(k, v)
+                    If v > best
+                        best = v
+                        bestKind = k
+                    EndIf
+                    k = top + 1
+                Else
+                    k += 1
                 EndIf
-            ElseIf cur == c.SkinFor(1, v)
-                If v > best
-                    best = v
-                    bestKind = 1
-                EndIf
-            EndIf
+            EndWhile
             v += 1
         EndWhile
         i += 1
@@ -299,10 +328,7 @@ Bool Function CoatSkin(ObjectReference what, Int kind, Int level) global
     If c == None
         Return false
     EndIf
-    FormList l = c.SkinCoatBlood
-    If kind == 1
-        l = c.SkinCoatAlt
-    EndIf
+    FormList l = c.SkinCoatFor(kind)
     If l == None || l.GetSize() < 1
         Return false
     EndIf
@@ -356,10 +382,7 @@ Bool Function Coat(ObjectReference what, Int kind) global
     If c == None
         Return false
     EndIf
-    EffectShader sh = c.CoatBlood
-    If kind == 1
-        sh = c.CoatAlt
-    EndIf
+    EffectShader sh = c.CoatFor(kind)
     If sh == None
         Return false
     EndIf
@@ -377,7 +400,7 @@ Function Uncoat(ObjectReference what, Int kind) global
      until it is stopped or its reference unloads. That is right for a shard
      that exists for forty-five seconds and wrong for a target who is put back
      on their feet: in testing, restored targets were still covered in
-     alt, and there was no call in this file that could have
+     marks, and there was no call in this file that could have
      removed it.
 
      EVERY MEMBER OF THE LIST, NOT THE ONE THAT WAS PLAYED. CoatSkin picks a
@@ -387,10 +410,10 @@ Function Uncoat(ObjectReference what, Int kind) global
      a shader that is not playing on that reference is the engine being asked
      to do nothing, and three of those cost less than the bookkeeping would.
 
-     THE TWO LISTS ARE THE ONES DC_Core HOLDS. the two SkinCoat lists are
-     the body-UV coats for shards (DC_Core.psc) and the two Coat shaders
-     are the flat atlas coats for everything else (DC_Core.psc); a
-     reference may be wearing either, so both come off.}
+     BOTH OF THE KIND'S COATS. Its SkinCoat list holds the body-UV coats for
+     shards and its Coat shader is the flat atlas coat for everything else
+     (DC_Core.psc); a reference may be wearing either, so both come off.
+     UncoatAll does this for every kind there is.}
     If what == None
         Return
     EndIf
@@ -398,12 +421,8 @@ Function Uncoat(ObjectReference what, Int kind) global
     If c == None
         Return
     EndIf
-    FormList l = c.SkinCoatBlood
-    EffectShader sh = c.CoatBlood
-    If kind == 1
-        l = c.SkinCoatAlt
-        sh = c.CoatAlt
-    EndIf
+    FormList l = c.SkinCoatFor(kind)
+    EffectShader sh = c.CoatFor(kind)
     If l != None
         Int n = l.GetSize()
         Int i = 0
@@ -418,6 +437,26 @@ Function Uncoat(ObjectReference what, Int kind) global
     If sh != None
         sh.Stop(what)
     EndIf
+EndFunction
+
+Function UncoatAll(ObjectReference what) global
+    {Uncoat for every kind there is: blood and each registered kind. For a target
+     who is put back on their feet, who may have been marked with any of them.}
+    If what == None
+        Return
+    EndIf
+    DC_Core c = Core()
+    If c == None
+        Return
+    EndIf
+    Int top = c.TopKind()
+    Int k = 0
+    While k <= top
+        If c.HasKind(k)
+            Uncoat(what, k)
+        EndIf
+        k += 1
+    EndWhile
 EndFunction
 
 ObjectReference Function RandomClutter(ObjectReference near, Float radius) global
@@ -527,6 +566,12 @@ Int Function Paint(Actor who, Int kind, Int area, Float alpha) global
     EndIf
     DC_Core c = Core()
     If c == None
+        Return -1
+    EndIf
+    ; A KIND NOBODY REGISTERED HAS NO ART, so there is nothing to paint -- and
+    ; nothing below may touch their overlays for it.
+    If !c.HasKind(kind)
+        Debug.Trace("[DecalCore] Paint: kind " + kind + " is not registered -- nothing painted")
         Return -1
     EndIf
 
@@ -782,18 +827,23 @@ EndFunction
 Int Function VariantOf(DC_Core c, String tex) global
     {Which of DecalCore's overlay variants is this layer wearing, or -1 for none.
 
-     Asked against every variant of BOTH kinds, because a layer holding blood
-     and a layer holding alt are equally DecalCore's and equally in the way. The
-     number is what lets Paint promote the sparsest layer rather than rewrite
-     an arbitrary one with what it already had.}
+     Asked against every variant of EVERY kind, because a layer holding one
+     kind is as much DecalCore's, and as much in the way, as a layer holding
+     another. The number is what lets Paint promote the sparsest layer rather
+     than rewrite an arbitrary one with what it already had.}
     If tex == ""
         Return -1
     EndIf
+    Int top = c.TopKind()
     Int v = 0
     While v < c.SkinVariants
-        If tex == c.SkinFor(0, v) || tex == c.SkinFor(1, v)
-            Return v
-        EndIf
+        Int k = 0
+        While k <= top
+            If c.HasKind(k) && tex == c.SkinFor(k, v)
+                Return v
+            EndIf
+            k += 1
+        EndWhile
         v += 1
     EndWhile
     Return -1
@@ -889,10 +939,10 @@ EndFunction
 ; Re-reading the texture the instant after writing it, as Wear once did, sees
 ; the old value in exactly two shapes:
 ;
-;     asked 'DecalCore\alt_skin0.dds', node still holds
+;     asked 'DecalCore\blood_skin0.dds', node still holds
 ;         'textures\actors\character\overlays\default.dds'  -- nothing there yet
-;     asked 'DecalCore\alt_skin4.dds', node still holds
-;         'DecalCore\alt_skin2.dds'                         -- an EARLIER variant
+;     asked 'DecalCore\blood_skin4.dds', node still holds
+;         'DecalCore\blood_skin2.dds'                       -- an EARLIER variant
 ;
 ; Neither is a failed write, and the proof is Paint's own
 ; layer walk. Paint chooses a layer by reading the node, so a write that never
@@ -1300,7 +1350,7 @@ Function ClearMarks(Actor a) global
      The record kept beside it -- their slot list, and their place on the worn list
      -- is a separate thing with a separate job: the note above WornKey has
      it, and RestoreAll is what acts on it. Strip alone leaves the record
-     saying they wear six layers of alt, and the next load walks that record
+     saying they wear six layers of marks, and the next load walks that record
      and paints all six back on.
 
      WHICH IS THE OTHER HALF OF THE RESTORE BUG. FL_Watch calls this on

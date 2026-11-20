@@ -27,9 +27,8 @@ Scriptname FL_ShredderSphere extends ObjectReference
  WHICH MEANS IT HAS TO SEE EVERYONE, and FindClosestActorFromRef answers with
  exactly one. powerofthree's Papyrus Extender is a dependency, and its
  FindAllReferencesOfFormType returns every reference of a form type inside a
- radius; 62 is kCharacter, which the scene framework's own source states in three separate
- places (the scene framework, the framework script, the framework script). That is the enumeration
- this needs, in one native call a tick.
+ radius; 62 is kCharacter, the form type of an actor's reference. That is the
+ enumeration this needs, in one native call a tick.
 
  THE HAUL IS BETHESDA'S OWN, AND IT IS RE-APPLIED. An actor on their feet shrugs
  off an impulse; a ragdoll slides. DLC2CycloneEffectScript -- the Cyclone shout
@@ -39,8 +38,8 @@ Scriptname FL_ShredderSphere extends ObjectReference
  for as long as the field lived. So it is re-applied on a timer.
 
  THE KILL IS THE ONE FLESHCORE ALREADY HAS. Detonate is cast on them from
- themselves -- the self-delivery idiom the retired quest uses for DecapitateSelf and
- FL_Grind uses for its Tick -- so the wound, the pieces, the marks and the
+ themselves -- the self-delivery idiom FL_Grind uses for its Tick -- so the
+ wound, the pieces, the marks and the
  death all run down roads that are already proven, and the spell needs
  nothing of its own in the DLL or the W table.}
 

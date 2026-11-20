@@ -38,9 +38,8 @@ Scriptname FL_KO_Hold extends Quest
                             the Paralyze archetype, which is the rigid one.
                             Fortified by one it drops them into havok and the
                             engine will not stand them up until it is zero
-                            again: limp, on the floor, killable. The pair
-                            an external consumer already uses
-                            (SettleCorpse, the technique external furniture uses).
+                            again: limp, on the floor, killable. The
+                            usual way to leave a body limp on the floor.
    PushActorAway            ObjectReference.psc -- the fall, so they go
                             over instead of folding where they stand.
 
@@ -107,8 +106,8 @@ Scriptname FL_KO_Hold extends Quest
 ;       LATER; and CorpsePass in the same tick took `now < corpseAt` for a
 ;       restarted clock and forgot them. CorpsePass reads its own clock now, and
 ;       a clock that really did restart re-stamps the corpse instead of
-;       dropping it -- because Paralysis persists through Resurrect (standard
-;       consumer warning), a forgotten corpse is a target revived
+;       dropping it -- because Paralysis persists through Resurrect, a
+;       forgotten corpse is a target revived
 ;       paralysed for good. Revived() is the direct route: FL_Watch's Restore
 ;       calls it on every actor it brings back, so what they are owed comes back
 ;       in the same frame, not on the next tick.
@@ -120,8 +119,8 @@ Scriptname FL_KO_Hold extends Quest
 
 ;   (l) Paralysis is given back AS IT WAS, like the flag: the base value is
 ;       read before the hold sets it and restored after (wasParalysis[],
-;       corpseParalysis[]). an external consumer holds the player at 1 during its
-;       own recovery; a cure that set 0 would have stood them up out of it.
+;       corpseParalysis[]). Something else may be holding the player at 1 on
+;       purpose; a cure that set 0 would have stood them up out of it.
 ;   (m) Revived() and CorpsePass no longer touch a target the register HOLDS: a
 ;       corpse revived by something else and knocked out again inside the hour
 ;       would have had the new hold torn down by the old corpse entry; and a
@@ -550,8 +549,8 @@ Float Function PriorParalysis(Actor who)
     {Their Paralysis base before the hold, as it will be given back -- see (u).
      One or more on anybody but the player is not theirs: it is what a hold or a
      corpse settle left on them, and handing it back would be a cure that does
-     nothing. The player keeps theirs: an external consumer holds them at one on
-     purpose during its own recovery.}
+     nothing. The player keeps theirs: something else may be holding them at one
+     on purpose.}
     Float base = who.GetBaseActorValue("Paralysis")
     If base >= 1.0 && who != Game.GetPlayer()
         Debug.Trace("[FleshCore] " + who + " came in with Paralysis already at " + base \

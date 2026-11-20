@@ -18,7 +18,8 @@ Scriptname FL_Decal extends ActiveMagicEffect
  guessing left in it.}
 
 Int Property Kind = 0 Auto
-{kind 0 or kind 1, set per spell on the magic effect.}
+{The DecalCore kind to paint, set per spell on the magic effect: 0 is blood,
+ the one kind built in. A kind no add-on has registered paints nothing.}
 
 Event OnEffectStart(Actor akTarget, Actor akCaster)
     If akTarget == None

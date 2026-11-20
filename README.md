@@ -1,10 +1,10 @@
-# FleshCore (Beta v0.1)
+# FleshCore (Beta v0.1.1)
 
 **Real-time volumetric dismemberment, layered anatomical wounds, and physics-enabled severed body parts for Skyrim Special Edition (Steam 1.6.1170 only), with full in-game customization and a Papyrus API (`FL_Api`) that other mods can call without making `FleshCore.esp` a master.**
 
 > **Content Warning (18+ Gore):** FleshCore renders graphic anatomical gore (skin, subcutaneous fat, muscle, and bone excavation).
 >
-> **Beta Release (`Beta v0.1`):** This is the first public beta release of FleshCore. Expect rough edges as edge cases across custom outfits and load orders are refined.
+> **Beta Release (`Beta v0.1.1`):** This is a public beta release of FleshCore. Expect rough edges as edge cases across custom outfits and load orders are refined.
 
 > **Disclaimer: This Mod was made with the assistance of AI Code Generation.
 
