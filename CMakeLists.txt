@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(FleshCore VERSION 0.1.1 LANGUAGES CXX)
+project(FleshCore VERSION 0.2.0 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 add_library(FleshCore SHARED
     src/flesh.cpp

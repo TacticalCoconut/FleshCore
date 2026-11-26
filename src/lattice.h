@@ -242,9 +242,19 @@ void PosOf(const std::uint8_t* rec, std::uint64_t desc, float out[3]);
 // emitted BOTH ways, so no winding convention has to be guessed.
 //
 // `orig` is the shape's full original triangle list, `keep` the survivors
-// (appended to in place). Returns the number of triangles added.
+// (appended to in place). Multi-loop boundary extraction seals every disjoint
+// closed/open boundary loop opened by the cut up to `maxTris` triangles.
+// When `vbOut` is provided on a mesh with inline positions (VF_VERTEX), appends
+// an inward-recessed (~0.35 * cellPitch) centroid vertex per loop (with dark
+// blood-crimson #550A0A RGBA when VF_COLORS is set); otherwise (e.g. face),
+// fans each loop across its existing boundary vertices.
 std::uint32_t CapWound(const std::uint16_t* orig, std::uint32_t origTris,
-                       std::vector<std::uint16_t>& keep, std::uint32_t maxTris);
+                       std::vector<std::uint16_t>& keep, std::uint32_t maxTris,
+                       const std::uint8_t* rawVerts = nullptr, std::uint32_t nVerts = 0,
+                       std::uint32_t vsize = 0, std::uint64_t desc = 0,
+                       float cellPitch = 4.0f,
+                       std::vector<std::uint8_t>* vbOut = nullptr,
+                       bool isFace = false);
 
 // ============================================================ THE CUT VOLUME
 //

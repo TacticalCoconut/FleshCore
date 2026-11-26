@@ -142,6 +142,12 @@ Int settlePolls = 0
 Float lastZ = 0.0
 Float born = 0.0
 Bool evicted = false        ; told to go by a newer piece: the ring was over its cap
+; THE WOUND'S MARK, COLLECTED LATE. An engine-placed piece can be thrown before
+; FL_Watch has read its wound, so the shared pending mark may still be the
+; previous wound's. FL_Watch leaves the right one on the piece itself
+; (StorageUtil "FC_mark"); until it is there this stays true and the landing
+; watch asks again. See TakeWoundMark.
+Bool markLater = false
 
 ; ---- THE PROBES ---------------------------------------------------------
 ;
@@ -355,18 +361,18 @@ Float Function Life()
 EndFunction
 
 Event OnInit()
-    BlockActivation(true)
     born = Utility.GetCurrentRealTime()
     probeStart = born
-    ; into the piece ring; joining over the cap evicts the oldest.
-    JoinPieceRing()
     ; ---- WAS THIS PIECE MADE BY THE ENGINE? ----------------------------
     ; One native, on this reference, before anything else. GetAngleY on a
     ; reference with no 3D yet reads the angle it was placed with.
     Float roll = GetAngleY()
-    If roll > RollBase - RollStep && roll < RollBase + RollStep * 1024.0
-        Float pitch = GetAngleX()
-        Int code = Math.Floor((roll - RollBase) / RollStep + 0.5)
+    Bool inBand = roll > RollBase - RollStep && roll < RollBase + RollStep * 1024.0
+    Float pitch = 0.0
+    Int code = 0
+    If inBand
+        pitch = GetAngleX()
+        code = Math.Floor((roll - RollBase) / RollStep + 0.5)
         Float back = RollBase + code * RollStep
         If code >= 1 && code <= 1023 && Math.abs(roll - back) < RollStep * 0.25 \
                 && Math.abs(pitch - PitchSeal) < 0.002
@@ -374,15 +380,35 @@ Event OnInit()
             section = (code / 2) % 2 == 1
             kick = (code / 4) % 64
             rollMark = (code / 256) % 4
-            ; LOGGED, ONCE PER PIECE: this line is the probe's proof that an
-            ; engine-placed reference runs this script and reads its roll.
-            Debug.Trace("[FleshCore] piece " + self + " was placed by the engine: section=" \
-                        + section + " kick=" + kick + " mark=" + rollMark \
-                        + " (roll " + roll + ", pitch " + pitch + ")")
-        Else
-            Debug.Trace("[FleshCore] piece " + self + " has a roll in the engine's band but" \
-                        + " does not decode (roll " + roll + ", pitch " + pitch + ", code " + code + ")")
         EndIf
+    EndIf
+    ; ---- THROWN AT ONCE WHEN THE 3D IS ALREADY HERE ---------------------
+    ;
+    ; The engine places a piece and its 3D arrives ten to twenty milliseconds
+    ; later (FleshCore.log, "GOT its 3D"); under load this event often runs
+    ; after that. Asking now saves the first poll's wait and one more trip
+    ; through the script queue. ENGINE-MADE PIECES ONLY: the roll has already
+    ; told such a piece everything (section, kick, mark) and FL_Watch neither
+    ; moves it nor calls into it. A piece FL_Watch placed is told it is a
+    ; section and moved AFTER this event, so it keeps the OnLoad / poll throw.
+    ; Launch() sets the activation block after its throw, so it is set here
+    ; only for a piece that is not thrown yet.
+    If engineMade && Is3DLoaded()
+        probeDone = true
+        Launch()
+    Else
+        BlockActivation(true)
+    EndIf
+    If engineMade
+        ; LOGGED, ONCE PER PIECE: this line is the probe's proof that an
+        ; engine-placed reference runs this script and reads its roll. Said
+        ; after the throw, so the write never holds the throw back.
+        Debug.Trace("[FleshCore] piece " + self + " was placed by the engine: section=" \
+                    + section + " kick=" + kick + " mark=" + rollMark \
+                    + " (roll " + roll + ", pitch " + pitch + ", thrown at once " + thrown + ")")
+    ElseIf inBand
+        Debug.Trace("[FleshCore] piece " + self + " has a roll in the engine's band but" \
+                    + " does not decode (roll " + roll + ", pitch " + pitch + ", code " + code + ")")
     ElseIf roll != 0.0
         ; A script-placed piece wears its target's angles, and an actor's roll
         ; is zero. A non-zero roll outside the band is therefore either an
@@ -392,12 +418,17 @@ Event OnInit()
         Debug.Trace("[FleshCore] piece " + self + " born with roll " + roll \
                     + " outside the engine's band (pitch " + GetAngleX() + ")")
     EndIf
-    ; THE FAST WATCH. Not the lifetime clock -- that is set when the fast watch
-    ; ends. Six seconds at a tenth of a second is the window in which a mesh
-    ; either attaches or is never going to, and every tick of it is recorded so
-    ; the answer is a measurement.
-    probePolls = 0
-    RegisterForSingleUpdate(ProbeInterval)
+    ; into the piece ring; joining over the cap evicts the oldest.
+    JoinPieceRing()
+    ; THE FAST WATCH, only for a piece still waiting for its 3D: a piece thrown
+    ; above already has its landing watch armed by Launch(). Not the lifetime
+    ; clock -- that is set when the fast watch ends. Six seconds at a tenth of
+    ; a second is the window in which a mesh either attaches or is never going
+    ; to, and every tick of it is recorded so the answer is a measurement.
+    If !thrown
+        probePolls = 0
+        RegisterForSingleUpdate(ProbeInterval)
+    EndIf
     If ProbeVerbose
         Debug.Trace("[FleshCore] piece " + self + " created")
         Dossier("placed")
@@ -421,11 +452,6 @@ Function Launch()
         Return
     EndIf
     thrown = true
-    ; ACTIVATION: blocked as always, unless a caller
-    ; has asked for it through FL_Api.EnableShardActivation -- the word is
-    ; the number of callers that did. A piece launched before anyone asked
-    ; stays blocked for its lifetime.
-    BlockActivation(StorageUtil.GetIntValue(None, "FC_shardact", 0) == 0)
     If ForceDynamic
         SetMotionType(Motion_Dynamic, false)
     EndIf
@@ -446,11 +472,10 @@ Function Launch()
         f = f * kick
     EndIf
     If section
-        ; Topple severed limb/leg sections immediately off vertical equilibrium
-        ; so they collapse horizontally onto the ground instead of standing upright.
-        SetAngle(Utility.RandomFloat(65.0, 85.0), \
-                 Utility.RandomFloat(-35.0, 35.0), \
-                 GetAngleZ())
+        ; Do NOT call SetAngle() here: SetAngle on a dynamic ObjectReference tears
+        ; down and rebuilds its 3D mid-frame, causing ApplyHavokImpulse below to fail
+        ; with 'Object has no 3D' and leaving severed torso/limb sections frozen in air.
+        ; Apply strong lateral + arc impulse directly onto the intact Havok 3D instead.
         Float sx = Utility.RandomFloat(0.65, 1.0)
         If Utility.RandomInt(0, 1) == 0
             sx = -sx
@@ -459,12 +484,22 @@ Function Launch()
         If Utility.RandomInt(0, 1) == 0
             sy = -sy
         EndIf
-        ApplyHavokImpulse(sx, sy, -0.35, f)
+        Float sz = -0.25
+        If kick > 1
+            sz = Utility.RandomFloat(0.18, 0.55)
+        EndIf
+        ApplyHavokImpulse(sx, sy, sz, f)
     Else
         ApplyHavokImpulse(Utility.RandomFloat(-1.0, 1.0), \
                           Utility.RandomFloat(-1.0, 1.0), \
                           Utility.RandomFloat(0.10, 0.80), f)
     EndIf
+    ; ACTIVATION, AFTER THE THROW: the throw is what is seen, so nothing goes
+    ; in front of it. Blocked as always, unless a caller has asked for it
+    ; through FL_Api.EnableShardActivation -- the word is the number of
+    ; callers that did. A piece launched before anyone asked stays blocked for
+    ; its lifetime.
+    BlockActivation(StorageUtil.GetIntValue(None, "FC_shardact", 0) == 0)
     ; MEASURED, THEN SILENCED. This line proved that a piece is thrown 0.13 to
     ; 0.25s after its own placement -- fast -- while the wound as a whole took
     ; seconds, which is what sent the search to the placement loop where the
@@ -510,18 +545,31 @@ Function Launch()
     ; mark goes on top of it when they had one -- two membrane passes, which
     ; composite, so a target covered in one fluid ends up with a piece wearing
     ; both. That is also what a piece of them should look like.
-    DC_Api.CoatSkin(Self, DC_Api.BLOOD(), BloodLevel)
-    Int mark = DC_Api.PendingMark()
+    If FL_Native.GetBloodSplatter()
+        Int splatPct = FL_Native.GetBloodSplatterPct()
+        If splatPct > 0 && (splatPct >= 100 || Utility.RandomInt(1, 100) <= splatPct)
+            DC_Api.CoatSkin(Self, DC_Api.BLOOD(), BloodLevel)
+        EndIf
+    EndIf
     ; an engine-placed piece of a wound whose W row FORCES a registered kind
     ; (mark 2 or 3: DecalCore kind 1 or 2) carries that in its roll and does
     ; not depend on FL_Watch having reached SetPendingMark before this piece's
     ; 3D arrived -- the exact packing FL_Watch uses for a forced mark, kind * 10
-    ; + level 5. A kind nobody registered leaves the pending mark as it was.
+    ; + level 5. Any other engine-placed piece takes the mark FL_Watch left on
+    ; it (TakeWoundMark), which may come a moment after the throw; a piece
+    ; FL_Watch placed itself reads the pending mark, which FL_Watch set before
+    ; placing it.
+    ; Every way a piece is done with "FC_mark" also unsets it: a created
+    ; reference's FormID is reused later in the session, and a key left on it
+    ; would be read by the next piece that gets the same FormID.
     If engineMade && rollMark >= 2 && DC_Api.HasKind(rollMark - 1)
-        mark = (rollMark - 1) * 10 + 5
-    EndIf
-    If mark >= 0 && mark / 10 != DC_Api.BLOOD()
-        DC_Api.CoatSkin(Self, mark / 10, mark % 10)
+        CoatMark((rollMark - 1) * 10 + 5)
+        StorageUtil.UnsetIntValue(Self, "FC_mark")
+    ElseIf engineMade
+        markLater = true
+        TakeWoundMark(false)
+    Else
+        CoatMark(DC_Api.PendingMark())
     EndIf
     ; ---- THE CONTROL -----------------------------------------------
     ;
@@ -562,6 +610,35 @@ Function Launch()
     settlePolls = 0
     lastZ = GetPositionZ()
     Nap(0.1)
+EndFunction
+
+Function CoatMark(Int aiMark)
+    {Their own mark, over the blood coat. DC_Api's packing: kind * 10 + level.
+     No mark (-1) and blood (already on) do nothing.}
+    If aiMark >= 0 && aiMark / 10 != DC_Api.BLOOD()
+        DC_Api.CoatSkin(Self, aiMark / 10, aiMark % 10)
+    EndIf
+EndFunction
+
+Function TakeWoundMark(Bool abLast)
+    {The mark FL_Watch left on this engine-placed piece for its own wound
+     (StorageUtil "FC_mark", set in PlaceLine). Asked at the throw and on every
+     landing-watch tick until it is there. On the last ask, at landing, a piece
+     whose wound line has still not been read takes the shared pending mark,
+     which is what every piece did before.}
+    If !markLater
+        Return
+    EndIf
+    If StorageUtil.HasIntValue(Self, "FC_mark")
+        markLater = false
+        Int m = StorageUtil.GetIntValue(Self, "FC_mark", -1)
+        StorageUtil.UnsetIntValue(Self, "FC_mark")
+        CoatMark(m)
+    ElseIf abLast
+        markLater = false
+        StorageUtil.UnsetIntValue(Self, "FC_mark")
+        CoatMark(DC_Api.PendingMark())
+    EndIf
 EndFunction
 
 Event OnLoad()
@@ -616,6 +693,7 @@ Function Consume()
     {The undertaker, run early for a piece somebody consumed (FL_Api.ConsumeShard).}
     LeavePieceRing()
     Disable(true)
+    StorageUtil.UnsetIntValue(Self, "FC_mark")
     Delete()
     DeleteWhenAble()
 EndFunction
@@ -632,6 +710,7 @@ Event OnUpdate()
         EndIf
         LeavePieceRing()
         Disable(true)
+        StorageUtil.UnsetIntValue(Self, "FC_mark")
         Delete()
         DeleteWhenAble()
         Return
@@ -646,8 +725,17 @@ Event OnUpdate()
     ; deletion time is deleted on schedule rather than kept alive by pooling.
     If settlePolls == -1 && bleedLeft > 0
         bleedLeft -= 1
-        If Squish
-            PlayImpactEffect(Squish, "", 0.0, 0.0, -1.0, 96.0, false, false)
+        If FL_Native.GetBloodSplatter()
+            Int bPct = FL_Native.GetBloodSplatterPct()
+            If bPct > 0 && (bPct >= 100 || Utility.RandomInt(1, 100) <= bPct)
+                If DC_Api.Ready()
+                    DC_Api.Splat(Self, DC_Api.BLOOD(), Utility.RandomInt(0, 2))
+                ElseIf Squish
+                    Float bAng = Utility.RandomFloat(0.0, 360.0)
+                    Float bTilt = Utility.RandomFloat(0.16, 0.32)
+                    PlayImpactEffect(Squish, "", bTilt * Math.Cos(bAng), bTilt * Math.Sin(bAng), -0.96, 96.0, false, false)
+                EndIf
+            EndIf
         EndIf
         If bleedLeft > 0
             Nap(BleedInterval)
@@ -680,10 +768,18 @@ Event OnUpdate()
                             + "s after placement)")
                 Dossier("3d-arrived")
             EndIf
-            ; THE POLL THROWS IT. If OnLoad has already been and gone this is a
-            ; no-op; if it has not, this is three quarters of a second the
-            ; shard does not spend hanging in the air.
-            Launch()
+            ; THE POLL THROWS IT -- OR, WHEN OnLoad ALREADY DID, STARTS THE
+            ; LANDING WATCH. If OnLoad has not been, this is three quarters of
+            ; a second the shard does not spend hanging in the air. If it has,
+            ; Launch() would return at once, and the update slot is single:
+            ; OnLoad's Launch armed it, this tick used it, and returning here
+            ; without arming it again left the piece with no landing, no bleed
+            ; and no lifetime clock (only the piece ring could clear it).
+            If thrown
+                Nap(0.1)
+            Else
+                Launch()
+            EndIf
             Return
         ElseIf probePolls >= ProbeTicks
             probeDone = true
@@ -725,6 +821,7 @@ Event OnUpdate()
         ; the wet arrival plays once and the watch ends.
         If (still && settlePolls > 3) || settlePolls > 60
             settlePolls = -1
+            TakeWoundMark(true)
             Land()
             ; Land() may have started a bleed, in which case the next tick is
             ; the next drip rather than the deletion. Asking bleedLeft keeps
@@ -735,6 +832,7 @@ Event OnUpdate()
                 Nap(Life() - (Utility.GetCurrentRealTime() - born))
             EndIf
         Else
+            TakeWoundMark(false)
             Nap(0.1)
         EndIf
         Return
@@ -772,8 +870,17 @@ Function Land()
     ; came from the record that never got the orientation fix.
     ;
     ; Fixed there, so what lands here now is the vanilla blood decal.
-    If Squish && LandingSplatter
-        PlayImpactEffect(Squish, "", 0.0, 0.0, -1.0, 64.0, false, false)
+    If LandingSplatter && FL_Native.GetBloodSplatter()
+        Int lPct = FL_Native.GetBloodSplatterPct()
+        If lPct > 0 && (lPct >= 100 || Utility.RandomInt(1, 100) <= lPct)
+            If DC_Api.Ready()
+                DC_Api.Splat(Self, DC_Api.BLOOD(), Utility.RandomInt(0, 2))
+            ElseIf Squish
+                Float lAng = Utility.RandomFloat(0.0, 360.0)
+                Float lTilt = Utility.RandomFloat(0.16, 0.32)
+                PlayImpactEffect(Squish, "", lTilt * Math.Cos(lAng), lTilt * Math.Sin(lAng), -0.96, 68.0, false, false)
+            EndIf
+        EndIf
     EndIf
     BeginBleed()
     If ProbeVerbose
@@ -842,7 +949,10 @@ Function BeginBleed()
         EndIf
         Return
     EndIf
-    If side <= 0.0
+    ; EVERY FORGED PIECE READS 0/0/0 HERE (its record's bounds come from the
+    ; seed mesh), so this line was one trace and three more natives per piece
+    ; in every log. It belongs to the probes now.
+    If side <= 0.0 && ProbeVerbose
         Debug.Trace("[FleshCore] " + self + " has no readable bounds (w/l/h gave " \
                     + GetWidth() + "/" + GetLength() + "/" + GetHeight() \
                     + ") -- bleeding anyway")
@@ -969,6 +1079,7 @@ Function ClearPastCap(Int cap, Int maxClears) global
                 ObjectReference oref = oldest as ObjectReference
                 If oref
                     oref.Disable(false)
+                    StorageUtil.UnsetIntValue(oref, "FC_mark")
                     oref.Delete()
                 EndIf
             EndIf

@@ -6,7 +6,7 @@
 
 **The scripts (`scripts/source/`)** do what only Papyrus can do from outside the engine, such as equipping the interior, placing pieces, relaying events and serving the public API in `FL_Api`.
 
-The two talk through small numbered files in `Data/SKSE/Plugins`. That costs one 100 ms tick each way. `FL_Watch` is the script end of it.
+The two talk in memory: the scripts call the plugin's `FL_Native` functions, and SKSE mod events carry commands to the plugin (`FC_Cmd` and others) and wake the scripts (`FC_Wake`). A few small files in `Data/SKSE/Plugins` keep what other tools read, such as the version and the debug-spell grants (FleshCore-API.md lists them). `FL_Watch` is the script end of it.
 
 ## A body
 
@@ -40,8 +40,12 @@ Clothed bodies need an interior that the game would not otherwise draw. `FL_Watc
 | `src/armour_bits.h` | What a worn item is made of, and whether it covers a spot |
 | `src/redraw_bits.h` | The pure parts of the redraw |
 | `src/facts.h` | Engine offsets, each with where it was read from |
+| `src/rawguard.h` | Checks that a body's vertex records were not swapped since they were read |
 | `src/windiag.cpp`, `windiag.h` | Stall and window diagnostics |
 | `scripts/source/FL_Api.psc` | The public API |
 | `scripts/source/FL_Watch.psc` | The script side of the engine |
+| `scripts/source/FL_Native.psc` | The plugin's native functions |
 | `scripts/source/FL_Chunk.psc` | A placed piece |
 | `scripts/source/DC_Api.psc` | Marks on skin and surfaces |
+| `scripts/source/FL_Grinder*.psc`, `FL_GrindHook.psc` | The optional grinder spells |
+| `scripts/source/FL_LeashBridge.psc` | The only script that calls Leash Framework, reached only when it is installed |

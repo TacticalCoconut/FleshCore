@@ -291,6 +291,7 @@ constexpr std::size_t    kSizeof_BSDynamicTriShape = 0x180;   // clib, SE == AE
 // partition record holds no position and why the head's positions have to come
 // out of dynamicData instead.
 constexpr std::uint64_t kVF_VERTEX = 1ull << 44;
+constexpr std::uint64_t kVF_COLORS = 1ull << 49;
 
 // GetFeature is BSShaderMaterial virtual slot 06 -- clib RE/B/BSShaderMaterial.h
 // annotates the whole table: dtor 00, Create 01, CopyMembers 02,
@@ -941,6 +942,10 @@ constexpr std::uint32_t  kPlayerFormID = 0x00000014;
 //             names no bit of flags2 but kFlags_CanDoFavor (0x80), so the
 //             runtime bits have ONE naming source; the base record's own
 //             flags below are the second read, and both are consulted.
+constexpr std::uintptr_t kActor_state1     = 0xC8;
+constexpr std::uintptr_t kActor_state2     = 0xCC;
+constexpr std::size_t    kActor_stateSpan  = 0xD0;
+constexpr std::uint32_t  kActorState2_Staggered = 1u << 13;
 constexpr std::uintptr_t kActor_boolBits   = 0xE8;
 constexpr std::uintptr_t kActor_boolFlags  = 0x204;
 constexpr std::size_t    kActor_flagsSpan  = 0x208;
@@ -966,7 +971,10 @@ constexpr std::uintptr_t kREFR_baseForm     = 0x40;
 constexpr std::uintptr_t kNPC_acbsFlags     = 0x38;
 constexpr std::size_t    kNPC_flagsSpan     = 0x40;
 constexpr std::uint32_t  kACBS_Essential    = 1u << 1;
+constexpr std::uint32_t  kACBS_Unique       = 1u << 5;
 constexpr std::uint32_t  kACBS_Protected    = 1u << 11;
+constexpr std::uint32_t  kACBS_IsGhost      = 1u << 29;
+constexpr std::uint32_t  kACBS_Invulnerable = 1u << 31;
 // THE LEVEL, eight past the flag word: clib TESActorBaseData.h
 // ACTOR_BASE_DATA "std::uint16_t level; // 08"; skse64 GameFormComponents.h
 // TESActorBaseData "UInt16 level; // 10 ... (CK Multiplier * 1000 if PCLevelMult
@@ -1116,5 +1124,41 @@ constexpr std::uintptr_t kDSI_numPartitions = 0x88;
 constexpr std::uintptr_t kDSI_partitions    = 0x90;
 constexpr std::size_t    kDSI_span          = 0xA0;
 constexpr std::uintptr_t kDSIPart_slot      = 0x02;
+
+// ---- PART 1 BATCH ADDITIONS (1.6.1170 Address Library & verified layouts) ---
+// BSTEventSource::SendEvent (AE id 13889 -> 0x001C2AE0)
+constexpr std::uint32_t  kModEventSendEvent     = 0x001C2AE0;
+// BSFixedString::ctor(const char*) (AE id 69161 -> 0x00CEC5D0) & Release (AE id 69192 -> 0x00CED9A0)
+constexpr std::uint32_t  kBSFixedStringCtor     = 0x00CEC5D0;
+constexpr std::uint32_t  kBSFixedStringRelease  = 0x00CED9A0;
+// VTABLE_BSScript__NF_util__NativeFunctionBase (AE id 252545 -> 0x01A9DE18)
+constexpr std::uint32_t  kVT_NativeFunctionBase = 0x01A9DE18;
+// BSTimer fGlobalTimeMultiplier float (AE id 388443 -> 0x020294FC)
+constexpr std::uint32_t  kGlobalTimeMultiplier  = 0x020294FC;
+// NiAVObject local.scale (0x48 + 0x30 = 0x78)
+constexpr std::uintptr_t kAV_localScale         = 0x78;
+// TESCamera::cameraRoot NiPointer<NiNode> (offset 0x20 on TESCamera / PlayerCamera)
+constexpr std::uintptr_t kTESCamera_cameraRoot  = 0x20;
+// TESActorBaseData::voiceType BGSVoiceType* (0x30 + 0x28 = 0x58 on TESNPC)
+constexpr std::uintptr_t kNPC_voiceType         = 0x58;
+constexpr std::size_t    kNPC_voiceSpan         = 0x60;
+constexpr std::uint8_t   kFormType_VoiceType    = 98;
+constexpr std::uintptr_t kVoice_editorID        = 0x28;
+constexpr std::size_t    kVoice_readSpan        = 0x30;
+// BSModelDB / EntryDB (1.6.1170 verified disassembly) (#6)
+constexpr std::uint32_t  kBSModelDBGlobal         = 0x020F6330;
+constexpr std::uint32_t  kBSModelDBDrainQueue     = 0x001974B0;
+constexpr std::uint32_t  kBSResourceIDFromPath    = 0x00D0F4C0;
+constexpr std::uint32_t  kBSEntryMapLookup        = 0x00207590;
+constexpr std::uint32_t  kBSEntryMapSentinel      = 0x01FD4698;
+constexpr std::uintptr_t kBSModelDB_dbBase        = 0xD0;
+constexpr std::uintptr_t kEntryDBBase_map         = 0x40;
+constexpr std::uintptr_t kEntryMap_rwLock         = 0x1C;
+constexpr std::uintptr_t kBSModelEntry_flagsRef   = 0x0C;
+constexpr std::uintptr_t kBSModelEntry_data       = 0x28;
+constexpr std::uintptr_t kNiRefObject_refCount    = 0x08;
+// BSScript StackFrame parameter unpacking (1.6.1170 verified) (#2)
+constexpr std::uint32_t  kStackGetPageForFrame       = 0x014327E0;
+constexpr std::uint32_t  kStackGetStackFrameVariable = 0x01432850;
 
 }  // namespace fact

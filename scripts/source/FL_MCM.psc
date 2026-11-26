@@ -230,15 +230,20 @@ String[] Function EngineFacts()
     out[0] = ""
     out[1] = ""
     String raw = MiscUtil.ReadFromFile("Data/SKSE/Plugins/FleshCore.version.txt")
-    If raw == ""
-        Return out
+    If raw != ""
+        String[] bits = StringUtil.Split(raw, "|")
+        If bits.Length >= 1
+            out[0] = bits[0]
+        EndIf
+        If bits.Length >= 2
+            out[1] = bits[1]
+        EndIf
     EndIf
-    String[] bits = StringUtil.Split(raw, "|")
-    If bits.Length >= 1
-        out[0] = bits[0]
-    EndIf
-    If bits.Length >= 2
-        out[1] = bits[1]
+    If FL_Native.IsReady()
+        String nv = FL_Native.GetVersionString()
+        If nv != ""
+            out[0] = nv
+        EndIf
     EndIf
     Return out
 EndFunction
@@ -277,7 +282,7 @@ Event OnPageReset(String a_page)
         EndIf
         _oidEngine = AddTextOption("Engine (SKSE plugin)", engine, OPTION_FLAG_DISABLED)
 
-        _oidScripts = AddTextOption("Scripts", "0.1.1 Beta", OPTION_FLAG_DISABLED)
+        _oidScripts = AddTextOption("Scripts", "0.2.0 Beta", OPTION_FLAG_DISABLED)
 
         ; The plugin is proven by resolving a record out of it rather than by
         ; asking whether a file exists: a plugin present but not ENABLED
@@ -306,6 +311,11 @@ Event OnPageReset(String a_page)
             ms = w.PanelDoubleMs()
         EndIf
         _oidDouble = AddTextOption("Double-tap within", ms + " ms", OPTION_FLAG_DISABLED)
+        Bool splatOn = true
+        If FL_Native.IsReady()
+            splatOn = FL_Native.GetBloodSplatter()
+        EndIf
+        AddToggleOptionST("FCBLOODSPLAT", "Blood Splatter & Pools", splatOn)
         AddEmptyOption()
         AddTextOption("Weapons, triggers, who may be cut, resets:", "", OPTION_FLAG_DISABLED)
         AddTextOption("the HQ's Combat page", "", OPTION_FLAG_DISABLED)
@@ -315,13 +325,37 @@ Event OnPageReset(String a_page)
             AddToggleOptionST("FCSNON", "Notify SkyrimNet of FleshCore wounds & dismemberments", StorageUtil.GetIntValue(None, "FC_SkyrimNetOn", 1) != 0)
             AddToggleOptionST("FCSNDIRECT", "Trigger spoken reactions on severe/fatal wounds", StorageUtil.GetIntValue(None, "FC_SkyrimNetDirect", 1) != 0)
         EndIf
+        ; THE GRINDER ROWS show only where FleshCore's grinder said it is there:
+        ; FL_GrinderSpells writes FL_GrinderState on every load (1 ready,
+        ; 2 Leash Framework not installed, 3 installed but not answering).
+        Int grindState = StorageUtil.GetIntValue(None, "FL_GrinderState", 0)
+        If grindState != 0
+            AddEmptyOption()
+            AddHeaderOption("Grinder")
+            If grindState == 1
+                AddToggleOptionST("FCGRINDSPELLS", "Grinder Spells", StorageUtil.GetIntValue(None, "FL_GrinderSpellsOn", 1) != 0)
+                AddToggleOptionST("FCGRINDANYONE", "Rollers grind bystanders", StorageUtil.GetIntValue(None, "FL_GrinderGrindAnyone", 0) != 0)
+            Else
+                AddToggleOptionST("FCGRINDSPELLS", "Grinder Spells", false, OPTION_FLAG_DISABLED)
+                If grindState == 2
+                    AddTextOption("Requires Leash Framework", "", OPTION_FLAG_DISABLED)
+                Else
+                    AddTextOption("Leash Framework did not load", "", OPTION_FLAG_DISABLED)
+                EndIf
+            EndIf
+        EndIf
 
         SetCursorPosition(1)
         AddHeaderOption("Combat Intensity Spectrum")
         Int curPreset = StorageUtil.GetIntValue(None, "FC_PresetId", 50)
+        Int basePreset = StorageUtil.GetIntValue(None, "FC_PresetBase", 50)
+        If FL_Native.IsReady()
+            curPreset = FL_Native.GetPresetId()
+            basePreset = FL_Native.GetPresetBase()
+        EndIf
         Int sliderVal = curPreset
         If sliderVal < 0
-            sliderVal = StorageUtil.GetIntValue(None, "FC_PresetBase", 50)
+            sliderVal = basePreset
         EndIf
         If sliderVal < 0 || sliderVal > 100
             sliderVal = 50
@@ -332,8 +366,8 @@ Event OnPageReset(String a_page)
             AddSliderOptionST("FCPRESET", "Combat Intensity", sliderVal as Float, "{0}%")
         EndIf
         AddTextOption("Intensity Tier:", PresetLabel(curPreset), OPTION_FLAG_DISABLED)
-        AddTextOption("Voxelization:", PresetWhatItDoes(curPreset), OPTION_FLAG_DISABLED)
-        AddTextOption("Survivability:", PresetHowItPlays(curPreset), OPTION_FLAG_DISABLED)
+        AddTextOption("Gore Damage:", PresetWhatItDoes(curPreset), OPTION_FLAG_DISABLED)
+        AddTextOption("Lethality:", PresetHowItPlays(curPreset), OPTION_FLAG_DISABLED)
 
         AddEmptyOption()
         AddHeaderOption("Out-of-Combat Layer & Magic Progression Tester")
@@ -747,6 +781,75 @@ State FCSNDIRECT
     EndEvent
 EndState
 
+; ---- the Grinder rows (see OnPageReset) ---------------------------------
+;
+; The two spells come from StorageUtil (FL_SpawnGrinderSpell, FL_GrindHookSpell),
+; where FL_GrinderSpells puts them on every load; the same script gives or takes
+; them again at each load to match FL_GrinderSpellsOn and FL_GrinderState.
+
+Function GiveGrinderSpells(Bool abOn)
+    Actor p = Game.GetPlayer()
+    If !p
+        Return
+    EndIf
+    Bool want = abOn && StorageUtil.GetIntValue(None, "FL_GrinderState", 0) == 1
+    GiveOneSpell(p, StorageUtil.GetFormValue(None, "FL_SpawnGrinderSpell") as Spell, want)
+    GiveOneSpell(p, StorageUtil.GetFormValue(None, "FL_GrindHookSpell") as Spell, want)
+EndFunction
+
+Function GiveOneSpell(Actor p, Spell s, Bool abOn)
+    If !s
+        Return
+    EndIf
+    If abOn && !p.HasSpell(s)
+        p.AddSpell(s, false)
+    ElseIf !abOn && p.HasSpell(s)
+        p.RemoveSpell(s)
+    EndIf
+EndFunction
+
+State FCGRINDSPELLS
+    Event OnSelectST()
+        If StorageUtil.GetIntValue(None, "FL_GrinderState", 0) != 1
+            Return
+        EndIf
+        Bool on = StorageUtil.GetIntValue(None, "FL_GrinderSpellsOn", 1) == 0
+        StorageUtil.SetIntValue(None, "FL_GrinderSpellsOn", on as Int)
+        GiveGrinderSpells(on)
+        SetToggleOptionValueST(on)
+    EndEvent
+    Event OnDefaultST()
+        If StorageUtil.GetIntValue(None, "FL_GrinderState", 0) != 1
+            Return
+        EndIf
+        StorageUtil.SetIntValue(None, "FL_GrinderSpellsOn", 1)
+        GiveGrinderSpells(true)
+        SetToggleOptionValueST(true)
+    EndEvent
+    Event OnHighlightST()
+        If StorageUtil.GetIntValue(None, "FL_GrinderState", 0) == 1
+            SetInfoText("Adds Spawn Grinder and Grinder Hook to your Conjuration spells, or takes them away. Spawn Grinder puts a grinder with two spiked rollers in front of you; aim at its base and activate it to switch it on or off. Grinder Hook chains the one you hit to the nearest grinder and pulls them into the spinning rollers.")
+        Else
+            SetInfoText("These two spells need the Leash Framework mod. It is not installed, or it did not load this time. Install or update Leash Framework, then load your save again.")
+        EndIf
+    EndEvent
+EndState
+
+State FCGRINDANYONE
+    Event OnSelectST()
+        Bool on = StorageUtil.GetIntValue(None, "FL_GrinderGrindAnyone", 0) == 0
+        StorageUtil.SetIntValue(None, "FL_GrinderGrindAnyone", on as Int)
+        SetToggleOptionValueST(on)
+    EndEvent
+    Event OnDefaultST()
+        StorageUtil.SetIntValue(None, "FL_GrinderGrindAnyone", 0)
+        SetToggleOptionValueST(false)
+    EndEvent
+    Event OnHighlightST()
+        SetInfoText("Off: the rollers take only the one on the Grinder Hook. On: anyone else who touches the spinning rollers is ground too, except you, your followers and anyone the game protects.")
+    EndEvent
+EndState
+
 String Function PresetLabel(Int lvl)
     If lvl < 0
         Return "Custom"
@@ -874,53 +977,76 @@ EndFunction
 
 String Function PresetWhatItDoes(Int lvl)
     If lvl < 0
-        Return "Custom settings modified outside preset"
+        Return "Custom (changed in the FleshCore Menu)"
     ElseIf lvl == 0
-        Return "Combat blows & hostile magic do not voxelise"
+        Return "Combat hits & hostile magic never cut flesh"
     ElseIf lvl < 20
-        Return "Near-death power blows peel 1 layer (<=25% HP)"
+        Return "Near-death blows cut 1 layer (about 20-30% health)"
     ElseIf lvl < 48
-        Return "Progressive 1-stage peeling on wounded targets"
+        Return "Wounded foes are cut 1-2 layers at a time"
     ElseIf lvl <= 52
-        Return "Wounds & 2-stage cleaves below 50% HP"
+        Return "Cuts 2 layers deep below half health"
     ElseIf lvl < 70
-        Return "Frequent 2-3 stage cleaves across skirmishes"
+        Return "Frequent cuts 2-3 layers deep in any fight"
     ElseIf lvl < 85
-        Return "Any-HP damage-scaled 3-stage visceral wounds"
+        Return "Cuts 3 layers deep at any health, by damage"
     EndIf
     Return "Every hit & spell tears through all 4 layers"
 EndFunction
 
 String Function PresetHowItPlays(Int lvl)
     If lvl < 0
-        Return "Custom dismemberment survivability rules"
+        Return "Custom (changed in the FleshCore Menu)"
     ElseIf lvl == 0
         Return "Head & Trunk fatal; all limbs survivable"
     ElseIf lvl < 20
-        Return "Head & Trunk fatal; 4-5 limbs before death"
+        Return "Head & Trunk fatal; 4-5 lost limbs kill"
     ElseIf lvl < 35
-        Return "Head, Trunk & Thighs fatal; 3-4 limbs to die"
+        Return "Head, Trunk & Thighs fatal; 3-4 lost limbs kill"
     ElseIf lvl < 50
         Return "Head, Trunk & Legs fatal; arms survivable"
     ElseIf lvl <= 54
-        Return "Head, Trunk, Legs & Upper Arms fatal (2 limbs)"
-    ElseIf lvl < 70
-        Return "All arm & leg shafts fatal; hands/feet survive"
+        Return "Head/Trunk/Legs/Upper Arms fatal; 2 limbs kill"
+    ElseIf lvl < 65
+        Return "Any arm or leg fatal; hands & feet survivable"
     ElseIf lvl < 85
-        Return "All limbs & feet fatal; only hands survivable"
+        Return "Losing any limb, hand or foot kills"
     EndIf
-    Return "All 15 body parts fatal on dismemberment"
+    Return "Losing any of the 15 body parts is fatal"
 EndFunction
 
 String Function PresetFullInfo(Int lvl)
-    Return PresetLabel(lvl) + " — VOXELIZATION: " + PresetWhatItDoes(lvl) + ". SURVIVABILITY: " + PresetHowItPlays(lvl) + ". (0% = Disabled, 50% = Finishing Blows, 100% = Gorefest)"
+    Return PresetLabel(lvl) + " — Gore Damage: " + PresetWhatItDoes(lvl) + ". Lethality: " + PresetHowItPlays(lvl) + ". A layer is skin, fat, muscle or bone. (0% = Disabled, 50% = Finishing Blows, 100% = Gorefest)"
 EndFunction
+
+State FCBLOODSPLAT
+    Event OnSelectST()
+        Bool on = true
+        If FL_Native.IsReady()
+            on = !FL_Native.GetBloodSplatter()
+        EndIf
+        FL_Api.SetBloodSplatter(on)
+        SetToggleOptionValueST(on)
+    EndEvent
+    Event OnDefaultST()
+        FL_Api.SetBloodSplatter(true)
+        SetToggleOptionValueST(true)
+    EndEvent
+    Event OnHighlightST()
+        SetInfoText("Enables or disables blood splatter decals, blood pools, and blood coats on severed chunks.")
+    EndEvent
+EndState
 
 State FCPRESET
     Event OnSliderOpenST()
         Int cur = StorageUtil.GetIntValue(None, "FC_PresetId", 50)
+        Int baseP = StorageUtil.GetIntValue(None, "FC_PresetBase", 50)
+        If FL_Native.IsReady()
+            cur = FL_Native.GetPresetId()
+            baseP = FL_Native.GetPresetBase()
+        EndIf
         If cur < 0
-            cur = StorageUtil.GetIntValue(None, "FC_PresetBase", 50)
+            cur = baseP
         EndIf
         If cur < 0 || cur > 100
             cur = 50
@@ -954,6 +1080,9 @@ State FCPRESET
     EndEvent
     Event OnHighlightST()
         Int cur = StorageUtil.GetIntValue(None, "FC_PresetId", 50)
+        If FL_Native.IsReady()
+            cur = FL_Native.GetPresetId()
+        EndIf
         SetInfoText(PresetFullInfo(cur))
     EndEvent
 EndState

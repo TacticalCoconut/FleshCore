@@ -262,7 +262,7 @@ details.adv[open] > summary::after{content:"Hide Advanced ▴"}
     <header class="top">
       <h2 id="ptitle">The Body</h2>
       <span class="pill ok" id="armed"><span class="dot"></span>ENGINE ARMED</span>
-      <span class="ver" id="banner">FleshCore v0.1.1 Beta</span>
+      <span class="ver" id="banner">FleshCore v0.2.0 Beta</span>
     </header>
 
     <!-- ============================= THE BODY ============================= -->
@@ -376,9 +376,9 @@ details.adv[open] > summary::after{content:"Hide Advanced ▴"}
             <div class="ctl"><button class="sw cb" data-k="who.follower" aria-pressed="false" aria-label="Followers"></button></div></div>
           <div class="row"><div class="lab"><b>Essential &amp; Protected NPCs</b><small>Quest-critical or protected NPCs.</small></div>
             <div class="ctl"><button class="sw cb" data-k="who.essential" aria-pressed="false" aria-label="Essential and protected NPCs"></button></div></div>
-          <div class="row"><div class="lab"><b>Player Character (Master Toggle)</b><small>Allow combat hits to voxelise your character.</small></div>
-            <div class="ctl"><button class="sw cb" data-k="who.player" aria-pressed="false" aria-label="The player"></button></div></div>
-          <div class="row"><div class="lab"><b>1. Player: Skin</b><small>Outer layer — must be enabled before Flesh, Bones, or Severing.</small></div>
+          <div class="row"><div class="lab"><b>Player Character (Combat Hits)</b><small>Allow weapon blows, hostile magic, and combat-bridge hooks to voxelise your character.</small></div>
+            <div class="ctl"><button class="sw cb" data-k="who.player" aria-pressed="false" aria-label="Player in combat"></button></div></div>
+          <div class="row"><div class="lab"><b>1. Player: Skin</b><small>Outer layer — must be enabled before Flesh, Bones, or Severing in combat.</small></div>
             <div class="ctl"><button class="sw cb" data-k="player.skin" aria-pressed="false" aria-label="Player skin"></button></div></div>
           <div class="row"><div class="lab"><b>2. Player: Flesh</b><small>Requires Player: Skin to be enabled first.</small></div>
             <div class="ctl"><button class="sw cb" data-k="player.flesh" aria-pressed="false" aria-label="Player flesh"></button></div></div>
@@ -386,6 +386,12 @@ details.adv[open] > summary::after{content:"Hide Advanced ▴"}
             <div class="ctl"><button class="sw cb" data-k="player.bones" aria-pressed="false" aria-label="Player bones"></button></div></div>
           <div class="row"><div class="lab"><b>4. Player: Severing Limbs</b><small>Requires Player: Skin, Flesh, and Bones to be enabled first.</small></div>
             <div class="ctl"><button class="sw cb" data-k="player.sever" aria-pressed="false" aria-label="Player severing limbs"></button></div></div>
+          <div style="margin-top:14px;padding-top:12px;border-top:1px solid var(--line2)">
+            <h3 style="margin-bottom:4px">External Mods &amp; Systems Bridge</h3>
+            <p class="note" style="margin-bottom:8px">Separate bridge for external mods, traps, environmental hazards, and scripted mechanics. Independent of combat hits above.</p>
+            <div class="row"><div class="lab"><b>Player Character (External Mods &amp; Systems)</b><small>Allow external mods and scripted systems to voxelise and dismember your character even when combat hits on the player are turned off.</small></div>
+              <div class="ctl"><button class="sw cb" data-k="who.modPlayer" aria-pressed="true" aria-label="Player for external mods and systems"></button></div></div>
+          </div>
         </div>
 
         <div class="card">
@@ -423,6 +429,10 @@ details.adv[open] > summary::after{content:"Hide Advanced ▴"}
           <div class="row"><div class="lab"><b>Out-of-combat body healing</b><small>Seconds after combat before wounds regenerate (0 = never).</small></div>
             <div class="ctl num"><input type="range" id="cbResetAfter" min="0" max="300" step="5" value="0">
             <output id="cbResetAfterV">never</output><span class="unit">s</span></div></div>
+          <div class="row"><div class="lab"><b>Stagger / ragdoll fodder overkill</b>
+            <small>Chance for a heavy, power, or sneak blow to detonate a staggered or knocked-down non-unique fodder enemy.</small></div>
+            <div class="ctl num"><input type="range" id="fodderOverkillPct" min="0" max="100" step="1" value="10">
+            <output for="fodderOverkillPct" id="fodderOverkillPctV">10</output><span class="unit">%</span></div></div>
         </div>
 
         <div class="card" style="grid-column:1/-1">
@@ -525,7 +535,7 @@ details.adv[open] > summary::after{content:"Hide Advanced ▴"}
       <div class="spellhead">
         <button class="btn" id="grantAll">Grant All Spells</button>
         <button class="btn q" id="revokeAll">Revoke All Spells</button>
-        <span class="count" id="spCount">0 of 60 granted</span>
+        <span class="count" id="spCount">0 of 56 granted</span>
       </div>
       <p class="note" style="margin:-6px 0 18px;color:var(--faint);max-width:68ch;font-size:12px">
         Toggle which FleshCore debug and wounding spells are present in your spellbook.
@@ -551,6 +561,13 @@ details.adv[open] > summary::after{content:"Hide Advanced ▴"}
           <div class="row"><div class="lab"><b>Pre-build all actors seen this session</b>
             <small>Uses idle background time to prepare every eligible actor seen this session.</small></div>
             <div class="ctl"><button class="sw" id="roster" aria-pressed="true" aria-label="Offer everyone seen this session"></button></div></div>
+          <div class="row"><div class="lab"><b>Blood splatter &amp; pools</b>
+            <small>Paints blood decals on actors, floors, and severed chunks. Turning off skips new blood decals and pools.</small></div>
+            <div class="ctl"><button class="sw" id="bloodSplat" aria-pressed="true" aria-label="Blood splatter and pools"></button></div></div>
+          <div class="row"><div class="lab"><b>Blood splatter amount</b>
+            <small>Scales decal and Detonate splatter density from 0% to 100%.</small></div>
+            <div class="ctl num"><input type="range" id="bloodSplatPct" min="0" max="100" step="5" value="100">
+            <output for="bloodSplatPct" id="bloodSplatPctV">100</output><span class="unit">%</span></div></div>
         </div>
 
         <div class="card">
@@ -612,7 +629,7 @@ details.adv[open] > summary::after{content:"Hide Advanced ▴"}
         <div class="card">
           <h3>Engine Status</h3>
           <dl class="kv">
-            <dt>Version</dt><dd id="dBanner">FleshCore v0.1.1 Beta</dd>
+            <dt>Version</dt><dd id="dBanner">FleshCore v0.2.0 Beta</dd>
             <dt>Armed</dt><dd id="dArmed">yes — form lookups validated</dd>
             <dt>Co-save</dt><dd id="dCosave">armed · serialization v4 · id FCWS</dd>
             <dt>Plugin</dt><dd id="dPlugin">FleshCore.esp</dd>
@@ -690,8 +707,8 @@ const state = {
     "right upper arm":false,"right forearm":false,"right hand":false,
     "left thigh":false,"left lower leg":false,"left foot":false,
     "right thigh":false,"right lower leg":false,"right foot":false },
-  body: { skin: 20, flesh: 35, bone: 15 },
-  head: { skin: 40, bone: 15, brain: 25 },
+  body: { skin: 45, flesh: 40, bone: 31 },
+  head: { skin: 67, flesh: 62, bone: 57 },
   live: { "head":100,"upper torso":100,"abdomen":100,
     "left upper arm":100,"left forearm":100,"left hand":100,
     "right upper arm":100,"right forearm":100,"right hand":100,
@@ -702,7 +719,7 @@ const state = {
 };
 
 const SPELLS = [
-  ["Body Cuts", [[0x819,"Nick (Small Bite)"],[0x81B,"Bite (Flense)"],[0x81D,"Deep Bite (Maul)"],[0x81F,"Excavate (Huge Bite)"],
+  ["Body Cuts", [[0x819,"Nick"],[0x81B,"Flense"],[0x81D,"Maul"],[0x81F,"Excavate"],
     [0x821,"Shatter"],[0x823,"Rend"],[0x825,"Flay"],[0x827,"Cleave"],[0x829,"Bisect"],
     [0x82B,"Sunder"],[0x82D,"Skewer"],[0x82F,"Impale"],[0x831,"Shred"],[0x833,"Unmake"],
     [0x83C,"Thin Cut"],[0x83E,"Halve"],[0x862,"Slash"],[0x864,"Rake"]]],
@@ -711,17 +728,15 @@ const SPELLS = [
     [0x874,"Unmask"],[0x876,"Crown"],[0x878,"Hollow"],[0x87A,"Decapitate"]]],
   ["Whole Body & Detonation", [[0x84A,"Excarnate"],[0x880,"Detonate"]]],
   ["Surface Marks", [[0x842,"Splatter"]]],
-  ["Grinding", [[0x85A,"Grind Down"],[0x85C,"Grind Player"]]],
+  ["Grinding", [[0x85A,"Grind Down"],[0x85C,"Grind Self"]]],
   ["Restoration", [[0x87C,"Restore Target"],[0x87E,"Restore Self"]]],
   ["Knockout", [[0x88F,"Knockout"],[0x891,"Knockout Cure"]]],
-  ["Sever a Specific Limb", [[0x8AB,"Take Left Arm"],[0x8AD,"Take Right Arm"],
-    [0x8AF,"Take Left Forearm"],[0x8B1,"Take Right Forearm"],
-    [0x8B3,"Take Left Hand"],[0x8B5,"Take Right Hand"],
-    [0x8B7,"Take Left Leg"],[0x8B9,"Take Right Leg"],
-    [0x8BB,"Take Left Lower Leg"],[0x8BD,"Take Right Lower Leg"],
-    [0x8BF,"Take Left Foot"],[0x8C1,"Take Right Foot"],
-    [0x8A0,"Take Left Arm (Self)"],[0x8A2,"Take Right Arm (Self)"],
-    [0x8A4,"Take Left Leg (Self)"],[0x8A6,"Take Right Leg (Self)"]]],
+  ["Sever a Specific Limb", [[0x8AB,"Take L. Arm"],[0x8AD,"Take R. Arm"],
+    [0x8AF,"Take L. Forearm"],[0x8B1,"Take R. Forearm"],
+    [0x8B3,"Take L. Hand"],[0x8B5,"Take R. Hand"],
+    [0x8B7,"Take L. Leg"],[0x8B9,"Take R. Leg"],
+    [0x8BB,"Take L. Calf"],[0x8BD,"Take R. Calf"],
+    [0x8BF,"Take L. Foot"],[0x8C1,"Take R. Foot"]]],
   ["Area Hazards", [[0x899,"Shredder Sphere"],[0x89C,"Shredder Rune"]]],
   ["Self-Targeted", [[0x84F,"Splatter (Self)"],
     [0x856,"Bisect (Self)"],[0x896,"Decapitate (Self)"]]],
@@ -857,6 +872,32 @@ function setFatal(n, v) {
   SEND("lethal", { part: n, fatal: v });
 }
 
+function clampLayerThresholds(setKey, changedLayer, rawVal) {
+  const cur = state[setKey];
+  if (!cur) return;
+  let s = cur.skin | 0, f = cur.flesh | 0, b = cur.bone | 0;
+  const v = Math.max(0, Math.min(100, rawVal | 0));
+  if (changedLayer === "skin") {
+    s = v;
+    if (f > s) f = s;
+    if (b > f) b = f;
+  } else if (changedLayer === "flesh") {
+    f = Math.min(v, s);
+    if (b > f) b = f;
+  } else if (changedLayer === "bone") {
+    b = Math.min(v, f);
+  }
+  cur.skin = s; cur.flesh = f; cur.bone = b;
+  ["skin", "flesh", "bone"].forEach(l => {
+    const el = document.getElementById(setKey + "-" + l);
+    if (el) {
+      el.value = cur[l];
+      const sp = el.parentElement && el.parentElement.querySelector(".val span");
+      if (sp) sp.textContent = String(cur[l]);
+    }
+  });
+}
+
 function layerCard(title, note, key, layers) {
   const c = document.createElement("div");
   c.className = "card";
@@ -868,15 +909,15 @@ function layerCard(title, note, key, layers) {
     const v = state[key][id];
     row.innerHTML =
       "<div class='lname'>" + label + "<em>" + gloss + "</em></div>" +
-      "<input type='range' id='" + key + "-" + id + "' min='0' max='100' step='5' value='" + v + "' " +
+      "<input type='range' id='" + key + "-" + id + "' min='0' max='100' step='1' value='" + v + "' " +
         "aria-label='" + title + " " + label + "'>" +
       "<div class='val'><span>" + v + "</span>%</div>";
-    const inp = row.querySelector("input"), out = row.querySelector(".val span");
-    inp.oninput = () => { out.textContent = inp.value; };
+    const inp = row.querySelector("input");
+    inp.oninput = () => { clampLayerThresholds(key, id, +inp.value); };
     inp.onchange = () => {
-      state[key][id] = +inp.value;
+      clampLayerThresholds(key, id, +inp.value);
       markCustomPreset();
-      SEND("threshold", { set: key, layer: id, pct: +inp.value });
+      SEND("threshold", { set: key, layer: id, pct: state[key][id] });
     };
     wired.push([inp, key + "." + id]);
     box.appendChild(row);
@@ -886,11 +927,11 @@ function layerCard(title, note, key, layers) {
 const advBodyStack = document.getElementById("advBodyStack");
 if (advBodyStack) {
   advBodyStack.insertBefore(
-    layerCard("Head Layer Thresholds", "Minimum percentage of each head layer that must remain attached before death (0% = any loss is fatal).", "head",
-      [["skin","Skin","face and scalp"],["bone","Bone","skull"],["brain","Brain","brain tissue"]]),
+    layerCard("Head Layer Lethality", "Lethality threshold per head layer (0% = survivable, 100% = any loss is fatal). Enforces Skin \u2265 Flesh \u2265 Bone.", "head",
+      [["skin","Skin","face and scalp"],["flesh","Flesh","brain & deep tissue"],["bone","Bone","skull"]]),
     advBodyStack.firstChild);
   advBodyStack.insertBefore(
-    layerCard("Body Layer Thresholds", "Minimum percentage of each body layer below the neck that must remain attached.", "body",
+    layerCard("Body Layer Lethality", "Lethality threshold per body layer below the neck (0% = survivable, 100% = any loss is fatal). Enforces Skin \u2265 Flesh \u2265 Bone.", "body",
       [["skin","Skin","outer layer"],["flesh","Flesh","muscle and fat"],["bone","Bone","skeleton"]]),
     advBodyStack.firstChild.nextSibling);
 }
@@ -982,6 +1023,7 @@ function bindRange(id, fmt, verb) {
 const f2 = v => v.toFixed(2), f1 = v => v.toFixed(1), f0 = v => String(v);
 [["lossLimb",f0],["coalesce",f0],["cgap",f0],["partSpan",f0],
  ["pollMs",f0],["hitCd",f0],["cell",f1],["maxcells",f0],["budget",f0],
+ ["bloodSplatPct",f0],["fodderOverkillPct",f0],
  ["maxPieces", v => v > 0 ? String(v) : "no limit"]]
   .forEach(([id, fmt]) => bindRange(id, fmt));
 
@@ -1103,7 +1145,7 @@ function describeIntensity(lvl) {
 }
 
 const CB = { on:0, blows:0, vulnhp:0, keepcfg:0, "peel.stages":1, "preset.id":0, "preset.base":50, lossLimb:4,
-  "who.npc":1, "who.essential":0, "who.follower":0, "who.player":0,
+  "who.npc":1, "who.essential":0, "who.follower":0, "who.player":0, "who.modPlayer":1,
   "player.skin":0, "player.flesh":0, "player.bones":0, "player.sever":0,
   "reset.after":0, "reset.rate":0, "reset.hp":0, "drain.on":0, "drain.rate":4, "drain.secs":8, hitCd:250,
   maxPieces:35 };   // the live-piece cap the DLL has in force, shown on the Engine page
@@ -1116,7 +1158,7 @@ CB_TRIGS.forEach(t => { CB["t."+t[0]+".on"] = CB_TRIG_DEF[t[0]][0]; CB["t."+t[0]
 
 function cbSet(key, val) {
   CB[key] = val;
-  if (key !== "preset.id" && key !== "preset.base") {
+  if (key !== "preset.id" && key !== "preset.base" && key !== "power.perLevel" && key !== "who.modPlayer") {
     markCustomPreset();
   }
   SEND("combat", { key, val });
@@ -1372,7 +1414,25 @@ window.fcApply = function (json) {
   // The engine's own switches, sliders and head thresholds, as it holds them.
   if (d.tog) { for (const k of Object.keys(d.tog)) { const b = document.getElementById(k); if (b && b.classList.contains("sw")) b.setAttribute("aria-pressed", d.tog[k] ? "true" : "false"); } }
   if (d.num) { for (const k of Object.keys(d.num)) { const el = document.getElementById(k); if (el && el.type === "range") { el.value = d.num[k]; if (el.oninput) el.oninput(); if (+el.value !== d.num[k]) { const o = document.getElementById(k + "V"); if (o) o.textContent = String(d.num[k]); } } } }
-  if (d.thr) { for (const k of Object.keys(d.thr)) { const p = k.split("."); const el = document.getElementById(p[0] + "-" + p[1]); if (el && el.type === "range" && state[p[0]]) { state[p[0]][p[1]] = d.thr[k]; el.value = d.thr[k]; if (el.oninput) el.oninput(); } } }
+  if (d.thr) {
+    for (const k of Object.keys(d.thr)) {
+      const p = k.split(".");
+      const lyr = (p[0] === "head" && p[1] === "brain") ? "flesh" : p[1];
+      const el = document.getElementById(p[0] + "-" + lyr);
+      if (el && el.type === "range" && state[p[0]]) {
+        state[p[0]][lyr] = d.thr[k];
+        el.value = d.thr[k];
+        const sp = el.parentElement && el.parentElement.querySelector(".val span");
+        if (sp) sp.textContent = String(d.thr[k]);
+      }
+    }
+    ["head", "body"].forEach(s => clampLayerThresholds(s, "skin", state[s].skin));
+  }
+  if (d.diag) {
+    const da = document.getElementById("dArmed"); if (da && d.diag.armed !== undefined) da.textContent = d.diag.armed;
+    const dp = document.getElementById("dPlugin"); if (dp && d.diag.plugin !== undefined) dp.textContent = d.diag.plugin;
+    const db = document.getElementById("dBodies"); if (db && d.diag.bodies !== undefined) db.textContent = d.diag.bodies;
+  }
   // The DLL pushes every GRANTED id (PanelPush walks g_panel.grant); an id it does not name is not granted.
   // Known ids only: an id the panel does not know is neither merged nor counted.
   if (d.spells) { for (const k of Object.keys(state.spells)) state.spells[k] = !!d.spells[k]; renderSpells(); }

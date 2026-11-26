@@ -174,7 +174,9 @@ Bool Function Splat(ObjectReference at, Int kind, Int size) global
 
      World-space down, not node-space -- see SplatDir. A corpse's root node is
      not upright, and a cast rotated into its frame would go sideways.}
-    Return SplatDir(at, kind, size, 0.0, 0.0, -1.0, 64.0, false)
+    Float ang = Utility.RandomFloat(0.0, 360.0)
+    Float tilt = Utility.RandomFloat(0.16, 0.32)
+    Return SplatDir(at, kind, size, tilt * Math.Cos(ang), tilt * Math.Sin(ang), -0.96, 72.0, false)
 EndFunction
 
 Bool Function SplatDir(ObjectReference at, Int kind, Int size, \
@@ -514,7 +516,9 @@ Bool Function SplatNode(ObjectReference at, String node, Int kind, Int size, Flo
     If s == None
         Return false
     EndIf
-    Return at.PlayImpactEffect(s, node, 0.0, 0.0, -1.0, dist, false, false)
+    Float ang = Utility.RandomFloat(0.0, 360.0)
+    Float tilt = Utility.RandomFloat(0.14, 0.28)
+    Return at.PlayImpactEffect(s, node, tilt * Math.Cos(ang), tilt * Math.Sin(ang), -0.97, dist, false, false)
 EndFunction
 
 ; ==========================================================================
@@ -1072,7 +1076,8 @@ Bool Function Fade(Actor who, Int area, Int layer, Float alpha) global
         Return false
     EndIf
     Bool female = IsFemale(who)
-    NiOverride.AddNodeOverrideFloat(who, female, NodeName(area, layer), 8, -1, alpha, true)
+    NiOverride.AddNodeOverrideFloat(who, female, NodeName(area, layer), 8, -1, alpha, false)
+    NiOverride.ApplyNodeOverrides(who)
     ; AND THE RECORD IS TOLD, or a load would put the mark back at the strength
     ; it was painted at rather than the strength it had faded to. Only if there
     ; is already a slot for this layer: fading something this service did not
@@ -1810,6 +1815,88 @@ Function Unrecord(Actor who, Int area, Int layer) global
     If StorageUtil.IntListCount(who, SlotsKey()) < 1
         StorageUtil.FormListRemove(None, WornKey(), who, true)
     EndIf
+EndFunction
+
+Bool Function OwnedTex(DC_Core c, String tex) global
+    {True when `tex` matches any variant of any DecalCore kind.}
+    If c == None || tex == ""
+        Return false
+    EndIf
+    Return VariantOf(c, tex) >= 0
+EndFunction
+
+Function Forget(Actor who) global
+    {Drop a single clean actor from the strip list and marked FormList.}
+    If who == None
+        Return
+    EndIf
+    Int id = who.GetFormID()
+    Int idx = JsonUtil.IntListFind(MarkFile(), MarkKey(), id)
+    While idx >= 0
+        JsonUtil.IntListRemoveAt(MarkFile(), MarkKey(), idx)
+        idx = JsonUtil.IntListFind(MarkFile(), MarkKey(), id)
+    EndWhile
+    JsonUtil.Save(MarkFile())
+    DC_Core c = Core()
+    If c != None && c.Marked != None && c.Marked.HasForm(who)
+        c.Marked.RemoveAddedForm(who)
+    EndIf
+    StorageUtil.FormListRemove(None, WornKey(), who, true)
+EndFunction
+
+Bool Function WashStep(Actor who, Float afAlphaDrop = 0.22) global
+    {Gradually wash DecalCore overlays and effect coats off `who` in water.
+     Returns true when all DecalCore slots on `who` are clean (and emits FL_Clean).}
+    If who == None
+        Return false
+    EndIf
+    UncoatAll(who)
+    If !PaintReady()
+        Return false
+    EndIf
+    DC_Core c = Core()
+    If c == None
+        Return false
+    EndIf
+    MigrateSlots(who)
+    Bool female = IsFemale(who)
+    Bool touched = false
+    Int i = StorageUtil.IntListCount(who, SlotsKey()) - 1
+    While i >= 0
+        Int slot = StorageUtil.IntListGet(who, SlotsKey(), i)
+        Int area = slot / 100 - 1
+        Int layer = slot % 100
+        If area >= 0 && area < 4 && layer >= 0 && layer < LayerCount(area)
+            String node = NodeName(area, layer)
+            String cur = NiOverride.GetNodePropertyString(who, false, node, 9, 0)
+            If OwnedTex(c, cur)
+                Float curAlpha = StorageUtil.GetFloatValue(who, AlphaKey(slot), 0.75)
+                Float nextAlpha = curAlpha - afAlphaDrop
+                If nextAlpha > 0.03
+                    Fade(who, area, layer, nextAlpha)
+                Else
+                    NiOverride.AddNodeOverrideString(who, female, node, 9, 0, DefaultOverlay(), false)
+                    NiOverride.AddNodeOverrideFloat(who, female, node, 8, -1, 0.0, false)
+                    Unrecord(who, area, layer)
+                EndIf
+                touched = true
+            Else
+                Unrecord(who, area, layer)
+            EndIf
+        Else
+            Unrecord(who, area, layer)
+        EndIf
+        i -= 1
+    EndWhile
+    If touched
+        NiOverride.ApplyNodeOverrides(who)
+    EndIf
+    If StorageUtil.IntListCount(who, SlotsKey()) < 1
+        Forget(who)
+        who.SendModEvent("FL_Clean", "", 0.0)
+        Return true
+    EndIf
+    Return false
 EndFunction
 
 Int Function RecordedCount(Actor who) global

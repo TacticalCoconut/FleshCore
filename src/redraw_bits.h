@@ -93,15 +93,17 @@ static inline std::uint32_t GatherPart(const std::uint16_t* tab, std::uint32_t r
         if (c >= cellCount) continue;
         if (underArmourSkin) {
             // Hidden body skin under a cuirass: only draw in cells where worn
-            // armour (0x10) has been peeled off and skin (0x01) is still intact.
+            // armour (0x10) has been peeled off, skin (0x01) is still intact,
+            // and no visible outer skin shape already covers that cell (bit 2 of coveredOf).
             if (!(goneOf[c] & flesh::kArmourBit)) continue;
             if (goneOf[c] & 1u) continue;
+            if (coveredOf[c] & 2u) continue;
         } else {
             if (goneOf[c] & (1u << L)) continue;
             // THE CLEARANCE RULE: hold back all interior fill lumps outside the
             // 2-cell neighbourhood of actual cuts so unwounded body parts (head,
             // hands, feet) never show internal skull/muscle lumps.
-            if (L >= 1 && L < 4 && coveredOf[c]) { ++hid; continue; }
+            if (L >= 1 && L < 4 && (coveredOf[c] & 1u)) { ++hid; continue; }
         }
         out.push_back(orig[t * 3]); out.push_back(orig[t * 3 + 1]); out.push_back(orig[t * 3 + 2]);
     }

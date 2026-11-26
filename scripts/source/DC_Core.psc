@@ -246,3 +246,74 @@ String Function SkinFor(Int kind, Int layer)
     EndIf
     Return ""
 EndFunction
+
+Bool _washArmed = false
+Bool _playerWashedSent = false
+
+Function EnsureWashLoop()
+    RegisterForModEvent("FleshCore_GameReload", "OnFleshCoreReload")
+    If !_washArmed
+        _washArmed = true
+        RegisterForSingleUpdate(1.0)
+    EndIf
+EndFunction
+
+Event OnInit()
+    EnsureWashLoop()
+EndEvent
+
+Function OnFleshCoreReload(String eventName, String strArg, Float numArg, Form sender)
+    _washArmed = true
+    _playerWashedSent = false
+    RegisterForModEvent("FleshCore_GameReload", "OnFleshCoreReload")
+    RegisterForSingleUpdate(1.0)
+EndFunction
+
+Function WashActorCheck(Actor a, Bool isPlayer)
+    If !a || a.IsDisabled() || !a.Is3DLoaded()
+        Return
+    EndIf
+    Bool deep = a.IsSwimming() || PO3_SKSEFunctions.IsActorUnderwater(a)
+    Bool waist = false
+    If !deep
+        waist = PO3_SKSEFunctions.IsRefNodeInWater(a, "NPC Pelvis [Pelv]") || PO3_SKSEFunctions.IsRefNodeInWater(a, "NPC Spine [Spn0]")
+    EndIf
+    If deep || waist
+        Float drop = 0.22
+        If deep
+            drop = 0.35
+        EndIf
+        If StorageUtil.IntListCount(a, DC_Api.SlotsKey()) > 0
+            DC_Api.WashStep(a, drop)
+            If isPlayer
+                _playerWashedSent = true
+            EndIf
+        Else
+            DC_Api.UncoatAll(a)
+            If isPlayer && !_playerWashedSent
+                _playerWashedSent = true
+                a.SendModEvent("FL_Clean", "", 0.0)
+            EndIf
+        EndIf
+    ElseIf isPlayer
+        _playerWashedSent = false
+    EndIf
+EndFunction
+
+Event OnUpdate()
+    Actor p = Game.GetPlayer()
+    If p
+        WashActorCheck(p, true)
+    EndIf
+    Int i = StorageUtil.FormListCount(None, DC_Api.WornKey()) - 1
+    While i >= 0
+        Actor a = StorageUtil.FormListGet(None, DC_Api.WornKey(), i) as Actor
+        If a && a != p
+            If !p || a.GetDistance(p) <= 3500.0
+                WashActorCheck(a, false)
+            EndIf
+        EndIf
+        i -= 1
+    EndWhile
+    RegisterForSingleUpdate(1.0)
+EndEvent

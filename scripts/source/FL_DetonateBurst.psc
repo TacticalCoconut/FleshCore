@@ -93,11 +93,28 @@ Event OnEffectStart(Actor akTarget, Actor akCaster)
     If c.HasKind(Kind)
         k = Kind
     EndIf
+    Int pct = 0
+    If FL_Native.GetBloodSplatter()
+        pct = FL_Native.GetBloodSplatterPct()
+    EndIf
+    If pct <= 0
+        Return
+    EndIf
+    If pct > 100
+        pct = 100
+    EndIf
+    StorageUtil.SetFloatValue(akTarget, "FL_LastDetonateBurst", Utility.GetCurrentRealTime())
+    Float scale = (pct as Float) / 100.0
+    Int coatBand = (5.0 * scale + 0.999) as Int
+    If coatBand < 1
+        coatBand = 1
+    ElseIf coatBand > 5
+        coatBand = 5
+    EndIf
     ; WHAT IS LEFT OF THEM WEARS IT. CoatSkin is the shard coat -- an effect
     ; shader in their body's UV, played on the reference, no overlay and no 3D
-    ; rebuild -- at the heaviest of DecalCore's six bands. Their pieces get the
-    ; same coat from FL_Chunk as they come away.
-    DC_Api.CoatSkin(akTarget, k, 5)
+    ; rebuild -- scaled by the splatter slider.
+    DC_Api.CoatSkin(akTarget, k, coatBand)
     ObjectReference org = akTarget.PlaceAtMe(XMarker, 1, true, false)
     If !org
         Debug.Trace("[FleshCore] burst: could not place the origin -- no burst")
@@ -143,40 +160,57 @@ Event OnEffectStart(Actor akTarget, Actor akCaster)
     ;
     ; all of them a third of one large decal's 60-96 units, and the 28
     ; between rings likewise, so the marks pile rather than tile.
-    Int got = Axis(c, org, h, k)
-    If got >= 0
-        landed += got
-        rays += 5
+    Int nHoriz = (4.0 * scale + 0.999) as Int
+    Int nR1 = (8.0 * scale + 0.999) as Int
+    Int nR2 = (12.0 * scale + 0.999) as Int
+    Int nR3 = (16.0 * scale + 0.999) as Int
+    Int nFlat = (8.0 * scale + 0.999) as Int
+    If nHoriz > 4
+        nHoriz = 4
     EndIf
-    got = Burst(c, org, 28.0, 8, 0.0, h, k)
+    ; Each ring's own count goes into the closing trace (-1: no atlas), so a
+    ; test log shows which part of the fan found a surface.
+    Int got = Axis(c, org, h, k, nHoriz)
+    String per = "axis " + got
     If got >= 0
         landed += got
-        rays += 8
+        rays += 1 + nHoriz
+    EndIf
+    got = Burst(c, org, 28.0, nR1, 0.0, h, k)
+    per += ", rings " + got
+    If got >= 0
+        landed += got
+        rays += nR1
         nring += 1
     EndIf
-    got = Burst(c, org, 55.0, 12, 15.0, h, k)
+    got = Burst(c, org, 55.0, nR2, 15.0, h, k)
+    per += "/" + got
     If got >= 0
         landed += got
-        rays += 12
+        rays += nR2
         nring += 1
     EndIf
-    got = Burst(c, org, 83.0, 16, 11.25, h, k)
+    got = Burst(c, org, 83.0, nR3, 11.25, h, k)
+    per += "/" + got
     If got >= 0
         landed += got
-        rays += 16
+        rays += nR3
         nring += 1
     EndIf
     ; AND THE ROOM: every ring ray above aims DOWN, so nothing but the four
-    ; axis rays could reach a wall. Eight flat rays, 200 units, from their
+    ; axis rays could reach a wall. Flat rays, 200 units, from their
     ; height, for the walls and whatever stands between the target and the walls.
-    got = Flat(c, org, 8, 22.5, k)
+    got = Flat(c, org, nFlat, 22.5, k)
+    per += ", flat " + got
     If got >= 0
         landed += got
-        rays += 8
+        rays += nFlat
     EndIf
     If nring == 0 && rays == 0
         Debug.Trace("[FleshCore] burst (kind " + k + "): DecalCore had no atlas -- nothing fired")
     EndIf
+    ; How far above their origin the fan's apex really was (the record asks 48).
+    Float apex = org.GetPositionZ() - akTarget.GetPositionZ()
     ; DISABLE WITHOUT WAITING, THEN DELETE -- the order FL_DecalMark ends its
     ; own sweep in (FL_DecalMark.psc). The vanilla header's own words
     ; are all that is claimed for it: DisableNoWait "Disables this object -
@@ -187,49 +221,43 @@ Event OnEffectStart(Actor akTarget, Actor akCaster)
     org.DisableNoWait()
     org.Delete()
     Debug.Trace("[FleshCore] burst (kind " + k + "): " + landed + " mark(s) from " + rays \
-                + " ray(s) in " + nring + " ring(s) around " + akTarget)
+                + " ray(s) in " + nring + " ring(s) around " + akTarget \
+                + " (" + per + "; apex " + apex + " above them)")
 EndEvent
 
-Int Function Axis(DC_Core c, ObjectReference org, Float afHeight, Int aiKind)
-    {The floor directly under them and the four horizontal rays, from the one
-     origin. Returns how many of the five laid a mark, or -1 if there was no
-     atlas to fire at all -- which is not the same as five misses, and the
-     trace has to be able to tell them apart.
-
-     THE DOWN RAY IS THE HEIGHT AND NOT 96. It has exactly afHeight of floor
-     to cross; the 16 is the same overshoot every ray in this script carries,
-     so a floor slightly below their feet is still met.
-
-     THE FOUR HORIZONTAL RAYS ARE KEPT AT 96 -- FL_DecalMark's Reach default
-     (FL_DecalMark.psc). They are the only rays in the burst that can reach a
-     WALL or the side of a table; every other ray is aimed at the floor by
-     construction. Fired from Height above their feet, they meet furniture at
-     knee height.
-
-     THERE IS NO UP RAY. From 48 units up, 96 units of reach ends at 144 --
-     about two metres, and lower than the ceiling of very nearly every room in
-     the game -- so it would meet nothing, and where it did it would mark a
-     ceiling nobody is looking at.}
-    ImpactDataSet s = c.SetFor(aiKind, DC_Api.LARGE())
-    If s == None
+Int Function Axis(DC_Core c, ObjectReference org, Float afHeight, Int aiKind, Int aiHorizMax = 4)
+    {The floor directly under them and up to aiHorizMax horizontal rays, from the one
+     origin.}
+    ImpactDataSet s0 = c.SetFor(aiKind, Utility.RandomInt(1, 2))
+    If s0 == None
         Return -1
     EndIf
     Int n = 0
-    If org.PlayImpactEffect(s, "", 0.0, 0.0, -1.0, afHeight + 16.0, false, false)
+    Float cAng = Utility.RandomFloat(0.0, 360.0)
+    Float cTilt = Utility.RandomFloat(0.14, 0.28)
+    ; 60 units past the floor assumed under the origin: a body whose origin
+    ; sits above the floor (lying, ragdolled, on a slope) still marks it.
+    If org.PlayImpactEffect(s0, "", cTilt * Math.Cos(cAng), cTilt * Math.Sin(cAng), -0.97, afHeight + 60.0, false, false)
         n += 1
     EndIf
-    If org.PlayImpactEffect(s, "", 1.0, 0.0, 0.0, 96.0, false, false)
-        n += 1
+    Int hLim = aiHorizMax
+    If hLim < 0
+        hLim = 0
+    ElseIf hLim > 4
+        hLim = 4
     EndIf
-    If org.PlayImpactEffect(s, "", -1.0, 0.0, 0.0, 96.0, false, false)
-        n += 1
-    EndIf
-    If org.PlayImpactEffect(s, "", 0.0, 1.0, 0.0, 96.0, false, false)
-        n += 1
-    EndIf
-    If org.PlayImpactEffect(s, "", 0.0, -1.0, 0.0, 96.0, false, false)
-        n += 1
-    EndIf
+    Int hIdx = 0
+    While hIdx < hLim
+        ImpactDataSet sh = c.SetFor(aiKind, Utility.RandomInt(0, 2))
+        If sh != None
+            Float hAng = (90.0 * hIdx) + Utility.RandomFloat(-28.0, 28.0)
+            Float hDz = Utility.RandomFloat(-0.22, 0.16)
+            If org.PlayImpactEffect(sh, "", Math.Cos(hAng), Math.Sin(hAng), hDz, Utility.RandomFloat(84.0, 128.0), false, false)
+                n += 1
+            EndIf
+        EndIf
+        hIdx += 1
+    EndWhile
     Return n
 EndFunction
 
@@ -237,71 +265,34 @@ Int Function Burst(DC_Core c, ObjectReference org, Float afRadius, Int aiRays, \
                    Float afTurn, Float afHeight, Int aiKind)
     {One ring of the fan: aiRays cast DOWN AND OUT from the held origin at the
      circle of radius afRadius on the floor around them, starting afTurn degrees
-     round. Returns how many laid a mark, or -1 if there was no atlas.
-
-     THE ARGUMENT SHAPE IS SplatDir's, REPRODUCED RATHER THAN CALLED.
-     DC_Api.SplatDir ends in
-
-         Return at.PlayImpactEffect(s, "", dx, dy, dz, dist, applyNodeRotation, false)
-
-     (DC_Api.psc) -- node "" so the cast starts at the reference's own
-     origin rather than a bone, WORLD-SPACE direction (applyNodeRotation
-     false: "FALSE means dx/dy/dz are world-space, which is what every caller
-     here wants", DC_Api.psc), and the native's own answer passed
-     straight through, which is what makes the count mean anything
-     (DC_Api.psc). The only thing not reproduced is the part that
-     costs: SplatDir resolves the service quest and re-picks an atlas on EVERY
-     call, and both of those are done once per RING here instead.
-
-     ---- THE AIM, IN FULL -------------------------------------------------
-
-     The origin sits afHeight above the floor they are standing on. The point
-     this ray is for is on that floor, afRadius out, at angle ang. So the
-     vector from the origin to that point is
-
-         ( r*cos(ang), r*sin(ang), -afHeight )
-
-     whose length is len = sqrt(r*r + afHeight*afHeight). PlayImpactEffect
-     takes a DIRECTION and a LENGTH separately, so the vector is divided by
-     len -- every caller in DC_Api normalises (see SplatToward)
-     and this keeps the same convention -- and the length passed is len plus a
-     16-unit overshoot, the same margin SplatToward uses so a ray that arrives
-     a little short of an uneven floor still lands.
-
-     With the record's Height of 48 that is, exactly:
-
-         r=28   len = sqrt(784+2304)   = 55.57   dist = 71.57   dz = -0.864
-         r=55   len = sqrt(3025+2304)  = 73.00   dist = 89.00   dz = -0.658
-         r=83   len = sqrt(6889+2304)  = 95.88   dist = 111.88  dz = -0.501
-
-     A ray that meets a wall or a chair on its way out lands there instead,
-     which is wanted: the fan sprays what is in the room as well as the floor.
-
-     Math.Cos and Math.Sin take DEGREES (Math.psc), which is why ang is
-     in degrees and no conversion appears here.}
-    ImpactDataSet s = c.SetFor(aiKind, DC_Api.LARGE())
-    If s == None
+     round. Returns how many laid a mark, or -1 if there was no atlas.}
+    If c.SetFor(aiKind, DC_Api.LARGE()) == None
         Return -1
     EndIf
     If aiRays < 1
         Return 0
     EndIf
-    Float len = Math.sqrt(afRadius * afRadius + afHeight * afHeight)
-    If len < 1.0
-        Return 0
-    EndIf
-    ; Constant for the whole ring: only the horizontal part of the aim turns.
-    Float dz = -afHeight / len
-    Float dist = len + 16.0
     Float step = 360.0 / aiRays
     Int n = 0
     Int i = 0
     While i < aiRays
-        Float ang = afTurn + step * i
-        If org.PlayImpactEffect(s, "", (afRadius * Math.Cos(ang)) / len, \
-                                (afRadius * Math.Sin(ang)) / len, \
-                                dz, dist, false, false)
-            n += 1
+        Int sz = Utility.RandomInt(0, 2)
+        If afRadius < 40.0 && sz == 0 && Utility.RandomInt(0, 2) > 0
+            sz = Utility.RandomInt(1, 2)
+        EndIf
+        ImpactDataSet s = c.SetFor(aiKind, sz)
+        If s != None
+            Float ang = afTurn + step * i + Utility.RandomFloat(-step * 0.44, step * 0.44)
+            Float rJit = afRadius * Utility.RandomFloat(0.60, 1.42)
+            Float lenJ = Math.sqrt(rJit * rJit + afHeight * afHeight)
+            If lenJ >= 1.0
+                ; Reach: 60 units past the aimed floor point, as Axis.
+                If org.PlayImpactEffect(s, "", (rJit * Math.Cos(ang)) / lenJ, \
+                                        (rJit * Math.Sin(ang)) / lenJ, \
+                                        -afHeight / lenJ, lenJ + 60.0, false, false)
+                    n += 1
+                EndIf
+            EndIf
         EndIf
         i += 1
     EndWhile
@@ -311,8 +302,7 @@ EndFunction
 Int Function Flat(DC_Core c, ObjectReference org, Int aiRays, Float afTurn, Int aiKind)
     {One flat ring: aiRays cast level, out from the held origin at their height,
      200 units, for the walls. Returns how many laid a mark, or -1 for no atlas.}
-    ImpactDataSet s = c.SetFor(aiKind, DC_Api.LARGE())
-    If s == None
+    If c.SetFor(aiKind, DC_Api.LARGE()) == None
         Return -1
     EndIf
     If aiRays < 1
@@ -322,9 +312,13 @@ Int Function Flat(DC_Core c, ObjectReference org, Int aiRays, Float afTurn, Int 
     Int n = 0
     Int i = 0
     While i < aiRays
-        Float ang = afTurn + step * i
-        If org.PlayImpactEffect(s, "", Math.Cos(ang), Math.Sin(ang), 0.0, 200.0, false, false)
-            n += 1
+        ImpactDataSet s = c.SetFor(aiKind, Utility.RandomInt(0, 2))
+        If s != None
+            Float ang = afTurn + step * i + Utility.RandomFloat(-step * 0.42, step * 0.42)
+            Float fDz = Utility.RandomFloat(-0.18, 0.16)
+            If org.PlayImpactEffect(s, "", Math.Cos(ang), Math.Sin(ang), fDz, Utility.RandomFloat(165.0, 235.0), false, false)
+                n += 1
+            EndIf
         EndIf
         i += 1
     EndWhile

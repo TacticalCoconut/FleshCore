@@ -13,6 +13,7 @@
 
 #include <windows.h>
 #include <stdint.h>
+#include <cstring>
 
 typedef uint64_t PrismaView;
 
@@ -142,8 +143,10 @@ namespace PRISMA_UI_API {
             return nullptr;
         }
 
-        auto requestAPIFunction =
-            reinterpret_cast<RequestPluginAPIFunc>(GetProcAddress(pluginHandle, "RequestPluginAPI"));
+        FARPROC rawProc = GetProcAddress(pluginHandle, "RequestPluginAPI");
+        RequestPluginAPIFunc requestAPIFunction = nullptr;
+        static_assert(sizeof(requestAPIFunction) == sizeof(rawProc), "ptr size");
+        std::memcpy(&requestAPIFunction, &rawProc, sizeof(requestAPIFunction));
 
         if (requestAPIFunction) {
             return requestAPIFunction(a_interfaceVersion);

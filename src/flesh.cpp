@@ -69,6 +69,7 @@ static inline void __builtin_ia32_pause() { _mm_pause(); }
 #include "facts.h"
 #include "lattice.h"
 #include "chunknif.h"
+#include "rawguard.h"   // stale vertex records: the print, the verdict, the forge's edge guard
 
 using u32 = std::uint32_t;
 
@@ -89,10 +90,11 @@ using u32 = std::uint32_t;
 // mingw and linked static, and a CRITICAL_SECTION has no runtime to depend on.
 static CRITICAL_SECTION g_csBodies, g_csLog, g_csForge, g_csOut;
 static bool g_locksReady = false;
+static thread_local int g_guardDepth = 0;
 struct Guard {
     CRITICAL_SECTION* cs;
-    explicit Guard(CRITICAL_SECTION* c) : cs(c) { if (g_locksReady) EnterCriticalSection(cs); }
-    ~Guard() { if (g_locksReady) LeaveCriticalSection(cs); }
+    explicit Guard(CRITICAL_SECTION* c) : cs(c) { if (g_locksReady) { EnterCriticalSection(cs); ++g_guardDepth; } }
+    ~Guard() { if (g_locksReady) { --g_guardDepth; LeaveCriticalSection(cs); } }
     Guard(const Guard&) = delete;
     Guard& operator=(const Guard&) = delete;
 };
@@ -731,7 +733,7 @@ struct PoolRec {
     DWORD tick   = 0;
     std::string path;
 };
-static PoolRec g_ledger[64];
+static PoolRec g_ledger[256];
 // THE FIRST MESH FORGED SINCE LAUNCH, kept by name as a control.
 //
 // In testing the first wound's pieces all loaded and everything
@@ -747,7 +749,7 @@ static void SayPool(const char* tag, std::size_t count)
     if (!g_probe.pool) return;
     const DWORD now = GetTickCount();
     Log("    [PROBE %s] pool ledger:", tag);
-    for (std::size_t i = 0; i < count && i < 64; ++i) {
+    for (std::size_t i = 0; i < count && i < 256; ++i) {
         const PoolRec& R = g_ledger[i];
         if (!R.claims) continue;
         Log("      slot %2u  wound %-4ld claim #%-3d  %6.1fs ago  %s",
@@ -781,7 +783,11 @@ struct SKSEMessagingInterface {
 // 2, 3 and 7. Clearing twice costs a map that is already empty; clearing on
 // the wrong one of a pair costs nothing either. Getting it wrong in the other
 // direction -- not clearing at all -- is what this fixes.
-enum { kInterface_Serialization = 3, kInterface_Task = 4, kInterface_Messaging = 5,
+struct SKSEPapyrusInterface {
+    u32  interfaceVersion;
+    bool (*Register)(bool (*)(void*));
+};
+enum { kInterface_Papyrus = 2, kInterface_Serialization = 3, kInterface_Task = 4, kInterface_Messaging = 5,
        kMessage_PreLoadGame = 2, kMessage_PostLoadGame = 3,
        kMessage_NewGame = 7, kMessage_DataLoaded = 8 };
 // THE CO-SAVE, which is the only place a wound can outlive a save.
@@ -848,6 +854,13 @@ struct PlaceJob {
     std::vector<PlacePiece> pieces;
     std::size_t next = 0;      // the next piece to place
     std::size_t engineCount = 0; // how many the engine places (1 = probe, all = on)
+    // STREAMED (E 2, E column 7): the forge hands each piece over the moment its
+    // file is written instead of the whole wound at the end. While forgeDone is
+    // false the forge may still append to `pieces` (under g_csPlace); firstAt is
+    // when the placer made the first piece of this wound, for the log.
+    bool streamed = false;
+    bool forgeDone = true;
+    double firstAt = 0;
     long epoch = 0;            // the load epoch the wound belongs to
     // The placer's memory of where their bones are, per job: FindNode walks the
     // whole rig, and the pieces of one wound share a handful of anchors.
@@ -936,6 +949,9 @@ static bool TearingDown()
 }
 static thread_local bool g_inWarm = false; // set around the warm thread's builds (head probes stay off)
 static void PlaceEnqueue(PlaceJob&& job);
+static void StreamPiece(long seq, long epoch, const PlacePiece& P);   // streamed placement, after PlaceEnqueue
+static void StreamDone(long seq, long epoch);
+static void ThrowWatchStep(double now);                               // the throw watch, after PlacedForgetAll
 static bool PlacedNote3D(u32 fid, bool on, double* msSincePlaced);   // was PlacedByUs
 static int  LivePieceCount();                                          // the plugin's pieces with 3D right now
 static void PlacedForgetAll();                                         // with the registry, on a load
@@ -949,21 +965,23 @@ struct SKSEPluginVersionData {
 // ONE VERSION, WRITTEN ONCE.
 //
 // The load banner and the plugin version data both come from these macros:
-// the banner shows major.minor.patch and the release tag ("0.1.1 Beta"), and
+// the banner shows major.minor.patch and the release tag ("0.2.0 Beta"), and
 // pluginVersion packs major, minor and patch. Keeping them side by side
 // keeps a log's first line naming the build that wrote it.
 #define FC_VER_MAJOR 0
-#define FC_VER_MINOR 1
-#define FC_VER_PATCH 1
+#define FC_VER_MINOR 2
+#define FC_VER_PATCH 0
 #define FC_STR2(x) #x
 #define FC_STR(x) FC_STR2(x)
 #define FC_VERSION FC_STR(FC_VER_MAJOR) "." FC_STR(FC_VER_MINOR) "." FC_STR(FC_VER_PATCH) " Beta"
-extern "C" __declspec(dllexport) SKSEPluginVersionData SKSEPlugin_Version =
+extern "C" {
+__declspec(dllexport) SKSEPluginVersionData SKSEPlugin_Version =
 {
     1, (FC_VER_MAJOR << 16) | (FC_VER_MINOR << 8) | FC_VER_PATCH,
     "FleshCore", "FleshCore", "",
     0, 0, { RUNTIME_VERSION_1_6_1170, 0 }, 0,
 };
+}
 static std::uintptr_t g_base = 0;
 
 // ------------------------------------------------------- validated memory
@@ -998,8 +1016,8 @@ static void ForgetMemory()
     g_lastForgetTick = nowTick;
     g_lastForgetLoadEpoch = curLoadEpoch;
     if (++g_runEpoch == 0) {
-        std::memset(g_run, 0, sizeof(g_run));
-        std::memset(g_bigRuns, 0, sizeof(g_bigRuns));
+        for (auto& r : g_run) r = MemRun{};
+        for (auto& r : g_bigRuns) r = MemRun{};
         g_lastRun = MemRun{};
         g_runEpoch = 1;
     } else {
@@ -1702,7 +1720,7 @@ struct Config {
     int   shardLifeS    = 45;
     int   sectionLifeS  = 300;
     // ---- THE ENGINE PLACES THE PIECES ----------------------------
-    // E <mode> <perFrame> <prime> <clearance> <lift>
+    // E <mode> <perFrame> <prime> <clearance> <lift> [stream]
     //
     // mode      0 the script places every piece, as it always has
     //           1 PROBE: the engine places the FIRST piece of every wound
@@ -1718,11 +1736,17 @@ struct Config {
     // lift      bone it came off, and lifted this much -- the SAME arithmetic
     //           FL_Watch.psc does with SpawnClearance (14) and SpawnLift (6),
     //           carried here so the two placers agree to the unit.
+    // stream    column 7, optional. 1 (the default, and what an absent column
+    //           means): with mode 2 each piece goes to the game's thread the
+    //           moment its file is written, so the first piece of a wound is
+    //           placed before its last one is forged. 0: a wound's pieces are
+    //           handed over together once all of them are written, as before.
     // The engine addresses this uses are in facts.h with their provenance;
     // mode 0 never touches them.
     int   place         = 0;
     int   placePerFrame = 6;
     int   placePrime    = 0;
+    int   placeStream   = 1;     // E column 7, see above
     float spawnClearance = 14.0f;
     float spawnLift      = 6.0f;
     // ---------------------------------------------------- TRUE DISMEMBERMENT
@@ -2122,32 +2146,32 @@ struct Config {
     //         Level 1 always applies -- a mod that named the actor meant it.
     // Defaults: nothing suppressed by origin, player included -- the old
     // behaviour, until someone sets a flag.
-    int   nlSpell  = 0;
-    int   nlHit    = 0;
-    int   nlPlayer = 1;
+    int   nlSpell   = 0;
+    int   nlHit     = 0;
+    int   nlPlayer  = 1;
+    int   nlCommand = 0;
+    int   nlVortex  = 0;
+    int   nlDrain   = 0;
+    int   bloodSplatter = 1;
+    int   bloodSplatterPct = 100;
+    int   fodderOverkillPct = 10;
+    int   fodderOverkillBonusPct = 0;
+    // Monotonic Lethality % (0 = Survivable / Never Fatal, 100 = Gorefest / Instant Kill on loss;
+    // enforced Skin >= Flesh >= Bone on both Head and Body!)
+    int   headSkinLeth  = 80;
+    int   headFleshLeth = 75;
+    int   headBoneLeth  = 65;
+    int   bodySkinLeth  = 50;
+    int   bodyFleshLeth = 40;
+    int   bodyBoneLeth  = 30;
     int   panelOn       = 1;
     int   panelKey      = 52;
     int   panelDoubleMs = 300;
     u32   panelLocal    = 0x8C2;
     int   panelPause    = 0;
     bool ok = false;
-    // ---- THE RACE GATE ------------------------------------------
-    // RG <mode>     -- see RaceGateRefuses, beside Refused. Last in the
-    // struct, so no member before it moves.
-    //
-    // 0 off: the race is not read at all.
-    // 1 log: the race is read, and one line per actor per load says what it
-    //   is and what the gate would decide; nothing is refused for it. This is
-    //   the default, and an absent row means it.
-    // 2 enforce: an actor the gate refuses is refused on every path that asks
-    //   Refused -- no pre-warm, no wound, no replayed wound -- and a read that
-    //   fails refuses them too.
-    int   raceGate = 1;
-    // ---- FT <maps> <hair> <cutout> <normals> <dedup> <probe> -------------
-    // THEIR FACE AND ITS ACCESSORIES, AS A PIECE CARRIES THEM. An absent row is
-    // all 0, which is every piece's bytes as before the row. See
-    // chunknif::SetFaceLook for what each column does; probe 1 writes the
-    // budgeted [FACETEX] lines (FaceTexProbe). A release cfg carries probe 0.
+    // RG 2 enforced by default: blocks children & unsupported non-playable races at DLL level (#7)
+    int   raceGate = 2;
     int   ftMaps = 0, ftHair = 0, ftCutout = 0, ftNormals = 0, ftDedup = 0, ftProbe = 0;
 };
 static Config g_cfg;
@@ -2515,6 +2539,7 @@ static std::string ArmourGridText(const armour::Grid& g)
     }
     return s;
 }
+static bool RegistryGet(u32 fid, const char* key, int& out);
 struct HQState {
     bool  on = false;
     HQTrig trig[6];           // by kHQKinds index: any per pct abs winpct winabs
@@ -2522,6 +2547,7 @@ struct HQState {
     int   vulnHp = 0;         // 0 always; else only at or under N % health
     bool  keepCfg = false;    // the config's own T rows stay in force beside the HQ's
     bool  whoNpc = true, whoEssential = false, whoFollower = false, whoPlayer = false;
+    bool  whoModPlayer = true; // External Systems Bridge player gate (default ON, independent of combat whoPlayer)
     bool  playerSkin = false, playerFlesh = false, playerBones = false, playerSever = false;
     float resetAfter = 0.0f;  // seconds since their last wound; 0 never
     float resetRate = 0.0f;   // cells a second; 0 = whole at once
@@ -2543,6 +2569,29 @@ static bool HQPlayerAllows()
 {
     if (!g_hq.whoPlayer) return false;
     return true;
+}
+static bool HQSystemPlayerAllows()
+{
+    int ov = -1;
+    if (RegistryGet(fact::kPlayerFormID, "systemtarget", ov) && ov >= 0) return ov != 0;
+    return g_hq.whoModPlayer;
+}
+static void WriteBridgeState(const HQState& st)
+{
+    int mask = 0;
+    if (st.whoPlayer) {
+        const bool allowSkin  = st.playerSkin;
+        const bool allowFlesh = allowSkin && st.playerFlesh;
+        const bool allowBones = allowFlesh && st.playerBones;
+        if (allowSkin)  mask |= int(flesh::kArmourBit) | 3;
+        if (allowFlesh) mask |= int(flesh::kArmourBit) | 4;
+        if (allowBones) mask |= int(flesh::kArmourBit) | 8;
+    }
+    const bool cbAllow = st.whoPlayer && (mask != 0);
+    if (FILE* f = std::fopen("Data\\SKSE\\Plugins\\FleshCore.bridges.txt", "wb")) {
+        std::fprintf(f, "%d|%d|%d|%d\n", cbAllow ? 1 : 0, st.whoModPlayer ? 1 : 0, mask, (st.whoPlayer && st.playerSever) ? 1 : 0);
+        std::fclose(f);
+    }
 }
 static int HQPlayerLayerMask()
 {
@@ -2590,7 +2639,8 @@ static void HQTrigEffective(const std::map<std::string, double>& m, int k, HQTri
     t.on = get(pre + "on", legacy == k ? 1.0 : 0.0) != 0;
     t.thr = float(get(pre + "thr", (legacy == k && haveThr) ? get("thr", kThrDef[k]) : double(kThrDef[k])));
     t.window = float(get(pre + "window", legacy == k ? get("window", 6.0) : 6.0));
-    if (t.window < 0.5f) t.window = 0.5f; if (t.window > 60.0f) t.window = 60.0f;
+    if (t.window < 0.5f) t.window = 0.5f;
+    if (t.window > 60.0f) t.window = 60.0f;
     // the threshold, policed per kind the way ParseTriggerRow polices a file's
     if (k == 1) { if (t.thr < 0.05f) t.thr = 0.05f; if (t.thr > 10.0f) t.thr = 10.0f; }
     else if (k == 2 || k == 4) { if (t.thr < 1.0f) t.thr = 1.0f; if (t.thr > 100.0f) t.thr = 100.0f; }
@@ -2600,7 +2650,7 @@ static void HQTrigEffective(const std::map<std::string, double>& m, int k, HQTri
 // THE ARMOUR CARD'S KEYS OVER THE CONFIG'S AR ROW: armour.on,
 // armour.reach, armour.<hard|soft|cloth>.<slash|pierce|blunt|magic>. Shared by
 // HQBuild and the page push, so the page shows the values the wound path uses.
-static void HQArmourEffective(const std::map<std::string, double>& m, armour::Grid& g)
+[[maybe_unused]] static void HQArmourEffective(const std::map<std::string, double>& m, armour::Grid& g)
 {
     g = g_cfg.armour;
     auto it = m.find("armour.on"); if (it != m.end()) g.on = it->second != 0;
@@ -2626,6 +2676,7 @@ static void HQBuild(const std::map<std::string, double>& m, HQState& st, std::ve
     st.keepCfg = get("keepcfg", 0) != 0;
     st.whoNpc = get("who.npc", 1) != 0; st.whoEssential = get("who.essential", 0) != 0;
     st.whoFollower = get("who.follower", 0) != 0; st.whoPlayer = get("who.player", 0) != 0;
+    st.whoModPlayer = get("who.modPlayer", 1) != 0;
     st.playerSkin  = get("player.skin", 0) != 0;
     st.playerFlesh = st.playerSkin && (get("player.flesh", 0) != 0);
     st.playerBones = st.playerFlesh && (get("player.bones", 0) != 0);
@@ -2640,7 +2691,8 @@ static void HQBuild(const std::map<std::string, double>& m, HQState& st, std::ve
     st.peelStages = int(get("peel.stages", 1)); if (st.peelStages < 1) st.peelStages = 1; if (st.peelStages > 4) st.peelStages = 4;
     const int rawPreset = int(get("preset.id", st.on ? 50 : 0));
     st.activePreset = (rawPreset >= 0) ? rawPreset : int(get("preset.base", st.on ? 50 : 0));
-    if (st.activePreset < 0) st.activePreset = 0; if (st.activePreset > 100) st.activePreset = 100;
+    if (st.activePreset < 0) st.activePreset = 0;
+    if (st.activePreset > 100) st.activePreset = 100;
     st.armour.on = false;
     rows.clear();
     if (!st.on) return;
@@ -2674,13 +2726,16 @@ static void HQBuild(const std::map<std::string, double>& m, HQState& st, std::ve
             if (kind == 0) { if (madeAny) continue; madeAny = true; }
             char thr[32]; std::snprintf(thr, sizeof(thr), "%.4g", double(kind == 0 ? 0.0f : st.trig[k].thr));
             char win[32]; std::snprintf(win, sizeof(win), "%.4g", double(st.trig[k].window));
-            const char* maxCellsStr = magic
-                ? (!std::strcmp(d.type, "fire") ? "14" : !std::strcmp(d.type, "frost") ? "16" : !std::strcmp(d.type, "shock") ? "16" : "22")
-                : (st.activePreset >= 85 ? "34" : (st.activePreset >= 50 ? "24" : "18"));
-            // a magic row is two pieces, four from Gorefest --
-            // it fires several times a second where a blow lands once.
-            const char* budgetStr   = magic ? (st.activePreset >= 85 ? "4" : "2")
-                                            : ((st.activePreset >= 85) ? "8" : (st.activePreset >= 60 ? "4" : "2"));
+            const int cfgMc = std::max(1, std::min(128, g_cfg.maxCells));
+            const int poolMax = g_cfg.poolLocals.empty() ? 64 : int(g_cfg.poolLocals.size());
+            const int cfgBg = std::max(1, std::min(poolMax, g_cfg.budget));
+            const int magicMcDef = !std::strcmp(d.type, "fire") ? 14 : !std::strcmp(d.type, "frost") ? 16 : !std::strcmp(d.type, "shock") ? 16 : 22;
+            const int magicBgDef = (st.activePreset >= 85) ? 4 : 2;
+            const int rowMc = magic ? std::min(magicMcDef, cfgMc) : cfgMc;
+            const int rowBg = magic ? std::min(magicBgDef, cfgBg) : cfgBg;
+            char maxCellsStr[16], budgetStr[16];
+            std::snprintf(maxCellsStr, sizeof(maxCellsStr), "%d", rowMc);
+            std::snprintf(budgetStr, sizeof(budgetStr), "%d", rowBg);
             std::vector<std::string> t = { d.type, kHQKinds[kind], thr, win,
                 kHQForms[form], sz, "1", maxCellsStr, budgetStr, std::to_string(depth), "0", "-", "-", "-", "0", "0", "-", "5" };
             Trigger tr; std::string why;
@@ -2917,17 +2972,32 @@ static void PanelLoad()
 // absent from this function and absent from kPanelApplied, and the page dims
 // it and says so. That list must never claim more
 // than the engine does.
+static std::string g_lastWoundSummary = "No wounds recorded yet this session.";
+static std::string g_lastWhyLog = "Crosshair check ready.";
+static volatile LONG g_whyCheckPending = 0;
+static volatile LONG g_panelPushPending = 0;
+static std::size_t ActiveBodyCountCached();
+static std::size_t ActiveBodyCountSafe();
+static void RequestHookTick();
+
+static void ClampMonotonicLethality(int& skin, int& flesh, int& bone)
+{
+    if (skin < 0) skin = 0;   else if (skin > 100) skin = 100;
+    if (flesh < 0) flesh = 0; else if (flesh > skin) flesh = skin;
+    if (bone < 0) bone = 0;   else if (bone > flesh) bone = flesh;
+}
+
 static const char* kPanelApplied[] = {
     "lossLimb", "partSpan", "coalesce", "cgap", "pollMs", "cell", "sectLumps",
-    "sever", "reread", "prewarm", "roster",
-    "nkSpell", "nkHit", "nkPlayer",
-    "head.skin", "head.bone", "head.brain",
-    // the cooldown slider (on the Combat page),
-    // every control on that page (one verb, "combat"), and the
-    // all-fatal / all-survivable button.
+    "maxcells", "budget",
+    "sever", "reread", "prewarm", "roster", "bloodSplat", "bloodSplatPct",
+    "fodderOverkillPct",
+    "nkSpell", "nkHit", "nkPlayer", "nkCommand", "nkVortex", "nkDrain",
+    "head.skin", "head.flesh", "head.bone", "head.brain",
+    "body.skin", "body.flesh", "body.bone",
+    "state", "lethal", "headFatal", "trunkFatal", "grant", "grantAll", "whynot",
     "hitCd", "combat", "lethalAll",
     "preset", "testStrike", "testRestore",
-    // the live-piece cap, laid over the cfg's LP row.
     "maxPieces",
     nullptr
 };
@@ -2962,12 +3032,52 @@ static void PanelApply(Config& c)
     T("reread",   c.reread);
     T("prewarm",  c.prewarm);
     T("roster",   c.roster);
-    T("nkSpell",  c.nlSpell);
-    T("nkHit",    c.nlHit);
-    T("nkPlayer", c.nlPlayer);
-    R("head.skin",  c.headSkinPct);
-    R("head.bone",  c.headBonePct);
-    R("head.brain", c.headBrainPct);
+    T("nkSpell",    c.nlSpell);
+    T("nkHit",      c.nlHit);
+    T("nkPlayer",   c.nlPlayer);
+    T("nkCommand",  c.nlCommand);
+    T("nkVortex",   c.nlVortex);
+    T("nkDrain",    c.nlDrain);
+    T("bloodSplat", c.bloodSplatter);
+    NI("bloodSplatPct", c.bloodSplatterPct);
+    if (c.bloodSplatterPct < 0) c.bloodSplatterPct = 0;
+    else if (c.bloodSplatterPct > 100) c.bloodSplatterPct = 100;
+    NI("fodderOverkillPct", c.fodderOverkillPct);
+    if (c.fodderOverkillPct < 0) c.fodderOverkillPct = 0;
+    else if (c.fodderOverkillPct > 100) c.fodderOverkillPct = 100;
+    NI("maxcells",  c.maxCells);
+    NI("budget",    c.budget);
+    // Support both legacy head.brain tolerance migration and unified head.flesh/body.* lethality keys (#14)
+    const bool legacyTol = !g_panel.thr.count("head.flesh") && !g_panel.thr.count("body.skin") && g_panel.thr.count("head.brain");
+    if (legacyTol) {
+        int hs = 100 - c.headSkinLeth, hf = 100 - c.headFleshLeth, hb = 100 - c.headBoneLeth;
+        if (g_panel.thr.count("head.skin"))  hs = g_panel.thr["head.skin"];
+        if (g_panel.thr.count("head.brain")) hf = g_panel.thr["head.brain"];
+        if (g_panel.thr.count("head.bone"))  hb = g_panel.thr["head.bone"];
+        c.headSkinLeth  = 100 - std::max(0, std::min(100, hs));
+        c.headFleshLeth = 100 - std::max(0, std::min(100, hf));
+        c.headBoneLeth  = 100 - std::max(0, std::min(100, hb));
+    } else {
+        R("head.skin",  c.headSkinLeth);
+        if (g_panel.thr.count("head.flesh")) R("head.flesh", c.headFleshLeth);
+        else if (g_panel.thr.count("head.brain")) R("head.brain", c.headFleshLeth);
+        R("head.bone",  c.headBoneLeth);
+    }
+    R("body.skin",  c.bodySkinLeth);
+    R("body.flesh", c.bodyFleshLeth);
+    R("body.bone",  c.bodyBoneLeth);
+    ClampMonotonicLethality(c.headSkinLeth, c.headFleshLeth, c.headBoneLeth);
+    ClampMonotonicLethality(c.bodySkinLeth, c.bodyFleshLeth, c.bodyBoneLeth);
+    g_panel.thr["head.skin"]  = c.headSkinLeth;
+    g_panel.thr["head.flesh"] = c.headFleshLeth;
+    g_panel.thr["head.brain"] = c.headFleshLeth;
+    g_panel.thr["head.bone"]  = c.headBoneLeth;
+    g_panel.thr["body.skin"]  = c.bodySkinLeth;
+    g_panel.thr["body.flesh"] = c.bodyFleshLeth;
+    g_panel.thr["body.bone"]  = c.bodyBoneLeth;
+    c.headSkinPct  = 100 - c.headSkinLeth;
+    c.headBrainPct = 100 - c.headFleshLeth;
+    c.headBonePct  = 100 - c.headBoneLeth;
     NI("hitCd",    c.cooldownMs);   // stored by the page for a while, and now read
     // the HQ's "Pieces kept on the ground", clamped as it lands. Only
     // the slider's number: the LP row's own is LoadConfig's to clamp and to
@@ -2985,18 +3095,30 @@ static void PanelApply(Config& c)
     // wound path unpoliced. The same numbers, written once more, so that both
     // roads into these fields are the same road. Kept beside the assignments
     // rather than in a third place, so the two copies are kept in step by hand.
-    if (c.limbDeadAt  < 1)    c.limbDeadAt  = 1;    if (c.limbDeadAt > 12)  c.limbDeadAt = 12;
-    if (c.lossLimb    < 1)    c.lossLimb    = 1;    if (c.lossLimb > 16)    c.lossLimb = 16;
+    if (c.maxCells < 1) c.maxCells = 1;
+    if (c.maxCells > 128) c.maxCells = 128;
+    if (c.budget < 1) c.budget = 1;
+    if (c.budget > 64) c.budget = 64;
+    if (!c.poolLocals.empty() && c.budget > int(c.poolLocals.size())) c.budget = int(c.poolLocals.size());
+    if (c.limbDeadAt  < 1)    c.limbDeadAt  = 1;
+    if (c.limbDeadAt > 12)  c.limbDeadAt = 12;
+    if (c.lossLimb    < 1)    c.lossLimb    = 1;
+    if (c.lossLimb > 16)    c.lossLimb = 16;
     if (c.partSpan    < 0)    c.partSpan    = 0;
     if (c.coalesceGap < 1 || c.coalesceGap > 8) c.coalesceGap = 3;
     if (c.coalesce    < 0)    c.coalesce    = 0;
-    if (c.rereadMs    < 50)   c.rereadMs    = 50;   if (c.rereadMs > 5000)  c.rereadMs = 5000;
+    if (c.rereadMs    < 50)   c.rereadMs    = 50;
+    if (c.rereadMs > 5000)  c.rereadMs = 5000;
     if (!(c.cellSize >= 1.0f && c.cellSize <= 40.0f)) c.cellSize = 6.0f;
     if (c.sectLumps < 0 || c.sectLumps > 64) c.sectLumps = 8;
-    if (c.headSkinPct  < 0) c.headSkinPct  = 0;  if (c.headSkinPct  > 100) c.headSkinPct  = 100;
-    if (c.headBonePct  < 0) c.headBonePct  = 0;  if (c.headBonePct  > 100) c.headBonePct  = 100;
-    if (c.headBrainPct < 0) c.headBrainPct = 0;  if (c.headBrainPct > 100) c.headBrainPct = 100;
-    if (c.cooldownMs < 0) c.cooldownMs = 0;      if (c.cooldownMs > 10000) c.cooldownMs = 10000;
+    if (c.headSkinPct  < 0) c.headSkinPct  = 0;
+    if (c.headSkinPct  > 100) c.headSkinPct  = 100;
+    if (c.headBonePct  < 0) c.headBonePct  = 0;
+    if (c.headBonePct  > 100) c.headBonePct  = 100;
+    if (c.headBrainPct < 0) c.headBrainPct = 0;
+    if (c.headBrainPct > 100) c.headBrainPct = 100;
+    if (c.cooldownMs < 0) c.cooldownMs = 0;
+    if (c.cooldownMs > 10000) c.cooldownMs = 10000;
 }
 
 // ---- THE PIECE CAP, HANDED TO THE SCRIPT SIDE ----------------------
@@ -3058,6 +3180,7 @@ static void HQApply()
         g_hqRows.swap(rows);
         RecountMagicRows();
     }
+    WriteBridgeState(st);
     // The armour in force, logged once at load and again whenever it moves.
     if (!armourSaid || armourWas != armourNow) { armourSaid = true; Log("[ARMOUR] %s", armourNow.c_str()); }
     if (st.on != was || g_hqRows.size() != had || st.weaponReach != wasReach) {
@@ -3072,7 +3195,8 @@ static void HQApply()
             if (k == 0) std::snprintf(b, sizeof(b), "any");
             else if (k >= 4) std::snprintf(b, sizeof(b), "%s %.3g over %.3g s", kHQKinds[k], double(st.trig[k].thr), double(st.trig[k].window));
             else std::snprintf(b, sizeof(b), "%s %.3g", kHQKinds[k], double(st.trig[k].thr));
-            if (!trigs.empty()) trigs += ", "; trigs += b;
+            if (!trigs.empty()) trigs += ", ";
+            trigs += b;
         }
         // the blade's reach on the physical rows, AND the CL
         // cap WoundActor applies to the longest blade, so this line says on its
@@ -3207,6 +3331,21 @@ static void ApplyCombatPreset(int level)
     g_panel.haveFatal = true;
     g_panel.fatalMask = fmask;
     g_panel.num["lossLimb"] = double(lossLimb);
+    {
+        const int hs = (level <= 0) ? 0 : std::min(100, 35 + (level * 65) / 100);
+        const int hf = std::min(hs, (level <= 0) ? 0 : std::min(100, 25 + (level * 75) / 100));
+        const int hb = std::min(hf, (level <= 0) ? 0 : std::min(100, 15 + (level * 85) / 100));
+        const int bs = (level <= 0) ? 0 : std::min(100, (level * 90) / 100);
+        const int bf = std::min(bs, (level <= 0) ? 0 : std::min(100, std::max(0, (level - 10) * 90 / 90)));
+        const int bb = std::min(bf, (level <= 0) ? 0 : std::min(100, std::max(0, (level - 20) * 85 / 80)));
+        g_panel.thr["head.skin"]  = hs;
+        g_panel.thr["head.flesh"] = hf;
+        g_panel.thr["head.brain"] = hf;
+        g_panel.thr["head.bone"]  = hb;
+        g_panel.thr["body.skin"]  = bs;
+        g_panel.thr["body.flesh"] = bf;
+        g_panel.thr["body.bone"]  = bb;
+    }
 
     // 2. HOW OFTEN AND HOW DEEP COMBAT CUTS (0..100):
     for (int k = 0; k < 6; ++k) {
@@ -3335,10 +3474,38 @@ static void PanelOnSet(const char* json)
             std::string set, layer; double pct = 0;
             if (JsonStr(ds, de, "set", set) && JsonStr(ds, de, "layer", layer) &&
                 JsonNum(ds, de, "pct", pct)) {
-                g_panel.thr[set + "." + layer] = int(pct);
+                if (layer == "brain") layer = "flesh";
+                int vInt = std::max(0, std::min(100, int(pct)));
+                int sVal = (set == "head") ? g_cfg.headSkinLeth  : g_cfg.bodySkinLeth;
+                int fVal = (set == "head") ? g_cfg.headFleshLeth : g_cfg.bodyFleshLeth;
+                int bVal = (set == "head") ? g_cfg.headBoneLeth  : g_cfg.bodyBoneLeth;
+                if (g_panel.thr.count(set + ".skin"))  sVal = g_panel.thr[set + ".skin"];
+                if (g_panel.thr.count(set + ".flesh")) fVal = g_panel.thr[set + ".flesh"];
+                if (g_panel.thr.count(set + ".bone"))  bVal = g_panel.thr[set + ".bone"];
+                if (layer == "skin") {
+                    sVal = vInt;
+                    if (fVal > sVal) fVal = sVal;
+                    if (bVal > fVal) bVal = fVal;
+                } else if (layer == "flesh") {
+                    fVal = std::min(vInt, sVal);
+                    if (bVal > fVal) bVal = fVal;
+                } else if (layer == "bone") {
+                    bVal = std::min(vInt, fVal);
+                }
+                ClampMonotonicLethality(sVal, fVal, bVal);
+                g_panel.thr[set + ".skin"]  = sVal;
+                g_panel.thr[set + ".flesh"] = fVal;
+                if (set == "head") g_panel.thr["head.brain"] = fVal;
+                g_panel.thr[set + ".bone"]  = bVal;
                 g_panel.combat["preset.id"] = -1.0;
-                Log("[PANEL] %s.%s = %d%% (preset -> Custom)", set.c_str(), layer.c_str(), int(pct));
+                Log("[PANEL] %s.%s -> monotonic (%d / %d / %d)%% (preset -> Custom)",
+                    set.c_str(), layer.c_str(), sVal, fVal, bVal);
             }
+        }
+        else if (verb == "whynot") {
+            g_lastWhyLog = "Checking crosshair / nearest actor eligibility...";
+            InterlockedExchange(&g_whyCheckPending, 1);
+            RequestHookTick();
         }
         else if (verb == "grant" && haveD) {
             std::string id; double on = 0;
@@ -3427,7 +3594,7 @@ static void PanelOnSet(const char* json)
                 }
                 // The player's power is no part of what the slider sets, so
                 // moving it leaves a preset a preset.
-                const bool custom = key != "preset.id" && key != "preset.base" && key != "power.perLevel";
+                const bool custom = key != "preset.id" && key != "preset.base" && key != "power.perLevel" && key != "who.modPlayer";
                 if (custom) g_panel.combat["preset.id"] = -1.0;
                 Log("[HQ] %s = %g%s", key.c_str(), val, custom ? " (preset -> Custom)" : "");
             }
@@ -3451,7 +3618,7 @@ static void PanelOnSet(const char* json)
                 const u32 tb = (1u << unsigned(flesh::Part::Chest)) | (1u << unsigned(flesh::Part::Abdomen));
                 if (v != 0.0) g_panel.fatalMask |= tb; else g_panel.fatalMask &= ~tb;
                 g_panel.combat["preset.id"] = -1.0;
-            } else if (verb == "nkHit" || verb == "nkSpell" || verb == "nkPlayer" || verb == "sever") {
+            } else if (verb == "nkHit" || verb == "nkSpell" || verb == "nkPlayer" || verb == "nkCommand" || verb == "nkVortex" || verb == "nkDrain" || verb == "sever") {
                 g_panel.combat["preset.id"] = -1.0;
             }
             Log("[PANEL] %s = %s", verb.c_str(), v != 0.0 ? "on" : "off");
@@ -3547,18 +3714,36 @@ static void PanelPush()
     // share them, and the first click on a switch then sends the value the
     // engine already has.
     {
+        const std::uint32_t fm = PanelFatalMask();
+        const int hfOn = (fm & (1u << unsigned(flesh::Part::Head))) ? 1 : 0;
+        const int tfOn = (fm & ((1u << unsigned(flesh::Part::Chest)) | (1u << unsigned(flesh::Part::Abdomen)))) ? 1 : 0;
+        std::size_t nBodiesLive = ActiveBodyCountSafe();
         Guard lk(&g_csPanel);
-        char buf[400];
+        char buf[1280];
         std::snprintf(buf, sizeof(buf),
-            ",\"tog\":{\"sever\":%d,\"prewarm\":%d,\"reread\":%d,\"roster\":%d,"
-            "\"nkHit\":%d,\"nkSpell\":%d,\"nkPlayer\":%d}"
-            ",\"num\":{\"cell\":%.6g,\"coalesce\":%d,\"cgap\":%d,\"partSpan\":%d,\"pollMs\":%d}"
-            ",\"thr\":{\"head.skin\":%d,\"head.bone\":%d,\"head.brain\":%d}",
-            g_cfg.sever ? 1 : 0, g_cfg.prewarm ? 1 : 0, g_cfg.reread ? 1 : 0, g_cfg.roster ? 1 : 0,
+            ",\"tog\":{\"sever\":%d,\"prewarm\":%d,\"reread\":%d,\"roster\":%d,\"bloodSplat\":%d,"
+            "\"headFatal\":%d,\"trunkFatal\":%d,"
+            "\"nkHit\":%d,\"nkSpell\":%d,\"nkPlayer\":%d,\"nkCommand\":%d,\"nkVortex\":%d,\"nkDrain\":%d}"
+            ",\"num\":{\"cell\":%.6g,\"coalesce\":%d,\"cgap\":%d,\"partSpan\":%d,\"pollMs\":%d,"
+            "\"lossLimb\":%d,\"maxcells\":%d,\"budget\":%d,\"hitCd\":%d,\"maxPieces\":%d,"
+            "\"bloodSplatPct\":%d,\"fodderOverkillPct\":%d}"
+            ",\"thr\":{\"head.skin\":%d,\"head.flesh\":%d,\"head.brain\":%d,\"head.bone\":%d,"
+            "\"body.skin\":%d,\"body.flesh\":%d,\"body.bone\":%d}"
+            ",\"diag\":{\"armed\":\"%s\",\"plugin\":\"FleshCore.esp\",\"bodies\":\"%u / 64 in registry (FCWS v2)\"}",
+            g_cfg.sever ? 1 : 0, g_cfg.prewarm ? 1 : 0, g_cfg.reread ? 1 : 0, g_cfg.roster ? 1 : 0, g_cfg.bloodSplatter ? 1 : 0,
+            hfOn, tfOn,
             g_cfg.nlHit ? 1 : 0, g_cfg.nlSpell ? 1 : 0, g_cfg.nlPlayer ? 1 : 0,
+            g_cfg.nlCommand ? 1 : 0, g_cfg.nlVortex ? 1 : 0, g_cfg.nlDrain ? 1 : 0,
             double(g_cfg.cellSize), g_cfg.coalesce, g_cfg.coalesceGap, g_cfg.partSpan, g_cfg.rereadMs,
-            g_cfg.headSkinPct, g_cfg.headBonePct, g_cfg.headBrainPct);
+            g_cfg.limbDeadAt, g_cfg.maxCells, g_cfg.budget, g_cfg.cooldownMs, g_cfg.maxLivePieces,
+            g_cfg.bloodSplatterPct, g_cfg.fodderOverkillPct,
+            g_cfg.headSkinLeth, g_cfg.headFleshLeth, g_cfg.headFleshLeth, g_cfg.headBoneLeth,
+            g_cfg.bodySkinLeth, g_cfg.bodyFleshLeth, g_cfg.bodyBoneLeth,
+            g_armed ? "armed & active" : "waiting for load",
+            unsigned(nBodiesLive));
         j += buf;
+        j += ",\"lastWound\":\"" + JsonEscape(g_lastWoundSummary) + "\"";
+        j += ",\"whynot\":\"" + JsonEscape(g_lastWhyLog) + "\"";
     }
     // THE COMBAT PAGE'S STATE, EFFECTIVE: every key the page has,
     // as the engine resolves it -- the stored number where one is stored,
@@ -3585,6 +3770,7 @@ static void PanelPush()
         put("blows", num("blows", 0)); put("vulnhp", num("vulnhp", 0)); put("keepcfg", num("keepcfg", 0));
         put("who.npc", num("who.npc", 1)); put("who.essential", num("who.essential", 0));
         put("who.follower", num("who.follower", 0)); put("who.player", num("who.player", 0));
+        put("who.modPlayer", num("who.modPlayer", 1));
         const double pSkin  = num("player.skin", 0) != 0 ? 1.0 : 0.0;
         const double pFlesh = (pSkin != 0.0 && num("player.flesh", 0) != 0) ? 1.0 : 0.0;
         const double pBones = (pFlesh != 0.0 && num("player.bones", 0) != 0) ? 1.0 : 0.0;
@@ -3698,9 +3884,9 @@ static void PanelKeepHidden()
 // it. One line, pipe-separated, because FL_Watch already splits on '|' and the
 // idiom is not worth inventing twice:
 //
-//     0.1.1 Beta|panel ready
-//     0.1.1 Beta|panel off in the config
-//     0.1.1 Beta|PrismaUI is not installed
+//     0.2.0 Beta|panel ready
+//     0.2.0 Beta|panel off in the config
+//     0.2.0 Beta|PrismaUI is not installed
 //
 // A missing file means the DLL did not load at all, which is itself the most
 // useful thing the MCM could tell anyone.
@@ -4287,13 +4473,14 @@ static bool LoadConfig()
             if (t.size() >= 3) c.rereadMs = std::atoi(t[2].c_str());
             if (t.size() >= 4) c.roster   = std::atoi(t[3].c_str());
         }
-        // E <mode> [perFrame] [prime] [clearance] [lift] -- engine placement.
+        // E <mode> [perFrame] [prime] [clearance] [lift] [stream] -- engine placement.
         else if (t[0] == "E" && t.size() >= 2) {
             c.place = std::atoi(t[1].c_str());
             if (t.size() >= 3) c.placePerFrame = std::atoi(t[2].c_str());
             if (t.size() >= 4) c.placePrime    = std::atoi(t[3].c_str());
             if (t.size() >= 5) c.spawnClearance = float(std::atof(t[4].c_str()));
             if (t.size() >= 6) c.spawnLift      = float(std::atof(t[5].c_str()));
+            if (t.size() >= 7) c.placeStream    = std::atoi(t[6].c_str());
         }
         // WD <defer> [maxMs] [perFrame] -- the deferred wound, see the struct.
         else if (t[0] == "WD" && t.size() >= 2) {
@@ -4378,15 +4565,21 @@ static bool LoadConfig()
     if (c.cleaveReach > 200.0f)   c.cleaveReach = 200.0f;
     if (c.partSpan < 0) c.partSpan = 0;          // 0 = off
     if (c.partSpan > 8) c.partSpan = 8;
-    if (c.lossLimb  < 1) c.lossLimb  = 1;   if (c.lossLimb  > 16) c.lossLimb  = 16;
-    if (c.lossTrunk < 1) c.lossTrunk = 1;   if (c.lossTrunk > 16) c.lossTrunk = 16;
-    if (c.lossHead  < 1) c.lossHead  = 1;   if (c.lossHead  > 16) c.lossHead  = 16;
+    if (c.lossLimb  < 1) c.lossLimb  = 1;
+    if (c.lossLimb  > 16) c.lossLimb  = 16;
+    if (c.lossTrunk < 1) c.lossTrunk = 1;
+    if (c.lossTrunk > 16) c.lossTrunk = 16;
+    if (c.lossHead  < 1) c.lossHead  = 1;
+    if (c.lossHead  > 16) c.lossHead  = 16;
     // 0 means "any damage at all" and is the shipped value for the brain, so
     // the floor is 0 rather than 1. 100 means "never", which is how a threshold
     // is switched off without a second flag.
-    if (c.headSkinPct  < 0) c.headSkinPct  = 0;  if (c.headSkinPct  > 100) c.headSkinPct  = 100;
-    if (c.headBonePct  < 0) c.headBonePct  = 0;  if (c.headBonePct  > 100) c.headBonePct  = 100;
-    if (c.headBrainPct < 0) c.headBrainPct = 0;  if (c.headBrainPct > 100) c.headBrainPct = 100;
+    if (c.headSkinPct  < 0) c.headSkinPct  = 0;
+    if (c.headSkinPct  > 100) c.headSkinPct  = 100;
+    if (c.headBonePct  < 0) c.headBonePct  = 0;
+    if (c.headBonePct  > 100) c.headBonePct  = 100;
+    if (c.headBrainPct < 0) c.headBrainPct = 0;
+    if (c.headBrainPct > 100) c.headBrainPct = 100;
     if (c.severMax > int(c.poolLocals.size()) && !c.poolLocals.empty())
         c.severMax = int(c.poolLocals.size());
     if (c.woundRadius < 2.0f) c.woundRadius = 12.0f;
@@ -4530,6 +4723,7 @@ static bool LoadConfig()
     if (c.placePerFrame < 1) c.placePerFrame = 1;
     if (c.placePerFrame > 32) c.placePerFrame = 32;
     if (c.placePrime < 0 || c.placePrime > 1) c.placePrime = 0;
+    if (c.placeStream < 0 || c.placeStream > 1) c.placeStream = 1;
     if (!(c.spawnClearance >= 0.0f && c.spawnClearance <= 200.0f)) c.spawnClearance = 14.0f;
     if (!(c.spawnLift >= -100.0f && c.spawnLift <= 200.0f)) c.spawnLift = 6.0f;
     // THE WD AND LP ROWS. The two lifetimes are FL_Chunk's to enforce
@@ -4617,6 +4811,10 @@ static bool LoadConfig()
         c.place == 2 ? "ON -- every piece, shards a frame before sections"
                      : c.place == 1 ? "PROBE -- first piece only" : "off",
         c.placePerFrame, c.placePrime ? "PROBE" : "off", c.spawnClearance, c.spawnLift);
+    Log("      streamed placement %s (E column 7)",
+        c.place != 2 ? "not used -- the engine does not place every piece (E mode is not 2)"
+                     : c.placeStream ? "ON -- each piece goes to the game's thread as soon as its file is written"
+                                     : "off -- a wound's pieces are placed once all of them are written");
     // the WD and LP rows, so a log says on its own what
     // was in force when a blow landed on a cold body or the floor filled up.
     Log("      deferred wounds %s (WD %d %d %d): a blow on a cold or re-dressed body %s;"
@@ -4976,6 +5174,15 @@ static void Harvest(const void* obj, int depth)
         return;
     }
     if (!IsA(obj, "NiNode")) return;
+    if (depth > 0) {
+        if (const char* nn = NodeName(obj)) {
+            if (!std::strcmp(nn, "WEAPON") || !std::strcmp(nn, "SHIELD") || !std::strcmp(nn, "QUIVER") ||
+                !std::strncmp(nn, "Weapon", 6) || !std::strncmp(nn, "MOV Weapon", 10) ||
+                !std::strncmp(nn, "CME Weapon", 10) || !std::strncmp(nn, "IED_", 4)) {
+                return;
+            }
+        }
+    }
     const void* data = nullptr; std::uint16_t used = 0;
     const void* arr = static_cast<const std::uint8_t*>(obj) + fact::kNode_children;
     if (!Peek(arr, fact::kNiTArr_data, &data) || !data) return;
@@ -5582,7 +5789,9 @@ static void FaceTexProbeHold(u32 formID, const std::string& shape, std::vector<s
 static void FaceTexProbeCut(u32 formID)
 {
     if (!g_cfg.ftProbe) return;
+#if defined(__cpp_exceptions) || defined(__EXCEPTIONS)
     try {
+#endif
         std::vector<std::string> now;
         unsigned nShapes = 0, nLeft = 0;
         bool saySpent = false;
@@ -5613,9 +5822,11 @@ static void FaceTexProbeCut(u32 formID)
         if (saySpent)
             Log("[FACETEX] budget spent: %ld line(s) -- the probe writes nothing more this session",
                 long(FaceTexBook::kLines));
+#if defined(__cpp_exceptions) || defined(__EXCEPTIONS)
     } catch (...) {
         // Out of memory in a log-only probe: the wound goes on without it.
     }
+#endif
 }
 static std::uint32_t VtRvaOf(const void* obj)
 {
@@ -5645,7 +5856,9 @@ static void FaceTexProbe(u32 formID, const char* nm, int feat, const void* geom,
                          const std::vector<std::string>& tex)
 {
     if (!g_cfg.ftProbe) return;
+#if defined(__cpp_exceptions) || defined(__EXCEPTIONS)
     try {
+#endif
         const std::string shape(nm ? nm : "?");
         const int how = FaceTexProbeAdmit(formID, shape);
         if (!how) return;
@@ -5693,9 +5906,11 @@ static void FaceTexProbe(u32 formID, const char* nm, int feat, const void* geom,
         }
         if (how == 1) { for (const std::string& s : out) Log("%s", s.c_str()); }
         else          FaceTexProbeHold(formID, shape, out);
+#if defined(__cpp_exceptions) || defined(__EXCEPTIONS)
     } catch (...) {
         // Out of memory in a log-only probe: the read goes on without it.
     }
+#endif
 }
 
 // ------------------------------------------ WHERE DOES THEIR COLOUR LIVE?
@@ -6568,6 +6783,7 @@ static void HeadWatchSample()
 // those.
 static DWORD GuardedThread(const char* name, DWORD (WINAPI* body)(LPVOID), LPVOID p)
 {
+#if defined(__cpp_exceptions) || defined(__EXCEPTIONS)
     int said = 0;
     for (;;) {
         try { return body(p); }
@@ -6580,12 +6796,18 @@ static DWORD GuardedThread(const char* name, DWORD (WINAPI* body)(LPVOID), LPVOI
         LogFlush();
         Sleep(50);
     }
+#else
+    (void)name;
+    return body(p);
+#endif
 }
 static void FlushOutbox();   // events queued under a lock leave once it is released
+static void FlushWakePending();
 static u32 GuardedSink(const char* name, u32 (*body)(void*, const void*, void*), void* a, const void* ev, void* c)
 {
+#if defined(__cpp_exceptions) || defined(__EXCEPTIONS)
     static volatile long said = 0;
-    try { const u32 r = body(a, ev, c); FlushOutbox(); LogFlush(); return r; }
+    try { const u32 r = body(a, ev, c); FlushOutbox(); FlushWakePending(); LogFlush(); return r; }
     catch (const std::exception& e) {
         if (InterlockedIncrement(&said) <= 32) Log("[SINK] %s: C++ exception '%s' -- the event is dropped", name, e.what());
     }
@@ -6594,6 +6816,14 @@ static u32 GuardedSink(const char* name, u32 (*body)(void*, const void*, void*),
     }
     LogFlush();
     return 0;
+#else
+    (void)name;
+    const u32 r = body(a, ev, c);
+    FlushOutbox();
+    FlushWakePending();
+    LogFlush();
+    return r;
+#endif
 }
 // THE LAST MOMENT THE GAME'S THREAD RAN ANY TASK OF THE PLUGIN'S.
 //
@@ -6644,8 +6874,9 @@ static void GuardedTask(const char* name, void (*body)(void*), void* self)
         InterlockedExchange64(&g_lastTransitionTick, LONGLONG(GetTickCount64()));
     }
     InterlockedCompareExchange(&g_taskThread, long(GetCurrentThreadId()), 0);
+#if defined(__cpp_exceptions) || defined(__EXCEPTIONS)
     static volatile long said = 0;
-    try { body(self); FlushOutbox(); LogFlush(); return; }
+    try { body(self); FlushOutbox(); FlushWakePending(); LogFlush(); return; }
     catch (const std::exception& e) {
         if (InterlockedIncrement(&said) <= 32) Log("[TASK] %s: C++ exception '%s' -- the task is dropped", name, e.what());
     }
@@ -6653,6 +6884,13 @@ static void GuardedTask(const char* name, void (*body)(void*), void* self)
         if (InterlockedIncrement(&said) <= 32) Log("[TASK] %s: C++ exception (not std) -- the task is dropped", name);
     }
     LogFlush();
+#else
+    (void)name;
+    body(self);
+    FlushOutbox();
+    FlushWakePending();
+    LogFlush();
+#endif
 }
 
 static void HeadWatchRun(void*);
@@ -6702,6 +6940,12 @@ static DWORD WINAPI HeadWatchThreadBody(LPVOID)
 struct FrameMark { long seq; double t0; double until; bool done; };
 static double        g_frameRing[4096];
 static volatile long g_frameHead = 0;          // next slot to write
+// THE PLACER'S NEXT FRAME. SKSE drains its task queue until it is empty, so a
+// placer task posted from inside a placer run runs again in the same frame.
+// When a frame's share of pieces is placed and more is waiting, the placer
+// raises this instead, and the frame probe's task -- one a frame -- posts it.
+static volatile long g_placeNextFrame = 0;
+static void PlacePost();
 static HANDLE        g_frameRan = nullptr;      // set by the task after each run
 static volatile long g_frameInFlight = 0;
 static DWORD         g_framePostedAt = 0;
@@ -6763,6 +7007,7 @@ static void FrameProbeRunBody(void*)
     const double now = NowMs();
     g_frameRing[g_frameHead & 4095] = now;
     InterlockedIncrement(&g_frameHead);
+    if (InterlockedExchange(&g_placeNextFrame, 0) != 0) PlacePost();   // a new frame: the placer's share is new
     if (g_csFrameReady) {
         FrameMark due[8]; int nd = 0;
         {
@@ -6774,6 +7019,7 @@ static void FrameProbeRunBody(void*)
         }
         for (int i = 0; i < nd; ++i) FrameProbeReport(due[i], now);
     }
+    ThrowWatchStep(now);   // the [THROW] lines; nothing while no piece is waiting
 }
 static void FrameProbeRun(void* self)
 {
@@ -6806,6 +7052,10 @@ static DWORD WINAPI FrameProbeThreadBody(LPVOID)
     return 0;
 }
 static HANDLE g_frameProbeThread = nullptr;
+// The placer counts frames by the probe only while the probe is actually
+// running (FP 1 at arm time and still on): a probe that never started would
+// never post a placer waiting for the next frame.
+static bool PlacerFramesKnown() { return g_cfg.frameProbe && g_frameProbeThread != nullptr; }
 static void FrameProbeStart()
 {
     if (g_frameProbeThread || !g_cfg.frameProbe) return;
@@ -7612,6 +7862,18 @@ struct ShapeSrc {
     u32 vsize = 0;
     std::uint64_t desc = 0;
     u32 nVerts = 0;
+    // WHERE `raw` CAME FROM, AND WHAT IT HELD (see CheckLiveRaw and rawguard.h).
+    // rawLive: `raw` is the engine's record buffer, read off partition rawPart
+    // of skinInst at the harvest -- never a private copy (privRecs) or the fill
+    // store. rawPartVerts is that partition's vertex count then; rawPrint and
+    // rawSamp what the records held then; maxEdge the longest edge of the shape's
+    // own triangles, which the forge's edge guard measures copies against.
+    bool rawLive = false;
+    u32  rawPart = 0;
+    u32  rawPartVerts = 0;
+    std::uint32_t rawPrint = 0;
+    rawguard::Samples rawSamp{};
+    float maxEdge = 0.0f;
     bool isSkin = false;
     bool underArmourSkin = false;           // hidden FleshSkinFill body skin beneath a slot-32 cuirass
     bool solid = false;                     // a filled volume, not a surface
@@ -7848,7 +8110,10 @@ struct Body {
     // RestoreEveryBody that makes them whole. Deliberately NOT co-saved -- their
     // gone cells are, and they are what the count is taken from after a load.
     bool headOff = false;
-    bool revealed = false;   // the fill has been unhidden on this 3D
+    bool beastNoSkull = false;      // Khajiit / Argonian (#8): exempt from human FL_HeadFill
+    bool wasDead = false;           // Resurrection detector (#19): auto-restores if dead -> alive
+    bool equipFastRebuild = false;  // Immediate 1-tick rebuild after TESEquipEvent on wounded body (#19)
+    bool revealed = false;          // the fill has been unhidden on this 3D
     bool underArmourRevealed = false; // the hidden body skin under armour has been unhidden on this 3D
     // HOT: the equip sink saw them (un)equip something. The re-read
     // watch looks at hot bodies on every tick rather than in its round-robin,
@@ -7904,6 +8169,8 @@ struct Body {
     int           seenCount = -1;
     std::uint64_t seenIds   = 0;
     DWORD         seenTick  = 0;
+    std::uint64_t seenRaw   = 0;     // CheckLiveRaw's mix of the live record pointers at that look ('vertex data')
+    DWORD         rawSince  = 0;     // when the watch first found their records changing, this run (0: not)
     std::uint64_t refusedIds = 0;   // an observation Voxelise could not build
     const void*   refusedRoot = nullptr;
     int           refusedCount = -1;
@@ -8066,6 +8333,175 @@ static int OwnerWears(u32 owner, const void* root, const void* skinInst)
 // and the game's thread never hand out the same number.
 static volatile long g_gen = 0;
 static u32 NextGen() { return u32(InterlockedIncrement(&g_gen)); }
+
+// =========================================== THE RECORDS UNDER A SKIN INSTANCE
+//
+// WHERE THE ENGINE DRAWS A SHAPE FROM NOW: skin instance -> skin partition ->
+// partition `part` -> buffData -> rawVertexData, the chain the harvest read.
+// With the plugin's copy installed (Privatise) it reads the same address: the
+// copy's buffData is a byte copy of the original's and keeps its record
+// pointer, and nothing in the plugin ever writes rawVertexData. A partition the
+// engine or another plugin swapped in reads a different one. Every hop is
+// page-tested, and only the engine's live objects are read -- never the
+// pointer being judged. Null when a hop cannot be read. `nVerts` and `desc`
+// (optional) receive the partition's vertex count and vertex descriptor.
+static const std::uint8_t* LiveRawOf(const void* skinInst, u32 part,
+                                     u32* nVerts = nullptr, std::uint64_t* desc = nullptr)
+{
+    const void* sp = nullptr;
+    if (!Peek(skinInst, fact::kSkinI_skinPartition, &sp) || !sp) return nullptr;
+    u32 nP = 0; const void* parr = nullptr;
+    if (!Peek(sp, fact::kSkinP_numPartitions, &nP) || !Peek(sp, fact::kSkinP_partitions, &parr)) return nullptr;
+    if (!parr || part >= nP || nP > 64) return nullptr;
+    const std::uint8_t* P = static_cast<const std::uint8_t*>(parr) + std::size_t(part) * fact::kPartStride;
+    const void* buf = nullptr;
+    if (!Peek(P, fact::kPart_buffData, &buf) || !buf) return nullptr;
+    const std::uint8_t* raw = nullptr;
+    if (!Peek(buf, fact::kRD_rawVertexData, &raw) || !raw) return nullptr;
+    if (nVerts) {
+        std::uint16_t nV = 0;
+        if (!Peek(P, fact::kPart_vertices, &nV)) return nullptr;
+        *nVerts = nV;
+    }
+    if (desc && !Peek(P, fact::kPart_vertexDesc, desc)) return nullptr;
+    return raw;
+}
+
+// ARE THE RECORDS EVERY SHAPE WAS BUILT FROM STILL THE ONES THE ENGINE DRAWS?
+//
+// FIELD: a Cleave and two bursts dropped pieces of long, sharp triangles
+// spanning the body. Every such piece shape had read its records some vertices
+// off (+12 on a hand; -28, +64 and +88 on a body): body-morph updates between
+// the build and the wound had swapped in a fresh copy of the
+// skin partition and freed the old one under the same skin instance, the same
+// root and the same shape count -- the three things the wound and the re-read
+// watch compared -- and the freed block had been reused by a copy of the same
+// mesh. The forge copied from the old pointer.
+//
+// So every shape whose records are the engine's (rawLive) is judged against
+// the live chain (rawguard::Judge): the same pointer holding the same mesh
+// passes; a fresh copy of the same mesh in the same order whose sampled
+// vertices moved less than half a cell is RE-POINTED here, so the cut, the
+// canvas and the forge read the new records (said in one line); anything else
+// is STALE, and the body must be re-read before it is cut. Returns how many
+// are stale; `firstStale` (optional) names the first. Caller holds g_csBodies
+// on the game's thread and has found the skin instances still on them.
+//
+// `liveMix` (optional) receives a mix of the record pointers the engine holds
+// now: the re-read watch compares it from one look to the next, to tell a
+// morph that is still running from one that has ended. A shape that carries a
+// drawn cut and would be re-pointed, but whose cut was on the copy that was
+// replaced (rawguard::KeepCut), counts as stale -- unless `recut` is set and
+// no other shape is stale: then those shapes are re-pointed and RE-CUT IN
+// PLACE, as WatchOne re-cuts a body whose copy the engine replaced after a
+// load, and no rebuild is needed. Each such re-cut privatises the partition
+// they are drawn from now, which keeps one more of the engine's partitions
+// alive for the session (Privatise's pin); the log keeps the count.
+static void ForgetDrawn(Body& B);                     // with Unprivatise, below
+static void Redraw(Body& B, void* dev, bool force);   // below
+static int CheckLiveRaw(Body& B, const char** firstStale = nullptr, std::uint64_t* liveMix = nullptr,
+                        bool recut = false)
+{
+    int stale = 0, repointed = 0;
+    float most = 0.0f;
+    const char* firstMoved = nullptr;
+    const float limit = 0.5f * g_cfg.cellSize;
+    std::uint64_t mix = 1469598103934665603ull;
+    std::vector<std::pair<std::size_t, const std::uint8_t*>> lost;   // cut shapes on a replaced copy: index, live records
+    for (std::size_t si = 0; si < B.shapes.size(); ++si) {
+        ShapeSrc& S = B.shapes[si];
+        if (!S.rawLive || !S.skinInst || !S.raw || !S.nVerts || !S.vsize) continue;
+        u32 liveVerts = 0; std::uint64_t liveDesc = 0;
+        const std::uint8_t* live = LiveRawOf(S.skinInst, S.rawPart, &liveVerts, &liveDesc);
+        mix = (mix ^ std::uint64_t(reinterpret_cast<std::uintptr_t>(live))) * 1099511628211ull;
+        const bool layoutSame = live && liveVerts == S.rawPartVerts && liveDesc == S.desc;
+        const bool liveOk = layoutSame && Readable(live, std::size_t(S.nVerts) * S.vsize);
+        std::uint32_t print = 0;
+        float moved = HUGE_VALF;
+        if (liveOk) {
+            print = rawguard::Print(live, S.nVerts, S.vsize, S.desc);
+            rawguard::Samples now;
+            rawguard::Take(live, S.nVerts, S.vsize, S.desc, now);
+            moved = rawguard::Moved(S.rawSamp, now);
+        }
+        rawguard::Live v = rawguard::Judge(S.raw, live, liveOk, layoutSame, S.rawPrint, print, moved, limit);
+        // A SHAPE THAT CARRIES A DRAWN CUT IS NOT RE-POINTED unless the plugin's
+        // copy is the partition under the instance now (rawguard::KeepCut). Its
+        // records can only have moved if the partition its cut was written into
+        // was swapped out (the plugin's copy keeps the original's record
+        // pointer), so the cut is no longer drawn -- and `drawn` still says it
+        // is, so the next Redraw would skip it and leave them whole there (the
+        // trap WatchOne describes). A rebuild starts `drawn` afresh and re-cuts
+        // them from the lattice when it lands. With the plugin's copy installed
+        // again (WatchOne re-cut them after a load) `drawn` is true of it, and
+        // re-pointing is right. CloneInstalled walks the clone table, so it is
+        // asked only here, for a shape about to be re-pointed.
+        if (v == rawguard::Live::Repoint) {
+            bool written = false;
+            for (u32 p = 0; p < S.drawn.size() && !written; ++p)
+                if (S.drawn[p] != 0xFFFFFFFFu) written = true;
+            if (written) v = rawguard::KeepCut(v, written, CloneInstalled(S.skinInst));
+            // Only KeepCut turns a Repoint stale: decided below, with the rest.
+            if (v == rawguard::Live::Stale) { lost.push_back(std::make_pair(si, live)); continue; }
+        }
+        switch (v) {
+        case rawguard::Live::Same:
+            break;
+        case rawguard::Live::Repoint:
+            if (!repointed) firstMoved = NodeName(S.geom);
+            ++repointed;
+            if (moved > most) most = moved;
+            S.raw = live;
+            break;
+        case rawguard::Live::Stale:
+            if (!stale && firstStale) *firstStale = NodeName(S.geom);
+            ++stale;
+            break;
+        }
+    }
+    if (liveMix) *liveMix = mix;
+    if (!lost.empty()) {
+        void* dev = (recut && !stale) ? Device() : nullptr;
+        if (dev) {
+            // Their drawn state described the copy that is gone, and so did the
+            // welded vertex buffer it owned (Unprivatise forgets both the same way).
+            for (const auto& L : lost) {
+                ShapeSrc& S = B.shapes[L.first];
+                S.raw = L.second;
+                for (u32& d : S.drawn) d = 0xFFFFFFFFu;
+                for (u32& o : S.vbOwned) o = 0u;
+            }
+            ForgetDrawn(B);                     // and Redraw must not think nothing moved
+            B.revealed = false;                 // as WatchOne does
+            B.gen = NextGen();                  // a re-cut is a mutation the watch must see
+            Redraw(B, dev, false);
+            // The first 24 a session, then every 50th, with the running count.
+            static volatile long saidRecut = 0;
+            const long n = InterlockedIncrement(&saidRecut);
+            const char* nm = NodeName(B.shapes[lost.front().first].geom);
+            if (n <= 24 || n % 50 == 0)
+                Log("  [RAW] 0x%08X: %u cut shape(s) are drawn from a fresh copy of the same mesh (first '%s'),"
+                    " and the copy their cut was written into was replaced -- re-pointed and re-cut in place,"
+                    " no rebuild (%ld such re-cut(s) this session)", B.formID, unsigned(lost.size()),
+                    nm ? nm : "?", n);
+        } else {
+            if (!stale && firstStale) *firstStale = NodeName(B.shapes[lost.front().first].geom);
+            stale += int(lost.size());
+        }
+    }
+    // Said for the first 24 re-points a session: a mod that re-applies the
+    // same morphs every few seconds must not fill the log with this line.
+    static volatile long saidRepoint = 0;
+    if (repointed) {
+        const long n = InterlockedIncrement(&saidRepoint);
+        if (n <= 24)
+            Log("  [RAW] 0x%08X: %d shape(s) now drawn from a fresh copy of the same mesh, in the same order"
+                " (first '%s', sampled vertices moved %.2f units at most) -- re-pointed, so they are cut"
+                " from the records the engine draws%s", B.formID, repointed, firstMoved ? firstMoved : "?",
+                double(most), n == 24 ? " (further re-points this session are not logged)" : "");
+    }
+    return stale;
+}
 // THE LEDGER SURVIVES A HAND-OVER, AND NOT A NEW 3D.
 // `oldPriv`/`oldRoot` are read off the registry body BEFORE it is moved over;
 // `B` is the fresh one that has just replaced it. See Body::everPriv.
@@ -8141,10 +8577,114 @@ static const LONG kReviveWindowMs = 60000L;
 // on the loading thread. CRITICAL_SECTIONs are recursive, so taking it inside
 // a wound that already holds it is safe.
 struct SavedWounds {
-    u32 partsLost = 0;
+    u32   partsLost = 0;
+    bool  headOff   = false;
+    float cellSize  = 0.0f;
     std::map<flesh::Key, std::uint32_t> cells;
 };
 static std::map<u32, SavedWounds> g_restore;
+
+// Thread-safe mirror for zero-latency Papyrus getters (#2) & HQ diagnostics (#14)
+struct ActorMirrorSnap {
+    bool hasBody = false;
+    bool headOff = false;
+    bool beastNoSkull = false;
+    u32  woundedCells = 0;
+    u32  partsLost = 0;
+    u32  partsBorn = 0;
+    u32  layersGone = 0;
+    float ownFillFrac = 0.0f;
+    std::size_t bornPer[std::size_t(flesh::Part::Count)] = {};
+    std::size_t remainPer[std::size_t(flesh::Part::Count)] = {};
+    u32  partLayersGone[std::size_t(flesh::Part::Count)] = {};
+    std::string remainStr;
+};
+static CRITICAL_SECTION g_csMirror;
+static bool g_mirrorLockReady = false;
+static std::map<u32, ActorMirrorSnap> g_actorMirror;
+static std::size_t g_activeBodyCountAtomic = 0;
+static std::size_t ActiveBodyCountCached() { return g_activeBodyCountAtomic; }
+static std::size_t ActiveBodyCountSafe()
+{
+    std::size_t n = ActiveBodyCountCached();
+    if (g_locksReady && TryEnterCriticalSection(&g_csBodies)) {
+        n = g_bodies.size();
+        g_activeBodyCountAtomic = n;
+        LeaveCriticalSection(&g_csBodies);
+    }
+    return n;
+}
+static void SyncBodyMirror(const Body& B)
+{
+    if (!g_mirrorLockReady) return;
+    ActorMirrorSnap s;
+    s.hasBody = B.live;
+    s.headOff = B.headOff;
+    s.beastNoSkull = B.beastNoSkull;
+    s.partsLost = B.partsLost;
+    s.partsBorn = B.partsAtBirth;
+    s.ownFillFrac = B.ownFillFrac;
+    for (int q = 0; q < int(flesh::Part::Count); ++q) s.bornPer[q] = B.bornPer[q];
+    std::map<flesh::Key, u32> all = B.ledger;
+    for (const auto& ck : B.lat.cells) {
+        const flesh::Cell& C = ck.second;
+        if (C.gone) {
+            all[ck.first] |= C.gone;
+            s.layersGone |= C.gone;
+        }
+        if (C.part > 0 && C.part < int(flesh::Part::Count)) {
+            const int q = C.part;
+            s.partLayersGone[q] |= (C.layers & C.gone);
+            const bool alive = B.wornPart[q]
+                ? !C.Empty()
+                : (q == int(flesh::Part::Head) && g_cfg.targetFace && !B.beastNoSkull)
+                    ? (C.mine && (C.layers & 0xEu) != 0 && !C.Empty())
+                    : (C.mine && !C.Empty());
+            if (alive) ++s.remainPer[q];
+        }
+    }
+    for (const auto& kv : all) s.layersGone |= kv.second;
+    s.woundedCells = u32(all.size());
+    for (int q = 1; q < int(flesh::Part::Count); ++q) {
+        if (!(s.partsBorn & (1u << unsigned(q)))) continue;
+        const int pct = (s.partsLost & (1u << unsigned(q))) ? 0
+                      : (s.bornPer[q] ? std::min(100, int((s.remainPer[q] * 100u) / s.bornPer[q])) : 100);
+        if (!s.remainStr.empty()) s.remainStr += ',';
+        s.remainStr += flesh::PartKey(flesh::Part(q));
+        s.remainStr += ':';
+        s.remainStr += std::to_string(pct);
+    }
+    EnterCriticalSection(&g_csMirror);
+    g_actorMirror[B.formID] = std::move(s);
+    LeaveCriticalSection(&g_csMirror);
+}
+static void SyncSavedMirror(u32 fid, const SavedWounds& w)
+{
+    if (!g_mirrorLockReady) return;
+    ActorMirrorSnap s;
+    s.hasBody = true;
+    s.headOff = w.headOff;
+    s.partsLost = w.partsLost;
+    s.woundedCells = u32(w.cells.size());
+    for (const auto& kv : w.cells) s.layersGone |= kv.second;
+    EnterCriticalSection(&g_csMirror);
+    g_actorMirror[fid] = std::move(s);
+    LeaveCriticalSection(&g_csMirror);
+}
+static void ClearBodyMirror(u32 fid)
+{
+    if (!g_mirrorLockReady) return;
+    EnterCriticalSection(&g_csMirror);
+    g_actorMirror.erase(fid);
+    LeaveCriticalSection(&g_csMirror);
+}
+static void ClearAllBodyMirrors()
+{
+    if (!g_mirrorLockReady) return;
+    EnterCriticalSection(&g_csMirror);
+    g_actorMirror.clear();
+    LeaveCriticalSection(&g_csMirror);
+}
 // Defined with the watch, far below; both restore paths arm it. A body whose
 // wounds have just been put back is watched for a while, because the engine
 // may rebuild their 3D after the load and take the cut with it.
@@ -8163,10 +8703,29 @@ static Body& Claim(u32 formID)
             const DWORD t = (b.touched > b.lastCut) ? b.touched : b.lastCut;
             if (t <= when) { when = t; oldest = id; }
         }
-        if (oldest) { g_bodies.erase(oldest); Log("  registry full: dropped 0x%08X", oldest); }
+        if (oldest) {
+            auto oit = g_bodies.find(oldest);
+            if (oit != g_bodies.end()) {
+                const Body& eb = oit->second;
+                if (Wounded(eb) || eb.partsLost || eb.headOff) {
+                    SavedWounds sw;
+                    sw.partsLost = eb.partsLost;
+                    sw.headOff   = eb.headOff;
+                    sw.cellSize  = eb.lat.cell;
+                    sw.cells     = eb.ledger;
+                    for (const auto& ck : eb.lat.cells)
+                        if (ck.second.gone) sw.cells[ck.first] |= ck.second.gone;
+                    SyncSavedMirror(oldest, sw);
+                    g_restore[oldest] = std::move(sw);
+                }
+                g_bodies.erase(oit);
+            }
+            Log("  registry full: dropped 0x%08X (wounds preserved in g_restore if any)", oldest);
+        }
     }
     RememberCut(formID);
     Body& B = g_bodies[formID];
+    g_activeBodyCountAtomic = g_bodies.size();
     B.formID = formID;
     B.touched = GetTickCount();
     return B;
@@ -9864,6 +10423,7 @@ static bool ApplyShapeFrames(Body& B, std::vector<flesh::ShapeData>& sd, const v
                 frame::TransformRecords(priv.data(), S.nVerts, S.vsize, S.desc, F);
                 B.privRecs.push_back(std::move(priv));
                 S.raw = B.privRecs.back().data();
+                S.rawLive = false;          // the plugin's own copy now: nothing of the engine's to go stale
                 sd[i].verts = S.raw;
                 applied = true;
                 verdict = "applied";
@@ -10095,8 +10655,8 @@ static bool Voxelise(Body& B, const void* root, bool* notEligible = nullptr,
         // starts with the word, and the beast races' skins do not have one:
         // measured in testing, the Khajiit male body diffuse is
         // textures\actors\character\khajiitmale\bodymale.dds and the female one's
-        // KhajiitFemale\femalebody.dds; vanilla Argonians are argonianmale\
-        // and argonianfemale\. A beast target was always eligible through the
+        // KhajiitFemale/femalebody.dds; vanilla Argonians are argonianmale/
+        // and argonianfemale/. A beast target was always eligible through the
         // fill their body carries, and sex -1 was taken as female, so nobody
         // saw it; a beast MALE BODY with sex -1 would have been lent the female
         // store. So the folder segment right after \actors\character\ is
@@ -10328,14 +10888,22 @@ static bool Voxelise(Body& B, const void* root, bool* notEligible = nullptr,
                     }
                     if (hskin) noteSkinName(gname);
                 }
-                Log("    skipping hidden surface '%s' -- not drawn, so not theirs",
-                    gname ? gname : "?");
-                continue;
+                if (hskin) {
+                    // Inner body skin carried by FL_SkinFillAA (#12a): keep hidden under intact clothes,
+                    // unhide on armour breach, and clip strictly to cells where armour is peeled & skin survives!
+                    S.underArmourSkin = true;
+                    Log("    accepting hidden inner skin '%s' as underArmourSkin", gname ? gname : "?");
+                } else {
+                    Log("    skipping hidden surface '%s' -- not drawn, so not theirs",
+                        gname ? gname : "?");
+                    continue;
+                }
             }
         }
         std::vector<const char*> vb;
         std::vector<flesh::TriRef> st;
         u32 maxVert = 0;
+        float edgeMax = 0.0f;               // the longest edge of its real triangles (ShapeSrc::maxEdge)
 
         for (u32 p = 0; p < nP; ++p) {
             const std::uint8_t* P = static_cast<const std::uint8_t*>(parr) + p * fact::kPartStride;
@@ -10364,6 +10932,7 @@ static bool Voxelise(Body& B, const void* root, bool* notEligible = nullptr,
             if (!Readable(pal, std::size_t(nB) * 2)) continue;
             if (!Readable(idx, std::size_t(nT) * 6)) continue;
             S.raw = raw; S.vsize = vs; S.desc = d;
+            S.rawLive = true; S.rawPart = p; S.rawPartVerts = nV;
 
             // the bone each palette slot names, once per partition
             std::vector<const char*> pname(nB, nullptr);
@@ -10448,6 +11017,13 @@ static bool Voxelise(Body& B, const void* root, bool* notEligible = nullptr,
                 }
             }
             const u32 realTris = nT - spareTris;
+            // ITS OWN LONGEST EDGE, for the forge's edge guard (AssembleChunk):
+            // the real triangles, over the records just proven readable for hi.
+            // Solid fill is merged across shapes in a piece and never guarded.
+            if (!S.solid) {
+                const float e = rawguard::MaxEdge(raw, hi, vs, d, idx, realTris);
+                if (e > edgeMax) edgeMax = e;
+            }
             // ONLY THE SHAPE THAT IS SUPPOSED TO HAVE THEM. Armour is never
             // layer 3, where the wound-surface shell is; without this test
             // any armour whose index list happened to end in a run of
@@ -10598,6 +11174,19 @@ static bool Voxelise(Body& B, const void* root, bool* notEligible = nullptr,
         }
         if (S.isSkin) noteSkinName(gname);
 
+        // WHAT ITS RECORDS HOLD NOW, kept so a later look can tell a fresh copy
+        // of the same mesh from a pointer gone stale (CheckLiveRaw). A buffer
+        // that cannot be read whole is not tracked: the forge refuses to copy
+        // from one anyway.
+        if (S.rawLive) {
+            if (Readable(S.raw, std::size_t(S.nVerts) * S.vsize)) {
+                S.rawPrint = rawguard::Print(S.raw, S.nVerts, S.vsize, S.desc);
+                rawguard::Take(S.raw, S.nVerts, S.vsize, S.desc, S.rawSamp);
+                S.maxEdge = edgeMax;
+            } else {
+                S.rawLive = false;
+            }
+        }
         B.texStore.push_back(S.tex);
         B.vertBone.push_back(std::move(vb));
         B.shapes.push_back(std::move(S));
@@ -11556,8 +12145,43 @@ static bool Voxelise(Body& B, const void* root, bool* notEligible = nullptr,
         tRead - tVox0, tBuilt - tRead, NowMs() - tVox0, g_runAsk, g_runMiss);
     Log("  filled: %.0f%% of their cells carry meat or bone", B.fillFrac * 100.0f);
     B.asked = false;
+    extern bool IsBeastActorHelper(u32 fid);
+    B.beastNoSkull = IsBeastActorHelper(B.formID);
     if (!nLayer)
         Log("  NOTE: no interior on this body -- requesting one");
+    // Rescale saved co-save cells if cellSize changed across saves (#5), and carry saved partsLost/headOff
+    u32 savedPartsLostCarry = B.partsLost;
+    bool savedHeadOffCarry  = B.headOff;
+    {
+        Guard lkR(&g_csBodies);
+        auto rit = g_restore.find(B.formID);
+        if (rit != g_restore.end()) {
+            savedPartsLostCarry |= rit->second.partsLost;
+            if (rit->second.headOff || (rit->second.partsLost & (1u << unsigned(flesh::Part::Head))))
+                savedHeadOffCarry = true;
+            const float scs = rit->second.cellSize;
+            if (scs > 0.5f && std::fabs(scs - B.lat.cell) > 0.05f && !remembered.empty()) {
+                std::map<flesh::Key, std::uint32_t> rescaled;
+                const float step = std::min(scs, B.lat.cell) * 0.5f;
+                for (const auto& [rk, rg] : remembered) {
+                    const float x0 = float(rk.x) * scs, x1 = float(rk.x + 1) * scs;
+                    const float y0 = float(rk.y) * scs, y1 = float(rk.y + 1) * scs;
+                    const float z0 = float(rk.z) * scs, z1 = float(rk.z + 1) * scs;
+                    for (float wx = x0 + 0.25f * step; wx < x1; wx += step)
+                    for (float wy = y0 + 0.25f * step; wy < y1; wy += step)
+                    for (float wz = z0 + 0.25f * step; wz < z1; wz += step) {
+                        flesh::Key nk{ std::int32_t(std::floor(wx / B.lat.cell)),
+                                       std::int32_t(std::floor(wy / B.lat.cell)),
+                                       std::int32_t(std::floor(wz / B.lat.cell)) };
+                        rescaled[nk] |= rg;
+                    }
+                }
+                Log("  [SAVE] rescaled %u saved cell(s) from cellSize %.1f -> %.1f (%u target cell(s))",
+                    unsigned(remembered.size()), double(scs), double(B.lat.cell), unsigned(rescaled.size()));
+                remembered.swap(rescaled);
+            }
+        }
+    }
     std::size_t kept = 0;
     for (const auto& [k, g] : remembered) {
         auto it = B.lat.cells.find(k);
@@ -11626,8 +12250,20 @@ static bool Voxelise(Body& B, const void* root, bool* notEligible = nullptr,
             // Which also means the ledger of what they have already lost is
             // spent: it was only ever there to stop one loss firing twice, and
             // every loss it recorded is now simply absent from the birth set.
-            B.partsAtBirth = flesh::PartsOver(whole[0], std::size_t(g_cfg.severMin));
-            B.partsLost    = 0;
+            // Enforce full part-mask culling on any newly equipped clothes/armour over already-severed limbs (#19)
+            if (savedPartsLostCarry != 0) {
+                for (auto& [ck, CC] : B.lat.cells) {
+                    if (CC.part != 0 && (savedPartsLostCarry & (1u << unsigned(CC.part)))) {
+                        CC.gone = 0xFFFFFFFFu;
+                        B.ledger[ck] = 0xFFFFFFFFu;
+                        ++B.restored;
+                    }
+                }
+                whole = flesh::Sections(B.lat, flesh::kAllLayers);
+            }
+            B.partsAtBirth = whole.empty() ? 0u : flesh::PartsOver(whole[0], std::size_t(g_cfg.severMin));
+            B.partsLost    = savedPartsLostCarry;
+            if (savedHeadOffCarry) B.headOff = true;
             const std::size_t floorCells = std::size_t(g_cfg.severMin);
             // DECIDED FRESH, EVERY TIME. This flag was set and never
             // cleared, so an in-place re-voxelise kept "worn, not flesh" on a
@@ -11666,7 +12302,7 @@ static bool Voxelise(Body& B, const void* root, bool* notEligible = nullptr,
                 // this Body after the fill left them.
                 // At HF 0 the line below is not reached and the head is
                 // counted the old way.
-                if (q == std::size_t(flesh::Part::Head) && g_cfg.targetFace) {
+                if (q == std::size_t(flesh::Part::Head) && g_cfg.targetFace && !B.beastNoSkull) {
                     const std::size_t skull = SkullCells(B.lat, whole[0].cells);
                     if (mine > skull)
                         Log("    %u skin-only Head cell(s) of theirs (%s); the skull count is %u",
@@ -12211,7 +12847,23 @@ static u32 PaintCanvas(Body& B, const Body::Canvas& CV, void* dev,
 static u32 PaintCut(Body& B, void* dev)
 {
     if (B.canvases.empty()) return 0;
-    std::vector<std::vector<flesh::CutQuad>> routed = BloodQuads(B);
+    std::vector<std::vector<flesh::CutQuad>> routed = g_cfg.bloodSplatter
+        ? BloodQuads(B)
+        : std::vector<std::vector<flesh::CutQuad>>(B.canvases.size());
+    if (g_cfg.bloodSplatterPct <= 0) {
+        for (auto& vec : routed) vec.clear();
+    } else if (g_cfg.bloodSplatter && g_cfg.bloodSplatterPct < 100) {
+        const u32 pct = u32(g_cfg.bloodSplatterPct);
+        for (auto& vec : routed) {
+            std::vector<flesh::CutQuad> kept;
+            kept.reserve((vec.size() * pct) / 100u + 1u);
+            for (std::size_t i = 0; i < vec.size(); ++i) {
+                if (((u32(i) * 2654435761u) % 100u) < pct) kept.push_back(vec[i]);
+            }
+            if (kept.empty() && !vec.empty()) kept.push_back(vec[0]);
+            vec.swap(kept);
+        }
+    }
     u32 total = 0;
     for (std::size_t k = 0; k < B.canvases.size() && k < routed.size(); ++k)
         total += PaintCanvas(B, B.canvases[k], dev, routed[k]);
@@ -12583,16 +13235,18 @@ struct RedrawPart {
     u32 drawnWas = 0xFFFFFFFFu;            // ShapeSrc::drawn[p] when the job was made
     std::size_t base = 0;                  // this partition's first entry in the shape's table copy
     // what the worker made
-    u32 nk = 0, draw = 0, fan = 0; void* ib = nullptr; void* vb = nullptr; bool skipped = true, failed = false;
+    u32 nk = 0, draw = 0, fan = 0, newVertCount = 0; void* ib = nullptr; void* vb = nullptr; bool skipped = true, failed = false;
 };
 struct RedrawShape {
     u32 si = 0; int layer = 0;
     const void* skinInst = nullptr;
-    bool capFan = false;                   // the unsolid fallback lid (CapWound)
+    bool capFan = false;                   // multi-loop boundary cap (CapWound)
     bool underArmourSkin = false;
     bool isSkin = false;
     bool solid = false;
+    bool isFace = false;
     const std::uint8_t* raw = nullptr;
+    std::vector<std::uint8_t> capRaw;      // thread-safe copy of vertex data for CapWound
     u32 nVerts = 0, vsize = 0;
     std::uint64_t desc = 0;
     float cellPitch = 4.0f;
@@ -12657,10 +13311,20 @@ static void RedrawWork(RedrawJob& J, void* dev)
             if (RP.nk == RP.cap && !everWritten) { RP.skipped = true; continue; }
             if (RP.drawnWas == RP.nk) { RP.skipped = true; continue; }
             RP.skipped = false;
-            if (RP.nk < RP.cap && RS.capFan) {
+            if (RP.nk > 0 && RP.nk < RP.cap && RS.capFan) {
                 const u32 room = RP.cap - RP.nk;
-                RP.fan = flesh::CapWound(RP.orig, RP.cap, out, room);
+                const std::uint8_t* vptr = !RS.capRaw.empty() ? RS.capRaw.data() : nullptr;
+                std::vector<std::uint8_t> vbData;
+                const bool allowVB = (!RS.isFace && RS.parts.size() == 1 && vptr && RS.nVerts && RS.vsize >= 12 &&
+                                      (RS.desc & fact::kVF_VERTEX) != 0);
+                RP.fan = flesh::CapWound(RP.orig, RP.cap, out, room,
+                                         vptr, RS.nVerts, RS.vsize, RS.desc, RS.cellPitch,
+                                         allowVB ? &vbData : nullptr, RS.isFace);
                 if (RP.fan) { std::snprintf(sl, sizeof(sl), "    shape %u part %u: cut face +%u triangle(s)", RS.si, RP.p, RP.fan); say(sl); }
+                if (allowVB && !vbData.empty() && vbData.size() > std::size_t(RS.nVerts) * RS.vsize) {
+                    RP.vb = NewGpuBuffer(dev, vbData.data(), u32(vbData.size()), fact::kD3D11_BIND_VERTEX_BUFFER);
+                    if (RP.vb) RP.newVertCount = u32(vbData.size() / RS.vsize);
+                }
             }
             const std::uint16_t pad = out.empty() ? 0 : out[0];
             while (out.size() < std::size_t(RP.cap) * 3) { out.push_back(pad); out.push_back(pad); out.push_back(pad); }
@@ -12676,8 +13340,10 @@ static void RedrawDiscard(RedrawJob& J)
 {
     for (RedrawShape& RS : J.shapes)
         for (RedrawPart& RP : RS.parts) {
-            if (RP.ib) Retire(RP.ib); RP.ib = nullptr;
-            if (RP.vb) Retire(RP.vb); RP.vb = nullptr;
+            if (RP.ib) Retire(RP.ib);
+            RP.ib = nullptr;
+            if (RP.vb) Retire(RP.vb);
+            RP.vb = nullptr;
         }
 }
 // THE LANDING: on the game's thread, under the bodies lock, the buffers are
@@ -12768,6 +13434,10 @@ static void RedrawLandRunBody(void* self)
                         if (oldV && S.vbOwned[RP.p]) Retire(oldV);
                         S.vbOwned[RP.p] = 1u;
                         RP.vb = nullptr;
+                        if (RP.newVertCount > 0) {
+                            void* vcSlot = static_cast<std::uint8_t*>(mySP) + fact::kSkinP_vertexCount;
+                            if (Writable(vcSlot, sizeof(u32))) *static_cast<volatile u32*>(vcSlot) = RP.newVertCount;
+                        }
                     } else if (RP.vb) {
                         Retire(RP.vb); RP.vb = nullptr;
                     }
@@ -12916,7 +13586,7 @@ static void Redraw(Body& B, void* dev, bool force = false)
             if (!HC.Empty()) ++headLive;
         }
         if (headMine) {
-            const bool off = headLive < std::size_t(g_cfg.severMin);
+            const bool off = (headLive < std::size_t(g_cfg.severMin)) && (!B.beastNoSkull || (B.partsLost & (1u << unsigned(flesh::Part::Head))));
             // Undo FleshCore's own cull the moment their head is demonstrably back --
             // a regrow, a re-dress into a fresh head fill. Only ever unhides
             // hair THIS PLUGIN hid, so a hair another mod hid is not disturbed.
@@ -12953,12 +13623,34 @@ static void Redraw(Body& B, void* dev, bool force = false)
     for (const auto& [k, C] : B.lat.cells) {
         if (useClearGain && (C.gone & ~flesh::kArmourBit) != 0) openGrid.Mark125Bits(k, 1u);
     }
+    if (useClearGain && !B.lat.severed.empty()) {
+        for (const auto& sl : B.lat.severed) {
+            bool expose = sl.bare;
+            if (!expose) {
+                auto ia = B.lat.cells.find(sl.a), ib = B.lat.cells.find(sl.b);
+                if ((ia != B.lat.cells.end() && ia->second.part == std::uint8_t(flesh::Part::Head)) ||
+                    (ib != B.lat.cells.end() && ib->second.part == std::uint8_t(flesh::Part::Head)))
+                    expose = true;
+            }
+            if (expose) {
+                openGrid.Mark125Bits(sl.a, 1u);
+                openGrid.Mark125Bits(sl.b, 1u);
+            }
+        }
+    }
     const u32 nShapes = u32(B.shapes.size());
     if (B.redrawDirty.size() != nShapes) B.redrawDirty.assign(nShapes, 1);
     if (force) std::fill(B.redrawDirty.begin(), B.redrawDirty.end(), 1);
     std::size_t cellsMoved = 0;
     // The two answers every cell gives, laid flat by Cell::ord for the table
     // path below; sized only when the table exists.
+    auto cellHasVisibleOuterSkin = [&](const flesh::Cell& C) -> bool {
+        for (u32 si : C.shapes) {
+            if (si < B.shapes.size() && B.shapes[si].isSkin && !B.shapes[si].underArmourSkin && !B.shapes[si].solid)
+                return true;
+        }
+        return false;
+    };
     std::vector<u32> goneOf;
     std::vector<std::uint8_t> coveredOf;
     if (B.lat.triCellProven && B.lat.cellCount > 0 && B.lat.cellCount <= 0x7FFFu) {
@@ -12979,7 +13671,10 @@ static void Redraw(Body& B, void* dev, bool force = false)
             }
             C.drawnGone = effGone; C.drawnCovered = covered;
         }
-        if (C.ord < goneOf.size()) { goneOf[C.ord] = effGone; coveredOf[C.ord] = covered; }
+        if (C.ord < goneOf.size()) {
+            goneOf[C.ord] = effGone;
+            coveredOf[C.ord] = std::uint8_t(covered | (cellHasVisibleOuterSkin(C) ? 2u : 0u));
+        }
     }
     // The canvas is PaintCut's and a face below HF 3 is read, not cut: the
     // shape loop below skips both, so their triangles are not gathered.
@@ -13058,7 +13753,11 @@ static void Redraw(Body& B, void* dev, bool force = false)
         const int L = layerOf[si];
         for (const auto& [k, C] : B.lat.cells) {
             if (C.gone & (1u << L)) continue;
-            if (S.underArmourSkin && !(C.gone & flesh::kArmourBit)) { ++hid; continue; }
+            if (S.underArmourSkin) {
+                if (!(C.gone & flesh::kArmourBit) || (C.gone & 1u)) { ++hid; continue; }
+                const bool visSkin = (C.ord < coveredOf.size()) ? ((coveredOf[C.ord] & 2u) != 0) : cellHasVisibleOuterSkin(C);
+                if (visSkin) { ++hid; continue; }
+            }
             const bool covered = C.drawnCovered != 0;   // decided in the pass above
             auto take = [&](const flesh::TriRef& t) {
                 if (L >= 1 && L < 4 && covered) { ++hid; return; }
@@ -13120,12 +13819,16 @@ static void Redraw(Body& B, void* dev, bool force = false)
         if (!parr || nP < S.partTris.size() || nP > 64) return false;
         if (!Readable(parr, std::size_t(nP) * fact::kPartStride)) return false;
         RedrawShape RS; RS.si = si; RS.layer = layerOf[si]; RS.skinInst = S.skinInst;
-        RS.capFan = false;
+        RS.capFan = (S.face || (S.isSkin && !B.solid)) && (g_cfg.targetFace >= 3 || !S.face);
         RS.underArmourSkin = S.underArmourSkin;
         RS.isSkin = S.isSkin;
         RS.solid = S.solid;
+        RS.isFace = S.face;
         RS.raw = (S.solid && S.raw && S.nVerts && S.vsize && Readable(S.raw, std::size_t(S.nVerts) * S.vsize)) ? S.raw : nullptr;
         RS.nVerts = S.nVerts; RS.vsize = S.vsize; RS.desc = S.desc; RS.cellPitch = B.lat.cell > 0.5f ? B.lat.cell : 4.0f;
+        if (RS.capFan && S.raw && S.nVerts && S.vsize && Readable(S.raw, std::size_t(S.nVerts) * S.vsize)) {
+            RS.capRaw.assign(S.raw, S.raw + std::size_t(S.nVerts) * S.vsize);
+        }
         std::size_t base = 0;
         for (u32 p = 0; p < S.partTris.size(); ++p) {
             const u32 real = S.partReal[p];
@@ -13245,16 +13948,29 @@ static void Redraw(Body& B, void* dev, bool force = false)
                     if (bridged) nk = u32(out.size() / 3);
                 }
             }
-            if (false && nk < cap && S.layer == deepest && B.canvases.empty() && !B.solid) {
+            void* nvb = nullptr;
+            u32 newVertCount = 0;
+            const bool wantCap = (S.face || (S.isSkin && !B.solid)) && (g_cfg.targetFace >= 3 || !S.face);
+            if (nk > 0 && nk < cap && wantCap) {
                 const std::uint16_t* orig = nullptr;
                 if (Peek(buf, fact::kRD_rawIndexData, &orig) && orig &&
                     Readable(orig, std::size_t(cap) * 6)) {
                     const u32 room = cap - nk;
-                    const u32 fan = flesh::CapWound(orig, cap, out, room);
+                    const std::uint8_t* vptr = (S.raw && S.nVerts && S.vsize && Readable(S.raw, std::size_t(S.nVerts) * S.vsize)) ? S.raw : nullptr;
+                    std::vector<std::uint8_t> vbData;
+                    const bool allowVB = (!S.face && S.partTris.size() == 1 && vptr && S.vsize >= 12 &&
+                                          (S.desc & fact::kVF_VERTEX) != 0);
+                    const u32 fan = flesh::CapWound(orig, cap, out, room,
+                                                    vptr, S.nVerts, S.vsize, S.desc,
+                                                    B.lat.cell > 0.5f ? B.lat.cell : 4.0f,
+                                                    allowVB ? &vbData : nullptr, S.face);
                     if (fan) { std::snprintf(sl, sizeof(sl), "    shape %u part %u: cut face +%u triangle(s)", si, p, fan); say(); }
+                    if (allowVB && !vbData.empty() && vbData.size() > std::size_t(S.nVerts) * S.vsize) {
+                        nvb = NewGpuBuffer(dev, vbData.data(), u32(vbData.size()), fact::kD3D11_BIND_VERTEX_BUFFER);
+                        if (nvb) newVertCount = u32(vbData.size() / S.vsize);
+                    }
                 }
             }
-            void* nvb = nullptr;
             const std::uint16_t pad = out.empty() ? 0 : out[0];
             while (out.size() < std::size_t(cap) * 3) {
                 out.push_back(pad); out.push_back(pad); out.push_back(pad);
@@ -13277,6 +13993,10 @@ static void Redraw(Body& B, void* dev, bool force = false)
                 *static_cast<void**>(vbSlot) = nvb;
                 if (oldV && S.vbOwned[p]) Retire(oldV);
                 S.vbOwned[p] = 1u;
+                if (newVertCount > 0) {
+                    void* vcSlot = static_cast<std::uint8_t*>(mySP) + fact::kSkinP_vertexCount;
+                    if (Writable(vcSlot, sizeof(u32))) *static_cast<volatile u32*>(vcSlot) = newVertCount;
+                }
             } else if (nvb) {
                 Retire(nvb);
             }
@@ -13369,17 +14089,104 @@ static void DressingSatisfied(Body& B)
 // beast, who can never wear the head fill, would be re-dressed after every
 // rebuild for ever. A wound's urgent request is written whatever this says.
 static constexpr DWORD kDressPatienceMs = 8000;
-static constexpr std::uint8_t kDressAskAgain = 2;
+static constexpr std::uint8_t kDressAskAgain = 5;
+
+static std::unordered_map<u32, int> g_dressFinalMask; // bit 1 = bodyFinal, bit 2 = headFinal
+static inline int FinalMaskFor(u32 fid)
+{
+    auto it = g_dressFinalMask.find(fid);
+    return (it != g_dressFinalMask.end()) ? it->second : 0;
+}
+static std::map<u32, int> g_dressNeed; // 1 = body only, 2 = head only, 3 = both (#9 F3)
+static CRITICAL_SECTION g_csMemIPC;
+static bool g_memIpcLockReady = false;
+static std::deque<std::string> g_memWounds;
+static std::deque<std::string> g_memEvents;
+static std::string g_memDressLine;
+static std::string g_memReviveLine;
+static std::deque<std::string> g_memCmds;
+static std::unordered_set<u32> g_memNoKill;
+static std::map<u32, DWORD> g_memDeathHeld;
+static std::vector<std::pair<u32, int>> g_memDressDoneQ;
+static volatile LONG g_tablesDirtyFlag = 1;
+static volatile LONG g_wakePending = 0;
+static volatile LONG g_wakeTaskInFlight = 0;
+// ONE UNANSWERED WAKE AT A TIME. FIELD: a script stack dump with five
+// OnFleshCoreWake stacks queued behind each other on the watcher. A wake is
+// answered when FL_Watch.OnFleshCoreWake reaches its end and sends FC_WakeDone
+// (the mod-event sink clears g_wakeOutstanding). Until then, or for
+// kWakeRearmMs, a further wake is not sent: g_wakePending is cleared and
+// g_wakeHeldFlag remembers it, so the hook ticker is not kept urgent by it.
+// The sink offers a held wake again as soon as the answer comes; the ticker
+// offers it once kWakeRearmMs has passed without one. Nothing is lost by
+// holding: the watcher's own tick drains the same queues (wounds every beat,
+// dress and revive lines every fourth).
+static volatile LONG g_wakeOutstanding = 0;
+static volatile LONG g_wakeHeldFlag    = 0;
+static volatile LONG g_wakeSentTick    = 0;
+static volatile LONG g_wakeSent        = 0;   // counters for the [IPC] line
+static volatile LONG g_wakeHeld        = 0;
+static const DWORD   kWakeRearmMs      = 3000;
+static volatile long g_outPending = 0;
+static void RequestWakeModEvent();
+static void FlushWakePending();
+
+static void DrainMemDressDoneLocked()
+{
+    if (!g_memIpcLockReady) return;
+    std::vector<std::pair<u32, int>> tmp;
+    EnterCriticalSection(&g_csMemIPC);
+    if (!g_memDressDoneQ.empty()) tmp.swap(g_memDressDoneQ);
+    LeaveCriticalSection(&g_csMemIPC);
+    for (const auto& item : tmp) {
+        const u32 fid = item.first;
+        const int dm = item.second & 3;
+        if (dm > 0) g_dressFinalMask[fid] |= dm;
+        for (std::size_t di = 0; di < g_dress.size(); ) {
+            if (g_dress[di] == fid) g_dress.erase(g_dress.begin() + std::ptrdiff_t(di));
+            else ++di;
+        }
+        g_dressNeed.erase(fid);
+    }
+}
+
+static void PushMemDress(const std::string& s)
+{
+    if (!g_memIpcLockReady) return;
+    EnterCriticalSection(&g_csMemIPC);
+    g_memDressLine = s;
+    LeaveCriticalSection(&g_csMemIPC);
+    InterlockedIncrement(&g_outPending);
+    RequestWakeModEvent();
+}
+static void PushMemRevive(const std::string& s)
+{
+    if (!g_memIpcLockReady) return;
+    EnterCriticalSection(&g_csMemIPC);
+    g_memReviveLine = s;
+    LeaveCriticalSection(&g_csMemIPC);
+    InterlockedIncrement(&g_outPending);
+    RequestWakeModEvent();
+}
 
 static void RequestDressing(Body& B, bool urgent = false)
 {
+    DrainMemDressDoneLocked();
+    const int finalMask = FinalMaskFor(B.formID);
+    const bool needBody = !(B.solid && B.ownFillFrac >= 0.30f) && ((finalMask & 1) == 0);
+    const bool hasHead  = B.beastNoSkull || ((B.partsAtBirth & (1u << unsigned(flesh::Part::Head))) != 0);
+    const bool needHead = !hasHead && ((finalMask & 2) == 0);
+    const int needMask  = (needBody ? 1 : 0) | (needHead ? 2 : 0);
+    if (needMask == 0) return;
+
     const DWORD now = GetTickCount();
     if (B.asked && !urgent) {
         if (DWORD(now - B.askedAt) < kDressPatienceMs || B.askAgain >= kDressAskAgain) return;
         ++B.askAgain;
-        Log("  dressing asked for again for 0x%08X: the request of %.1f s ago brought no interior",
-            B.formID, double(DWORD(now - B.askedAt)) / 1000.0);
+        Log("  dressing asked for again for 0x%08X (need=%d): request of %.1f s ago still pending",
+            B.formID, needMask, double(DWORD(now - B.askedAt)) / 1000.0);
     }
+    g_dressNeed[B.formID] = needMask;
     for (std::size_t i = 0; i < g_dress.size(); ++i) {
         if (g_dress[i] == B.formID) {
             if (urgent && i > 0) {
@@ -13414,7 +14221,8 @@ write_dress:
         // all, so GetFormEx receives a different number and finds nothing. The
         // arming path already knew this and converted the other way; this side
         // did not.
-        std::snprintf(buf, sizeof(buf), "%s%d", i ? "|" : "", int(g_dress[i]));
+        const int nm = g_dressNeed.count(g_dress[i]) ? g_dressNeed[g_dress[i]] : 3;
+        std::snprintf(buf, sizeof(buf), "%s%d:%d", i ? "|" : "", int(g_dress[i]), nm);
         line += buf;
     }
     // ---- FIELD ZERO IS THE HEAD, AS IT ALREADY IS ON THE REVIVE FILE ----
@@ -13440,9 +14248,8 @@ write_dress:
     // dress path never taught FL_Watch the head armour -- only a Restore did.
     std::snprintf(hd, sizeof(hd), "%d|", int(g_cfg.headLocal ? g_prefix + g_cfg.headLocal : 0u));
     const std::string body = std::string(hd) + line;
-    FILE* f = std::fopen("Data\\SKSE\\Plugins\\FleshCore.dress.txt", "wb");
-    if (f) { std::fputs(body.c_str(), f); std::fclose(f); }
-    Log("  dressing requested for 0x%08X (%u waiting), head 0x%08X", B.formID,
+    PushMemDress(body);
+    Log("  dressing queued in-memory for 0x%08X (%u waiting), head 0x%08X", B.formID,
         unsigned(g_dress.size()), unsigned(g_cfg.headLocal ? g_prefix + g_cfg.headLocal : 0u));
 }
 
@@ -13526,6 +14333,14 @@ struct GeomRef {
     const std::uint8_t* raw = nullptr;
     std::vector<std::uint8_t> ownedRaw;
     const void* skinInst = nullptr;    // for the forge's own liveness test (ForgeThread)
+    // THE STALE-RECORD TESTS' INPUTS (ShapeSrc::rawLive, rawPart, maxEdge), by
+    // value: ForgeStillTheirs re-reads the live record pointer of every shape a
+    // recipe uses, and AssembleChunk's edge guard measures copies against
+    // maxEdge (0: not guarded -- a private or fill buffer).
+    bool used = false;                 // a recipe of this batch names it
+    bool rawLive = false;
+    u32  rawPart = 0;
+    float maxEdge = 0.0f;
     u32 vsize = 0;
     std::uint64_t desc = 0;
     u32 nVerts = 0;
@@ -13618,15 +14433,17 @@ static volatile long g_forgeDepth = 0;
 // shared mutable state left to race on.
 static void WriteWoundFile(long seq, int victim, const std::string& body)
 {
+    if (g_memIpcLockReady) {
+        EnterCriticalSection(&g_csMemIPC);
+        if (g_memWounds.size() >= 512) g_memWounds.pop_front();
+        g_memWounds.push_back(body);
+        LeaveCriticalSection(&g_csMemIPC);
+        InterlockedIncrement(&g_outPending);
+        RequestWakeModEvent();
+    }
+    if (false) {
     char path[192];
     std::snprintf(path, sizeof(path), "Data\\SKSE\\Plugins\\FleshCore.w%ld.txt", seq);
-    FILE* f = std::fopen(path, "wb");
-    if (!f) { Log("  cannot write %s -- errno %d (%s)", path, errno, std::strerror(errno)); return; }
-    // Signed: Papyrus's Int is signed 32-bit and most of a large load order has
-    // the high bit set. Written unsigned, GetFormEx is handed a number it
-    // cannot parse and finds nothing.
-    std::fprintf(f, "%s", body.c_str());
-    std::fclose(f);
     // THE LINE THE SCRIPT WILL READ, WRITTEN OUT IN FULL, AND THEN READ BACK.
     //
     // Every piece that ever appears in the game appears because this exact
@@ -13648,7 +14465,8 @@ static void WriteWoundFile(long seq, int victim, const std::string& body)
                 same ? "" : "  <<< DOES NOT MATCH WHAT WAS WRITTEN", back);
         }
     }
-    (void)victim;
+    }
+    (void)seq; (void)victim;
 }
 
 // THE PER-BATCH SCRATCH FOR THE COPY. One entry per SOURCE shape: for every
@@ -13686,6 +14504,7 @@ static bool AssembleChunk(const std::vector<GeomRef>& geom, const ForgeJob& J,
 {
     std::vector<std::vector<std::size_t>> slot(geom.size());
     std::vector<u32> curSerial(geom.size(), 0);
+    std::vector<int> srcOf(C.shapes.size(), -1);   // per chunk shape: its source shape, -1 for merged fill
     std::vector<std::size_t> solidL2Run, solidL3Run;
     u32 solidL2Serial = 0, solidL3Serial = 0;
     for (const flesh::TriRef& t : J.tris) {
@@ -13721,6 +14540,7 @@ static bool AssembleChunk(const std::vector<GeomRef>& geom, const ForgeJob& J,
             sh.liveTex = S.liveTex;
             run.push_back(C.shapes.size());
             C.shapes.push_back(std::move(sh));
+            srcOf.push_back(mergeSolid ? -1 : int(t.shape));
             activeSerial = ++X.serial;
         }
         const std::size_t si = run.back();
@@ -13748,10 +14568,65 @@ static bool AssembleChunk(const std::vector<GeomRef>& geom, const ForgeJob& J,
             sh.tris.push_back(li);
         }
     }
+    // ---- THE EDGE GUARD: the last line of defence (rawguard.h) ----
+    //
+    // A copied shape most of whose triangles are far longer than any its own
+    // mesh had when the body was built (GeomRef::maxEdge, measured at the
+    // harvest) was copied from records that are not its own: the stretched
+    // pieces of the field test. CheckLiveRaw and ForgeStillTheirs keep that
+    // from happening; if it happens anyway, that shape is dropped from the
+    // piece and said, and the rest of the piece is kept. A piece left with
+    // nothing is refused. Only shapes read from the engine's records carry a
+    // maxEdge.
+    std::size_t keep = 0;
+    int dropped = 0;
+    for (std::size_t i = 0; i < C.shapes.size(); ++i) {
+        chunknif::Shape& sh = C.shapes[i];
+        const int s = i < srcOf.size() ? srcOf[i] : -1;
+        if (s >= 0 && geom[std::size_t(s)].maxEdge > 0.0f && sh.vsize) {
+            const std::size_t nT = sh.tris.size() / 3;
+            const float lim = rawguard::EdgeLimit(geom[std::size_t(s)].maxEdge);
+            float longest = 0.0f;
+            const u32 nLong = rawguard::LongTris(sh.vdata.data(), u32(sh.vdata.size() / sh.vsize), sh.vsize,
+                                                 sh.desc, sh.tris.data(), nT, lim, &longest);
+            if (rawguard::Scrambled(nLong, nT)) {
+                // The first 64 a session: a whole burst gone wrong must not bury the log.
+                static volatile long saidDrop = 0;
+                const long n = InterlockedIncrement(&saidDrop);
+                if (n <= 64)
+                    Log("    [RAW] piece shape %s dropped: %u of %u triangle(s) longer than %.1f units (longest %.1f;"
+                        " its own mesh's longest edge is %.1f) -- copied from records that are not its own%s",
+                        sh.name.c_str(), unsigned(nLong), unsigned(nT), double(lim), double(longest),
+                        double(geom[std::size_t(s)].maxEdge),
+                        n == 64 ? " (further drops this session are not logged)" : "");
+                ++dropped;
+                continue;
+            }
+        }
+        if (keep != i) C.shapes[keep] = std::move(C.shapes[i]);
+        ++keep;
+    }
+    if (keep < C.shapes.size()) C.shapes.erase(C.shapes.begin() + std::ptrdiff_t(keep), C.shapes.end());
+    if (dropped && C.shapes.empty()) {
+        *why = "every shape it held was copied from records that are not its own (the edge guard)";
+        return false;
+    }
     return true;
 }
 
 static int WalkQuiet(const void* root, std::uint64_t* ids);   // defined with the re-read watch
+
+// THE RECORDS EVERY SHAPE A RECIPE USES ARE STILL THE ONES THE ENGINE DRAWS IT
+// FROM (CheckLiveRaw): one pointer compare per such shape. Asked before the
+// first copy (ForgeStillTheirs) and again after every piece's copy (the forge
+// loop). A shape whose records the batch copied for itself is never asked.
+static bool ForgeRecordsStill(const ForgeBatch& B)
+{
+    for (const GeomRef& G : B.geom)
+        if (G.used && G.rawLive && G.skinInst && G.ownedRaw.empty() && LiveRawOf(G.skinInst, G.rawPart) != G.raw)
+            return false;
+    return true;
+}
 
 // STILL THEM, STILL THOSE SHAPES -- ON THE FORGE THREAD, NOW.
 //
@@ -13788,6 +14663,16 @@ static bool ForgeStillTheirs(const ForgeBatch& B, const char** why)
     for (int i = 0; i < g_shapeCount && i < kMaxShapes; ++i) live.insert(g_shapes[i].skin);
     for (const GeomRef& G : B.geom)
         if (G.skinInst && !live.count(G.skinInst)) { *why = "a skin instance the recipes name is no longer on them"; return false; }
+    // ...AND THE RECORDS UNDER THEM ARE THE ONES THE WOUND READ (CheckLiveRaw):
+    // ForgeRecordsStill, above. A body-morph update in the
+    // last milliseconds swaps a partition without touching any of the three
+    // facts above, and the copy would read a freed block. This is the one check
+    // that posts a wound with no pieces rather than re-reading the body: the
+    // cells are already gone from them.
+    if (!ForgeRecordsStill(B)) {
+        *why = "their vertex data was replaced after the wound was decided";
+        return false;
+    }
     return true;
 }
 
@@ -13881,6 +14766,33 @@ static DWORD WINAPI ForgeThreadBody(LPVOID)
                     " refused, nothing copied -- the wound posts empty",
                     why, unsigned(B.jobs.size()));
         }
+        // ---- STREAMED PLACEMENT (E 2, E column 7) ---------------------------
+        //
+        // FIELD: the forge writes a wound's pieces one after another, about nine
+        // milliseconds each and up to ninety-four for a five-piece wound with
+        // sections, and the engine was handed none of them until the last was
+        // written. Now the wound's job goes on the placer's queue here, empty,
+        // and every piece joins it the moment its file is on disk; the placer
+        // takes them as they come (still placePerFrame a frame, shards a frame
+        // before sections) and writes the wound file once the forge says it is
+        // done. Order is kept: the forge is one thread, so no later wound's job
+        // can be queued in front of this one.
+        const bool stream = stillTheirs && !B.jobs.empty() && g_cfg.place == 2 &&
+                            g_cfg.placeStream != 0 && g_task != nullptr && B.epoch == g_loadEpoch;
+        if (stream) {
+            PlaceJob SJ;
+            SJ.seq = B.seq; SJ.victim = B.victim; SJ.kick = B.kick; SJ.mark = B.mark;
+            SJ.dismembered = B.dismembered; SJ.trunk = B.trunk; SJ.t0 = B.t0;
+            SJ.nolethal = B.nolethal;
+            SJ.blast = B.blast;
+            SJ.tint[0] = B.tint[0]; SJ.tint[1] = B.tint[1]; SJ.tint[2] = B.tint[2];
+            SJ.hasTint = B.hasTint;
+            SJ.epoch = B.epoch;
+            SJ.streamed = true;
+            SJ.forgeDone = false;
+            SJ.engineCount = std::size_t(-1);   // every piece; StreamDone sets the real count
+            PlaceEnqueue(std::move(SJ));
+        }
         for (ForgeJob& J : B.jobs) {
             float mass = 0;
             if (!stillTheirs) continue;
@@ -13891,6 +14803,20 @@ static DWORD WINAPI ForgeThreadBody(LPVOID)
             if (!AssembleChunk(B.geom, J, scratch, C, &why)) {
                 Log("    island of %u cell(s) could not be copied by the forge: %s -- no piece",
                     unsigned(J.cells), why);
+                continue;
+            }
+            // COPY, THEN CHECK. ForgeStillTheirs proved the records theirs
+            // before the first copy, and a whole-body burst then copies for a
+            // couple of hundred milliseconds: a morph step inside that window
+            // frees records under the copies still to come, and the edge guard
+            // cannot see merged fill. So the compare is made again after every
+            // copy. A piece copied while its records were swapped is dropped,
+            // nothing more is copied, and the pieces already made are posted.
+            if (!ForgeRecordsStill(B)) {
+                const std::size_t left = B.jobs.size() - std::size_t(&J - B.jobs.data());
+                Log("    their vertex data was replaced while the forge was copying: %u piece(s) dropped,"
+                    " the %d already made are posted", unsigned(left), made);
+                stillTheirs = false;
                 continue;
             }
             // A shard is debris and a severed limb is not -- see SetDebris.
@@ -13911,8 +14837,8 @@ static DWORD WINAPI ForgeThreadBody(LPVOID)
                     if (sh.vsize) nv += u32(sh.vdata.size() / sh.vsize);
                     nt += u32(sh.tris.size() / 3);
                 }
-                Log("    island of %u cell(s) refused by the forge: %u shape(s), V=%u T=%u",
-                    unsigned(J.cells), unsigned(C.shapes.size()), nv, nt);
+                Log("    island of %u cell(s) refused by the forge: %u shape(s), V=%u T=%u -- %s",
+                    unsigned(J.cells), unsigned(C.shapes.size()), nv, nt, bs.why ? bs.why : "no reason given");
                 continue;
             }
             char full[256];
@@ -14000,6 +14926,7 @@ static DWORD WINAPI ForgeThreadBody(LPVOID)
                 P.part = J.part; P.layers = J.layers; P.cells = J.cells;
                 P.skinBlocks = bs.skinBlock;
                 PieceTexKeys(C, P.accTex0, P.skinTex0);   // the colour pass's accessory test
+                if (stream) StreamPiece(B.seq, B.epoch, P);   // the placer may take it this very frame
                 written.push_back(std::move(P));
             }
             ++made;
@@ -14053,28 +14980,38 @@ static DWORD WINAPI ForgeThreadBody(LPVOID)
         // byte as it was before the placer existed.
         if (g_cfg.place >= 1 && g_task) {
             PlaceJob PJ;
-            PJ.seq = B.seq; PJ.victim = B.victim; PJ.kick = B.kick; PJ.mark = B.mark;
-            PJ.dismembered = B.dismembered; PJ.trunk = B.trunk; PJ.t0 = B.t0;
-            PJ.nolethal = B.nolethal;
-            PJ.blast = B.blast;
-            PJ.tint[0] = B.tint[0]; PJ.tint[1] = B.tint[1]; PJ.tint[2] = B.tint[2];
-            PJ.hasTint = B.hasTint;
-            // THE BATCH'S epoch, not the current one: a wound decided before a
-            // load must be refused by PlaceRun's own test, and stamping it with
-            // the new epoch here laundered it past that test.
-            PJ.epoch = B.epoch;
-            PJ.pieces = std::move(written);
-            PJ.engineCount = (g_cfg.place == 2) ? PJ.pieces.size()
-                           : (PJ.pieces.empty() ? 0u : 1u);
+            std::size_t engineN = written.size();
+            if (!stream) {
+                PJ.seq = B.seq; PJ.victim = B.victim; PJ.kick = B.kick; PJ.mark = B.mark;
+                PJ.dismembered = B.dismembered; PJ.trunk = B.trunk; PJ.t0 = B.t0;
+                PJ.nolethal = B.nolethal;
+                PJ.blast = B.blast;
+                PJ.tint[0] = B.tint[0]; PJ.tint[1] = B.tint[1]; PJ.tint[2] = B.tint[2];
+                PJ.hasTint = B.hasTint;
+                // THE BATCH'S epoch, not the current one: a wound decided before a
+                // load must be refused by PlaceRun's own test, and stamping it with
+                // the new epoch here laundered it past that test.
+                PJ.epoch = B.epoch;
+                PJ.pieces = std::move(written);
+                PJ.engineCount = (g_cfg.place == 2) ? PJ.pieces.size()
+                               : (PJ.pieces.empty() ? 0u : 1u);
+                engineN = PJ.engineCount;
+            }
             Log("  wound %ld forged: %d piece(s)%s, forge %.1f ms, %.1f ms after the wound"
-                " began -- handed to the game's thread to place (%u by the engine%s)",
+                " began -- %s (%u by the engine%s)",
                 B.seq, made,
                 B.dismembered ? (nSection ? " INCLUDING SEVERED SECTIONS"
                                           : " -- they lost a part, but nothing came off them that could be forged")
                               : "",
-                NowMs() - f0, NowMs() - B.t0, unsigned(PJ.engineCount),
+                NowMs() - f0, NowMs() - B.t0,
+                stream ? "streamed to the game's thread piece by piece"
+                       : "handed to the game's thread to place",
+                unsigned(engineN),
                 g_cfg.place == 1 ? ", the PROBE" : "");
-            PlaceEnqueue(std::move(PJ));
+            // STREAMED: every piece is already on the placer's queue
+            // (StreamPiece); this tells it there are no more.
+            if (stream) StreamDone(B.seq, B.epoch);
+            else        PlaceEnqueue(std::move(PJ));
             InterlockedDecrement(&g_forgeDepth);
             if (made > 0) {
                 const bool allWell = (nTinted == nSkinShapes)
@@ -14504,6 +15441,96 @@ static void AssembleCells(Body& B, const std::vector<flesh::Key>& cells,
 // `fresh` asks for a BRAND-NEW filename -- the kind of path that can stop
 // loading -- for one piece per wound when the probe's control is on, so the
 // recycled names beside it have something to be compared against.
+static bool ProbeModelCache(const char* rel, bool& outFound, u32& outFlagsRef, u32& outNodeRef, std::uint8_t** outDbBase = nullptr)
+{
+    outFound = false; outFlagsRef = 0; outNodeRef = 0;
+    if (outDbBase) *outDbBase = nullptr;
+    if (!rel || !rel[0] || !g_base || HandsOff() || TearingDown()) return false;
+    void* modelDB = nullptr;
+    if (!Peek(reinterpret_cast<const void*>(g_base + fact::kBSModelDBGlobal), 0, &modelDB) || !modelDB) return false;
+    if (!Readable(modelDB, 0x240)) return false;
+    std::uint8_t* dbBase = static_cast<std::uint8_t*>(modelDB) + fact::kBSModelDB_dbBase;
+    if (outDbBase) *outDbBase = dbBase;
+    std::uint8_t* entryMap = dbBase + fact::kEntryDBBase_map;
+    const void* fnId   = reinterpret_cast<const void*>(g_base + fact::kBSResourceIDFromPath);
+    const void* fnLook = reinterpret_cast<const void*>(g_base + fact::kBSEntryMapLookup);
+    if (!Readable(fnId, 16) || !Readable(fnLook, 16)) return false;
+
+    char norm[320];
+    bool hasPrefix = false;
+    if ((rel[0] == 'm' || rel[0] == 'M') && (rel[1] == 'e' || rel[1] == 'E') &&
+        (rel[2] == 's' || rel[2] == 'S') && (rel[3] == 'h' || rel[3] == 'H') &&
+        (rel[4] == 'e' || rel[4] == 'E') && (rel[5] == 's' || rel[5] == 'S') &&
+        (rel[6] == '\\' || rel[6] == '/')) {
+        hasPrefix = true;
+    }
+    if (hasPrefix) std::snprintf(norm, sizeof(norm), "%s", rel);
+    else           std::snprintf(norm, sizeof(norm), "meshes\\%s", rel);
+
+    struct BSResID { u32 file, ext, dir; } resId{ 0u, 0u, 0u };
+    reinterpret_cast<void (*)(void*, const char*)>(g_base + fact::kBSResourceIDFromPath)(&resId, norm);
+
+    volatile LONG* rw = reinterpret_cast<volatile LONG*>(entryMap + fact::kEntryMap_rwLock);
+    if (!Writable(const_cast<LONG*>(rw), sizeof(LONG))) return false;
+    bool gotRead = false;
+    for (int spin = 0; spin < 4096; ++spin) {
+        const LONG cur = *rw;
+        if (cur < 0) {
+            if ((spin & 63) == 63) Sleep(0);
+            else __builtin_ia32_pause();
+            continue;
+        }
+        if (InterlockedCompareExchange(rw, cur + 1, cur) == cur) {
+            gotRead = true;
+            break;
+        }
+    }
+    if (!gotRead) return false;
+
+    void* sentinel = reinterpret_cast<void*>(g_base + fact::kBSEntryMapSentinel);
+    using Lookup_t = void** (*)(void*, const void*, void*);
+    void** slot = reinterpret_cast<Lookup_t>(g_base + fact::kBSEntryMapLookup)(entryMap, &resId, sentinel);
+    void* entry = (slot && Readable(slot, sizeof(void*)) && *slot && *slot != sentinel) ? *slot : nullptr;
+    if (entry && Readable(entry, 0x30)) {
+        outFound = true;
+        Peek(entry, fact::kBSModelEntry_flagsRef, &outFlagsRef);
+        const void* node = nullptr;
+        if (Peek(entry, fact::kBSModelEntry_data, &node) && node && Readable(node, 0x10)) {
+            Peek(node, fact::kNiRefObject_refCount, &outNodeRef);
+        }
+    }
+    InterlockedDecrement(rw);
+    return true;
+}
+
+static void EvictModelIfUnused(const char* rel)
+{
+    const long game = InterlockedCompareExchange(&g_taskThread, 0, 0);
+    if (game && long(GetCurrentThreadId()) != game) return;
+    if (!g_base || HandsOff() || TearingDown()) return;
+    if (!Readable(reinterpret_cast<const void*>(g_base + fact::kBSModelDBDrainQueue), 16)) return;
+    bool found = false; u32 flagsRef = 0, nodeRef = 0; std::uint8_t* dbBase = nullptr;
+    if (!ProbeModelCache(rel, found, flagsRef, nodeRef, &dbBase) || !found || !dbBase) return;
+    const u32 state    = flagsRef & 0x70000000u;
+    const u32 entryRef = flagsRef & 0x0FFFFFFFu;
+    if (state == 0x40000000u && entryRef == 0u && nodeRef <= 1u) {
+        using Drain_t = void (*)(void*);
+        Drain_t drain = reinterpret_cast<Drain_t>(g_base + fact::kBSModelDBDrainQueue);
+        drain(dbBase);
+        drain(dbBase);
+    }
+}
+
+static bool IsModelBusyInCache(const char* rel)
+{
+    bool found = false; u32 flagsRef = 0, nodeRef = 0;
+    if (!ProbeModelCache(rel, found, flagsRef, nodeRef)) return false;
+    if (!found) return false;
+    const u32 state    = flagsRef & 0x70000000u;
+    const u32 entryRef = flagsRef & 0x0FFFFFFFu;
+    return state == 0x50000000u || entryRef > 0u || nodeRef > 1u || state == 0x30000000u || state == 0x40000000u;
+}
+
 static int ClaimPool(long seq, std::string& relOut, bool fresh, bool section)
 {
     if (g_cfg.poolLocals.empty()) return -1;
@@ -14517,47 +15544,45 @@ static int ClaimPool(long seq, std::string& relOut, bool fresh, bool section)
     if (fresh) {
         std::snprintf(rel, sizeof(rel), "FleshCore\\runtime\\c%lu_%d.nif",
                       (unsigned long)seq, int(poolSlot));
-    } else if (section) {
-        // The slow range. A limb lies on the floor for five minutes and must
-        // not have its mesh taken by the shard churn happening around it.
-        const int sectLimit = (g_cfg.sectCap > 0 && g_cfg.sectCap < kSectionNames)
-                              ? g_cfg.sectCap : kSectionNames;
-        if (g_sectCursor >= sectLimit) {
-            static bool sWrapped = false;
-            if (!sWrapped) {
-                sWrapped = true;
-                Log("    [MESHPOOL] the %d SECTION name(s) have wrapped. A severed"
-                    " limb lives %s, so from here one may take a name still worn by"
-                    " an older limb and wear that limb's shape and colour instead.",
-                    sectLimit, "five minutes");
-            }
-            g_sectCursor = 0;
-        }
-        std::snprintf(rel, sizeof(rel), "FleshCore\\runtime\\r%04d.nif",
-                      kShardNames + g_sectCursor++);
     } else {
-        // EVERY NAME SPENT. Wrapping means a piece may wear the mesh its name
-        // carried earlier in this session, because a path the engine has
-        // already loaded it remembers. This is no longer a warning about
-        // something that might happen: it is what put somebody else's colour
-        // on a piece in play, and the range above is sized so it should
-        // now take sustained casting for a full shard lifetime to reach.
-        const int shardLimit = (g_cfg.shardCap > 0 && g_cfg.shardCap < kShardNames)
-                               ? g_cfg.shardCap : kShardNames;
-        if (g_meshCursor >= shardLimit) {
-            static bool wrapped = false;
-            if (!wrapped) {
-                wrapped = true;
-                Log("    [MESHPOOL] all %d shard name(s) are spent -- the cursor has"
-                    " wrapped. From here a piece may wear the shape AND THE COLOUR"
-                    " that one of these names carried earlier this session, because"
-                    " a path the engine has already loaded it remembers. Pieces of"
-                    " the wrong target from this line onwards are this, not a tint"
-                    " fault.", shardLimit);
+        for (int tries = 0; tries < 32; ++tries) {
+            if (section) {
+                const int sectLimit = (g_cfg.sectCap > 0 && g_cfg.sectCap < kSectionNames)
+                                      ? g_cfg.sectCap : kSectionNames;
+                if (g_sectCursor >= sectLimit) {
+                    static bool sWrapped = false;
+                    if (!sWrapped) {
+                        sWrapped = true;
+                        Log("    [MESHPOOL] the %d SECTION name(s) have wrapped. A severed"
+                            " limb lives %s, so from here one may take a name still worn by"
+                            " an older limb and wear that limb's shape and colour instead.",
+                            sectLimit, "five minutes");
+                    }
+                    g_sectCursor = 0;
+                }
+                std::snprintf(rel, sizeof(rel), "FleshCore\\runtime\\r%04d.nif",
+                              kShardNames + g_sectCursor++);
+            } else {
+                const int shardLimit = (g_cfg.shardCap > 0 && g_cfg.shardCap < kShardNames)
+                                       ? g_cfg.shardCap : kShardNames;
+                if (g_meshCursor >= shardLimit) {
+                    static bool wrapped = false;
+                    if (!wrapped) {
+                        wrapped = true;
+                        Log("    [MESHPOOL] all %d shard name(s) are spent -- the cursor has"
+                            " wrapped. From here a piece may wear the shape AND THE COLOUR"
+                            " that one of these names carried earlier this session, because"
+                            " a path the engine has already loaded it remembers. Pieces of"
+                            " the wrong target from this line onwards are this, not a tint"
+                            " fault.", shardLimit);
+                    }
+                    g_meshCursor = 0;
+                }
+                std::snprintf(rel, sizeof(rel), "FleshCore\\runtime\\r%04d.nif", g_meshCursor++);
             }
-            g_meshCursor = 0;
+            EvictModelIfUnused(rel);
+            if (!IsModelBusyInCache(rel)) break;
         }
-        std::snprintf(rel, sizeof(rel), "FleshCore\\runtime\\r%04d.nif", g_meshCursor++);
     }
     void* acti = LookupForm(g_prefix + g_cfg.poolLocals[poolSlot], fact::kFormType_ACTI);
     if (!acti) { Log("    pool record %d not found -- skipping this piece", int(poolSlot)); return -1; }
@@ -14584,7 +15609,7 @@ static int ClaimPool(long seq, std::string& relOut, bool fresh, bool section)
     // one any piece placed on this record and not yet given 3D is still
     // waiting for. Overwriting it inside the window where that can happen is a
     // specific, nameable bug, so it is logged here.
-    PoolRec& R = g_ledger[poolSlot < 64 ? poolSlot : 0];
+    PoolRec& R = g_ledger[poolSlot < 256 ? poolSlot : 0];
     const DWORD now = GetTickCount();
     if (R.claims && g_probe.pool) {
         const double gap = double(now - R.tick) / 1000.0;
@@ -14697,7 +15722,7 @@ static void AnswerAsk()
             const char* cur = nullptr;
             if (acti) Peek(acti, fact::kACTI_modelStr, &cur);
             const char* cs = cur ? SafeStr(cur) : nullptr;
-            const PoolRec& R = g_ledger[slot < 64 ? slot : 0];
+            const PoolRec& R = g_ledger[slot < 256 ? slot : 0];
             Log("      pool %d now names '%s' (ledger: wound %ld, claim #%d)", slot,
                 cs ? cs : "<unreadable>", R.seq, R.claims);
             if (cs) SayFile("ask", cs);
@@ -14844,7 +15869,6 @@ struct FCWoundedMsg  { u32 version; u32 victimFormID, seq, origin, partsTouchedM
 struct FCPartLostMsg { u32 version; u32 victimFormID, seq, part, partsLostMask, flags; char caller[32]; };
 static u32 PartMaskFromList(const std::string& list);
 static std::vector<OutEvent> g_outbox;   // g_outSeq is declared beside DeleteWoundFiles
-static volatile long g_outPending = 0;
 extern DWORD g_mainThread;               // defined beside the sinks; set at DataLoaded
 static void Emit(const char* name, u32 sender, float num, const std::string& str)
 {
@@ -14895,16 +15919,18 @@ static void FlushOutbox()
                 g_msg->Dispatch(g_pluginHandle, kFC_PartLost, &m, sizeof(m), nullptr);
             }
         }
-        const long n = InterlockedIncrement(&g_outSeq);
-        char path[128];
-        std::snprintf(path, sizeof(path), "Data\\SKSE\\Plugins\\FleshCore.ev%ld.txt", n);
-        // Written whole, terminator last, exactly as the wound files are.
-        FILE* f = std::fopen(path, "wb");
-        if (!f) continue;
-        std::fprintf(f, "%s|%d|%.0f|%s\n#", e.name.c_str(), e.sender, double(e.num), e.str.c_str());
-        std::fclose(f);
+        (void)InterlockedIncrement(&g_outSeq);
+        char evHdr[128];
+        std::snprintf(evHdr, sizeof(evHdr), "%s|%d|%.0f|", e.name.c_str(), e.sender, double(e.num));
+        if (g_memIpcLockReady) {
+            EnterCriticalSection(&g_csMemIPC);
+            if (g_memEvents.size() >= 1024) g_memEvents.pop_front();
+            g_memEvents.push_back(std::string(evHdr) + e.str);
+            LeaveCriticalSection(&g_csMemIPC);
+        }
         Log("[EVENT] %s -> 0x%08X num %.0f: %s", e.name.c_str(), unsigned(e.sender), double(e.num), e.str.c_str());
     }
+    RequestWakeModEvent();
 }
 // The origin numbering for consumers: spell 0, hit 1, command 2,
 // vortex 3, drain 4. Internally the Wound carries 1 spell, 2 hit,
@@ -14966,25 +15992,164 @@ static bool NoLethal(const Body& B, const Wound& W, const char*& why)
             std::fclose(f);
         }
     }
-    if (s_nokillIds.count(B.formID) != 0) {
+    bool memNK = false;
+    if (g_memIpcLockReady) {
+        EnterCriticalSection(&g_csMemIPC);
+        memNK = (g_memNoKill.count(B.formID) != 0);
+        LeaveCriticalSection(&g_csMemIPC);
+    }
+    if (memNK || s_nokillIds.count(B.formID) != 0) {
         why = "a mod's SetNoKill on them";
         return true;
     }
     const bool isPlayer = (B.formID == 0x14u);
     if (isPlayer) {
-        if (W.origin == 1) { why = "player self/spell wound held non-lethal"; return true; }
+        if (W.origin == 1 && W.form != flesh::Lattice::Form::Detonate) { why = "player self/spell wound held non-lethal"; return true; }
         if (!g_cfg.nlPlayer) return false;
     }
     if (W.noKill) { why = "the wound's own nokill column"; return true; }
-    if (W.origin == 1 && g_cfg.nlSpell) { why = "NL: spell wounds never kill"; return true; }
-    if (W.origin == 2 && g_cfg.nlHit)   { why = "NL: blows never kill";        return true; }
+    if (W.origin == 1 && g_cfg.nlSpell)   { why = "NL: spell wounds never kill";   return true; }
+    if (W.origin == 2 && g_cfg.nlHit)     { why = "NL: blows never kill";          return true; }
+    if (W.origin == 3 && g_cfg.nlCommand) { why = "NL: command wounds never kill"; return true; }
+    if (W.origin == 4 && g_cfg.nlVortex)  { why = "NL: vortex wounds never kill";  return true; }
+    if (W.origin == 5 && g_cfg.nlDrain)   { why = "NL: drain wounds never kill";   return true; }
     return false;
+}
+
+struct SavedProtFlags { bool hasActor = false; u32 actorFlags = 0; bool hasNpc = false; u32 npcFlags = 0; };
+static std::map<u32, SavedProtFlags> g_savedProtFlags;
+
+static bool IsDeathHeldInMem(u32 fid)
+{
+    if (!g_memIpcLockReady || !fid) return false;
+    bool held = false;
+    const DWORD now = GetTickCount();
+    EnterCriticalSection(&g_csMemIPC);
+    auto it = g_memDeathHeld.find(fid);
+    if (it != g_memDeathHeld.end()) {
+        if (LONG(it->second - now) > 0) held = true;
+        else g_memDeathHeld.erase(it);
+    }
+    LeaveCriticalSection(&g_csMemIPC);
+    return held;
+}
+
+static void RestoreActorProtectionFlags(u32 fid)
+{
+    auto it = g_savedProtFlags.find(fid);
+    if (it == g_savedProtFlags.end()) return;
+    const SavedProtFlags sp = it->second;
+    g_savedProtFlags.erase(it);
+    void* actorRef = LookupForm(fid, fact::kFormType_ACHR);
+    if (!actorRef || !Readable(actorRef, fact::kActor_flagsSpan)) return;
+    if (sp.hasActor) {
+        void* flagsPtr = static_cast<std::uint8_t*>(actorRef) + fact::kActor_boolFlags;
+        if (Writable(flagsPtr, sizeof(u32))) {
+            u32 cur = 0; std::memcpy(&cur, flagsPtr, sizeof(u32));
+            const u32 mask = fact::kActorFlag_Essential | fact::kActorFlag_Protected;
+            const u32 next = (cur & ~mask) | (sp.actorFlags & mask);
+            std::memcpy(flagsPtr, &next, sizeof(u32));
+        }
+    }
+    if (sp.hasNpc) {
+        const void* base = nullptr;
+        if (Peek(actorRef, fact::kREFR_baseForm, &base) && base && Readable(base, fact::kNPC_flagsSpan)) {
+            std::uint8_t bt = 0;
+            if (Peek(base, fact::kForm_formType, &bt) && bt == fact::kFormType_NPC) {
+                void* acbsPtr = const_cast<std::uint8_t*>(static_cast<const std::uint8_t*>(base)) + fact::kNPC_acbsFlags;
+                if (Writable(acbsPtr, sizeof(u32))) {
+                    u32 cur = 0; std::memcpy(&cur, acbsPtr, sizeof(u32));
+                    const u32 bmask = fact::kACBS_Essential | fact::kACBS_Protected;
+                    const u32 next = (cur & ~bmask) | (sp.npcFlags & bmask);
+                    std::memcpy(acbsPtr, &next, sizeof(u32));
+                }
+            }
+        }
+    }
+    Log("  [RESTORE] 0x%08X: restored original Essential/Protected flags", fid);
+}
+
+// Brief 45ms hit-stop on heavy bone-shatter / sever blows (#18c), guarded by wall-clock watchdog
+static volatile LONGLONG g_hitStopUntilQpc = 0;
+static volatile LONG     g_hitStopActive   = 0;
+static void ClearHitStopNow()
+{
+    if (InterlockedCompareExchange(&g_hitStopActive, 0, 1) == 1 && g_base) {
+        void* pMult = reinterpret_cast<void*>(g_base + fact::kGlobalTimeMultiplier);
+        if (Writable(pMult, sizeof(float))) {
+            const float one = 1.0f;
+            std::memcpy(pMult, &one, sizeof(float));
+        }
+    }
+    InterlockedExchange64(&g_hitStopUntilQpc, 0);
+}
+static void TriggerBoneHitStop(DWORD durMs = 45)
+{
+    if (!g_base || HandsOff() || TearingDown() || LoadScreenUp()) return;
+    void* pMult = reinterpret_cast<void*>(g_base + fact::kGlobalTimeMultiplier);
+    if (!Readable(pMult, sizeof(float)) || !Writable(pMult, sizeof(float))) return;
+    float cur = 1.0f;
+    std::memcpy(&cur, pMult, sizeof(float));
+    // Only dip time if game is currently running at normal speed (never clobber Slow Time shout!)
+    if (InterlockedCompareExchange(&g_hitStopActive, 0, 0) == 0 && (cur < 0.96f || cur > 1.04f)) return;
+    const float dip = 0.14f;
+    std::memcpy(pMult, &dip, sizeof(float));
+    InterlockedExchange64(&g_hitStopUntilQpc, LONGLONG(GetTickCount64() + durMs));
+    InterlockedExchange(&g_hitStopActive, 1);
+}
+static void StepHitStopWatchdog()
+{
+    if (InterlockedCompareExchange(&g_hitStopActive, 0, 0) == 0) return;
+    const LONGLONG until = InterlockedCompareExchange64(&g_hitStopUntilQpc, 0, 0);
+    if (until <= 0 || LONGLONG(GetTickCount64()) >= until || LoadScreenUp() || TearingDown()) {
+        ClearHitStopNow();
+    }
 }
 
 static bool RegistryGet(u32 fid, const char* key, int& out);
 static float ScalarFor(u32 fid);
 // WHAT THE LAST SEPARATE DID, for a command's FL_Done: reset by the
 // caller before WoundActor, set here. Main thread only, like Separate.
+static void StripActorProtectionForLethalSever(const void* actorRef, u32 fid)
+{
+    if (!actorRef || fid == 0u || fid == fact::kPlayerFormID || IsDeathHeldInMem(fid)) return;
+    if (!Readable(actorRef, fact::kActor_flagsSpan)) return;
+    std::uint8_t ft = 0;
+    if (!Peek(actorRef, fact::kForm_formType, &ft) || ft != fact::kFormType_ACHR) return;
+    void* flagsPtr = const_cast<std::uint8_t*>(static_cast<const std::uint8_t*>(actorRef)) + fact::kActor_boolFlags;
+    if (Writable(flagsPtr, sizeof(u32))) {
+        u32 flags = 0;
+        std::memcpy(&flags, flagsPtr, sizeof(u32));
+        const u32 mask = fact::kActorFlag_Essential | fact::kActorFlag_Protected;
+        if (flags & mask) {
+            if (!g_savedProtFlags[fid].hasActor) { g_savedProtFlags[fid].hasActor = true; g_savedProtFlags[fid].actorFlags = flags; }
+            const u32 next = flags & ~mask;
+            std::memcpy(flagsPtr, &next, sizeof(u32));
+            Log("  [KILL] 0x%08X: cleared runtime Essential/Protected actor flags (0x%08X -> 0x%08X) for lethal sever",
+                fid, flags, next);
+        }
+    }
+    const void* base = nullptr;
+    if (Peek(actorRef, fact::kREFR_baseForm, &base) && base && Readable(base, fact::kNPC_flagsSpan)) {
+        std::uint8_t bt = 0;
+        if (Peek(base, fact::kForm_formType, &bt) && bt == fact::kFormType_NPC) {
+            void* acbsPtr = const_cast<std::uint8_t*>(static_cast<const std::uint8_t*>(base)) + fact::kNPC_acbsFlags;
+            if (Writable(acbsPtr, sizeof(u32))) {
+                u32 acbs = 0;
+                std::memcpy(&acbs, acbsPtr, sizeof(u32));
+                const u32 bmask = fact::kACBS_Essential | fact::kACBS_Protected;
+                if (acbs & bmask) {
+                    if (!g_savedProtFlags[fid].hasNpc) { g_savedProtFlags[fid].hasNpc = true; g_savedProtFlags[fid].npcFlags = acbs; }
+                    const u32 nextAcbs = acbs & ~bmask;
+                    std::memcpy(acbsPtr, &nextAcbs, sizeof(u32));
+                    Log("  [KILL] 0x%08X: cleared base Essential/Protected NPC flags (0x%08X -> 0x%08X) for lethal sever",
+                        fid, acbs, nextAcbs);
+                }
+            }
+        }
+    }
+}
+
 static bool g_sepRan = false, g_sepChanged = false;
 static unsigned g_sepTaken = 0;
 static int Separate(Body& B, const float pIn[3], const Wound& W)
@@ -15928,19 +17093,43 @@ static int Separate(Body& B, const float pIn[3], const Wound& W)
                     if ((C.gone & ~flesh::kArmourBit) != 0) anyHeadCut = true;
                     if (C.mine && !C.Empty()) liveHeadMinePos.push_back(C.c);
                 }
+                // Keep helmets, hoods, and hair intact on non-severing head wounds (#12b):
+                // propagate support from any !C.mine Head cell anchored within 8.5 units of surviving
+                // head flesh through connected !C.mine Head neighbours, so tall helmets/hoods/braids
+                // stay whole unless the supporting skull underneath their entire base is gone!
                 if (anyHeadCut && !secs.empty()) {
-                    std::vector<flesh::Key> keep0, dropHair;
-                    keep0.reserve(secs[0].cells.size());
+                    std::set<flesh::Key> accPool, accSupported;
+                    std::vector<flesh::Key> bfs;
                     for (const flesh::Key& k : secs[0].cells) {
                         auto it = B.lat.cells.find(k);
                         if (it != B.lat.cells.end() && it->second.part == std::uint8_t(flesh::Part::Head) && !it->second.mine) {
+                            accPool.insert(k);
                             const float* p0 = it->second.c;
-                            bool supported = false;
                             for (const float* pm : liveHeadMinePos) {
                                 const float dx = p0[0] - pm[0], dy = p0[1] - pm[1], dz = p0[2] - pm[2];
-                                if (dx * dx + dy * dy + dz * dz <= 72.25f) { supported = true; break; } // 8.5 units
+                                if (dx * dx + dy * dy + dz * dz <= 72.25f) {
+                                    accSupported.insert(k);
+                                    bfs.push_back(k);
+                                    break;
+                                }
                             }
-                            if (!supported) { dropHair.push_back(k); continue; }
+                        }
+                    }
+                    for (std::size_t bi = 0; bi < bfs.size(); ++bi) {
+                        const flesh::Key curK = bfs[bi];
+                        for (const flesh::Key& nb : B.lat.Neighbours(curK)) {
+                            if (accPool.count(nb) && !accSupported.count(nb)) {
+                                accSupported.insert(nb);
+                                bfs.push_back(nb);
+                            }
+                        }
+                    }
+                    std::vector<flesh::Key> keep0, dropHair;
+                    keep0.reserve(secs[0].cells.size());
+                    for (const flesh::Key& k : secs[0].cells) {
+                        if (accPool.count(k) && !accSupported.count(k)) {
+                            dropHair.push_back(k);
+                            continue;
                         }
                         keep0.push_back(k);
                     }
@@ -15948,7 +17137,7 @@ static int Separate(Body& B, const float pIn[3], const Wound& W)
                         secs[0] = RebuildSection(B.lat, keep0);
                         B.lat.MarkGone(dropHair, 0xFFFFFFFFu);
                         changed = true;
-                        Log("  swept %u unsupported head accessory/hair cell(s) after head cut", unsigned(dropHair.size()));
+                        Log("  swept %u truly unanchored head accessory/hair cell(s) after head cut", unsigned(dropHair.size()));
                     }
                 }
             }
@@ -15997,7 +17186,7 @@ static int Separate(Body& B, const float pIn[3], const Wound& W)
                 const std::size_t born = B.bornPer[q];
                 // The head by its skull, born and now alike -- see SkullCells.
                 // HF 0 counts as it always has.
-                const std::size_t now  = (q == int(flesh::Part::Head) && !B.wornPart[q] && g_cfg.targetFace)
+                const std::size_t now  = (q == int(flesh::Part::Head) && !B.wornPart[q] && g_cfg.targetFace && !B.beastNoSkull)
                                        ? SkullCells(B.lat, secs[0].cells)
                                        : B.wornPart[q] ? secs[0].cellsPer[q]
                                                        : secs[0].minePer[q];
@@ -16026,6 +17215,7 @@ static int Separate(Body& B, const float pIn[3], const Wound& W)
                     const char* key = (q == int(flesh::Part::Head)) ? "losshead" : isTrunk ? "losstrunk" : "losslimb";
                     if (RegistryGet(B.formID, key, v) && v >= 1 && v <= 16) div = v;
                 }
+                if (q == int(flesh::Part::Head) && B.beastNoSkull) div = std::max(3, div);
                 if (born && now * std::size_t(div) < born) lostParts |= 1u << q;
                 const bool isLimbShaft = (q == int(flesh::Part::LThigh) || q == int(flesh::Part::RThigh) ||
                                           q == int(flesh::Part::LCalf)  || q == int(flesh::Part::RCalf)  ||
@@ -16096,21 +17286,9 @@ static int Separate(Body& B, const float pIn[3], const Wound& W)
                     lostParts |= 1u << unsigned(flesh::Part::Chest);
                 if (detachedAbd >= 2 || (B.bornPer[abQ] && nowAbd * 10 < B.bornPer[abQ] * 7))
                     lostParts |= 1u << unsigned(flesh::Part::Abdomen);
-                const std::uint32_t anyLegShaft = (1u << unsigned(flesh::Part::LThigh))
-                                                | (1u << unsigned(flesh::Part::RThigh))
-                                                | (1u << unsigned(flesh::Part::LCalf))
-                                                | (1u << unsigned(flesh::Part::RCalf));
-                if (lostParts & anyLegShaft)
-                    lostParts |= 1u << unsigned(flesh::Part::Abdomen);
-                const std::uint32_t allLimbShafts = anyLegShaft
-                                                  | (1u << unsigned(flesh::Part::LUpperArm))
-                                                  | (1u << unsigned(flesh::Part::RUpperArm))
-                                                  | (1u << unsigned(flesh::Part::LForearm))
-                                                  | (1u << unsigned(flesh::Part::RForearm));
-                unsigned lostLimbCount = 0;
-                for (std::uint32_t m = (lostParts & allLimbShafts); m; m &= (m - 1)) ++lostLimbCount;
-                if (lostLimbCount >= 2)
-                    lostParts |= 1u << unsigned(flesh::Part::Chest);
+                // NOTE (#19): Single/multi limb severs NO LONGER synthetically stamp Abdomen/Chest!
+                // Limb lethality is governed cleanly by PanelFatalMask() and limbDeadAt (lossLimb),
+                // allowing survivable leg crippling & multi-limb survival when configured!
             }
             // ---- AND THE HEAD DIES BY LAYER TOO -------------------------
             //
@@ -16149,7 +17327,8 @@ static int Separate(Body& B, const float pIn[3], const Wound& W)
                 for (const auto& [k, C] : B.lat.cells) {
                     if (C.part != std::uint8_t(flesh::Part::Head)) continue;
                     const std::uint32_t had = C.layers, lost = C.layers & C.gone;
-                    if (had  & 0x1u) ++bornL0;     if (lost & 0x1u) ++goneL0;
+                    if (had  & 0x1u) ++bornL0;
+                    if (lost & 0x1u) ++goneL0;
                     // ---- SKIN IS THE isSkin BIT, NOT LAYER 0 ----
                     //
                     // Lattice::Build sets layer bit 0 for every layer-0 shape,
@@ -16166,8 +17345,10 @@ static int Separate(Body& B, const float pIn[3], const Wound& W)
                     // shape's, and that is what this counts.
                     if (C.isSkin && (had  & 0x1u)) ++bornSkin;
                     if (C.isSkin && (lost & 0x1u)) ++goneSkin;
-                    if (had  & 0x4u) ++bornBrain;  if (lost & 0x4u) ++goneBrain;
-                    if (had  & 0x8u) ++bornBone;   if (lost & 0x8u) ++goneBone;
+                    if (had  & 0x4u) ++bornBrain;
+                    if (lost & 0x4u) ++goneBrain;
+                    if (had  & 0x8u) ++bornBone;
+                    if (lost & 0x8u) ++goneBone;
                 }
                 if (bornL0 != bornSkin || goneL0 != goneSkin)
                     Log("  head tally: %u Head cell(s) born with a layer-0 shape and"
@@ -16194,16 +17375,44 @@ static int Separate(Body& B, const float pIn[3], const Wound& W)
                         unsigned(bornL0), unsigned(goneL0));
                 // strictly MORE than the threshold, so 20 means "more than 20%"
                 // and 0 means "any at all".
-                const bool skinGone  = bornSkin  && goneSkin  * 100u > bornSkin  * std::size_t(g_cfg.headSkinPct);
-                const bool boneGone  = bornBone  && goneBone  * 100u > bornBone  * std::size_t(g_cfg.headBonePct);
-                const bool brainGone = bornBrain && goneBrain * 100u > bornBrain * std::size_t(g_cfg.headBrainPct);
+                const bool skinGone  = (g_cfg.headSkinLeth  > 0) && bornSkin  && goneSkin  * 100u > bornSkin  * std::size_t(100 - g_cfg.headSkinLeth);
+                const bool brainGone = (g_cfg.headFleshLeth > 0) && bornBrain && goneBrain * 100u > bornBrain * std::size_t(100 - g_cfg.headFleshLeth);
+                const bool boneGone  = (g_cfg.headBoneLeth  > 0) && bornBone  && goneBone  * 100u > bornBone  * std::size_t(100 - g_cfg.headBoneLeth);
                 if (skinGone || boneGone || brainGone) {
                     lostParts |= 1u << unsigned(flesh::Part::Head);
-                    Log("  THEIR HEAD IS LOST BY LAYER: skin %u/%u (>%d%%%s),"
-                        " skull %u/%u (>%d%%%s), brain %u/%u (>%d%%%s)",
-                        unsigned(goneSkin),  unsigned(bornSkin),  g_cfg.headSkinPct,  skinGone  ? " TRIPPED" : "",
-                        unsigned(goneBone),  unsigned(bornBone),  g_cfg.headBonePct,  boneGone  ? " TRIPPED" : "",
-                        unsigned(goneBrain), unsigned(bornBrain), g_cfg.headBrainPct, brainGone ? " TRIPPED" : "");
+                    Log("  THEIR HEAD IS LOST BY LAYER (lethality %d/%d/%d%%): skin %u/%u%s, flesh %u/%u%s, bone %u/%u%s",
+                        g_cfg.headSkinLeth, g_cfg.headFleshLeth, g_cfg.headBoneLeth,
+                        unsigned(goneSkin),  unsigned(bornSkin),  skinGone  ? " TRIPPED" : "",
+                        unsigned(goneBrain), unsigned(bornBrain), brainGone ? " TRIPPED" : "",
+                        unsigned(goneBone),  unsigned(bornBone),  boneGone  ? " TRIPPED" : "");
+                }
+            }
+            // Body layer lethality (#14): Skin >= Flesh >= Bone across non-Head cells
+            if (!(lostParts & (1u << unsigned(flesh::Part::Chest))) &&
+                (g_cfg.bodySkinLeth > 0 || g_cfg.bodyFleshLeth > 0 || g_cfg.bodyBoneLeth > 0)) {
+                std::size_t bSkinBorn = 0, bSkinGone = 0;
+                std::size_t bFleshBorn = 0, bFleshGone = 0;
+                std::size_t bBoneBorn = 0, bBoneGone = 0;
+                for (const auto& [k, C] : B.lat.cells) {
+                    if (C.part == std::uint8_t(flesh::Part::Head) || C.part == std::uint8_t(flesh::Part::Unknown)) continue;
+                    const std::uint32_t had = C.layers, lost = C.layers & C.gone;
+                    if (C.isSkin && (had & 0x1u)) ++bSkinBorn;
+                    if (C.isSkin && (lost & 0x1u)) ++bSkinGone;
+                    if (had & 0x6u) ++bFleshBorn;
+                    if (lost & 0x6u) ++bFleshGone;
+                    if (had & 0x8u) ++bBoneBorn;
+                    if (lost & 0x8u) ++bBoneGone;
+                }
+                const bool bsTrip = (g_cfg.bodySkinLeth  > 0) && bSkinBorn  && bSkinGone  * 100u > bSkinBorn  * std::size_t(100 - g_cfg.bodySkinLeth);
+                const bool bfTrip = (g_cfg.bodyFleshLeth > 0) && bFleshBorn && bFleshGone * 100u > bFleshBorn * std::size_t(100 - g_cfg.bodyFleshLeth);
+                const bool bbTrip = (g_cfg.bodyBoneLeth  > 0) && bBoneBorn  && bBoneGone  * 100u > bBoneBorn  * std::size_t(100 - g_cfg.bodyBoneLeth);
+                if (bsTrip || bfTrip || bbTrip) {
+                    lostParts |= 1u << unsigned(flesh::Part::Chest);
+                    Log("  THEIR BODY IS LOST BY LAYER (lethality %d/%d/%d%%): skin %u/%u%s, flesh %u/%u%s, bone %u/%u%s",
+                        g_cfg.bodySkinLeth, g_cfg.bodyFleshLeth, g_cfg.bodyBoneLeth,
+                        unsigned(bSkinGone),  unsigned(bSkinBorn),  bsTrip ? " TRIPPED" : "",
+                        unsigned(bFleshGone), unsigned(bFleshBorn), bfTrip ? " TRIPPED" : "",
+                        unsigned(bBoneGone),  unsigned(bBoneBorn),  bbTrip ? " TRIPPED" : "");
                 }
             }
             // ONLY WHAT IS NEWLY GONE. Once a leg is off it stays off, and
@@ -16233,7 +17442,7 @@ static int Separate(Body& B, const float pIn[3], const Wound& W)
                         std::snprintf(one, sizeof(one), "%s %u/%u%s%s",
                                       flesh::PartName(flesh::Part(q)),
                                       unsigned(B.wornPart[q] ? secs[0].cellsPer[q]
-                                             : (q == int(flesh::Part::Head) && g_cfg.targetFace)
+                                             : (q == int(flesh::Part::Head) && g_cfg.targetFace && !B.beastNoSkull)
                                                  ? SkullCells(B.lat, secs[0].cells)
                                                  : secs[0].minePer[q]),
                                       unsigned(B.bornPer[q]),
@@ -16285,7 +17494,7 @@ static int Separate(Body& B, const float pIn[3], const Wound& W)
                 // diagram) and the cumulative limb-loss threshold (limbDeadAt / lossLimb).
                 int totalLimbsLost = 0;
                 for (u32 m = B.partsLost & kLimbBits; m; m &= m - 1) ++totalLimbsLost;
-                if (freshlyLost & (kHeadBit | kTrunkBits)) {
+                if (!g_panel.haveFatal && (freshlyLost & (kHeadBit | kTrunkBits))) {
                     lethalNow |= (freshlyLost & (kHeadBit | kTrunkBits));
                 }
                 { int n = g_cfg.limbDeadAt;
@@ -16346,7 +17555,7 @@ static int Separate(Body& B, const float pIn[3], const Wound& W)
         // fifty-five and the rule never fires on the one case it was written
         // for.
         const std::size_t keeperCount =
-            (!B.wornPart[std::size_t(flesh::Part::Head)] && g_cfg.targetFace)
+            (!B.wornPart[std::size_t(flesh::Part::Head)] && g_cfg.targetFace && !B.beastNoSkull)
                 ? SkullCells(B.lat, headKeeperCells) : headKeeperMine;
         //
         // AND SMALL ON BOTH RULERS. What LEAVES them is the whole keeper piece,
@@ -17104,6 +18313,9 @@ static int Separate(Body& B, const float pIn[3], const Wound& W)
                 G.matTint[0] = S.matTint[0]; G.matTint[1] = S.matTint[1]; G.matTint[2] = S.matTint[2];
                 G.liveTex = S.liveTex;
                 G.skinInst = S.skinInst;
+                G.used = used[i] != 0;
+                G.rawLive = S.rawLive; G.rawPart = S.rawPart;
+                G.maxEdge = S.rawLive ? S.maxEdge : 0.0f;
                 // THE FORGE OWNS WHAT IT READS OUT OF A PRIVATE BUFFER. A
                 // shape a recipe names whose records lie inside one of
                 // Body::privRecs' buffers is copied here, whole, because the
@@ -17143,7 +18355,7 @@ static int Separate(Body& B, const float pIn[3], const Wound& W)
         // THEY DIED BECAUSE A NAMED PART OF THEM LEFT, not because a piece was
         // forged. Debris coming loose is not a dismemberment, and a limb the
         // forge refused is still a limb that left them.
-        if (B.formID == 0x14u && (!dismembered || W.origin == 1)) {
+        if (B.formID == 0x14u && (!dismembered || (W.origin == 1 && W.form != flesh::Lattice::Form::Detonate))) {
             nolethal = true;
             dismembered = false;
         }
@@ -17157,7 +18369,8 @@ static int Separate(Body& B, const float pIn[3], const Wound& W)
         if (B.formID == 0x14u && !nolethal && (changed || made > 0 || dismembered)) DeathCamArm();
         batch.trunk = trunkLeft;
         batch.kick = W.kick;
-        batch.mark = W.mark;
+        batch.mark = (!g_cfg.bloodSplatter && W.mark == 1) ? 0 : W.mark;
+        if (g_cfg.bloodSplatterPct <= 0 && batch.mark == 1) batch.mark = 0;
         batch.blast = blast;
         // ---- FL_Wounded / FL_PartLost ------------
         //
@@ -17233,6 +18446,38 @@ static int Separate(Body& B, const float pIn[3], const Wound& W)
                     char pl[96]; std::snprintf(pl, sizeof(pl), "%s|%u|%u|%s", flesh::PartKey(flesh::Part(q)), unsigned(B.partsLost), unsigned(fl), W.caller.c_str());
                     Emit("FL_PartLost", B.formID, float(seq), pl);
                 }
+            // Bone-crack 3D SFX & brief hit-stop when bone (0x8) is broken or a part severs (#18c)
+            bool boneBrokenNow = (freshLostAll != 0);
+            if (!boneBrokenNow && (WoundMask(W) & 0x08u)) {
+                for (const flesh::Key& tk : taken) {
+                    auto ck = B.lat.cells.find(tk);
+                    if (ck != B.lat.cells.end() && (ck->second.layers & ck->second.gone & 0x08u)) { boneBrokenNow = true; break; }
+                }
+            }
+            if (boneBrokenNow) {
+                Emit("FL_BoneCrack", B.formID, freshLostAll ? 2.0f : 1.0f, W.caller);
+                if (W.origin == 2 && B.formID != fact::kPlayerFormID) TriggerBoneHitStop(freshLostAll ? 50 : 35);
+            }
+            if (dismembered && !nolethal) B.wasDead = true;
+            if (dismembered && !nolethal && B.formID != fact::kPlayerFormID) {
+                if (void* vRef = LookupForm(B.formID, fact::kFormType_ACHR))
+                    StripActorProtectionForLethalSever(vRef, B.formID);
+            }
+            {
+                Guard lkP(&g_csPanel);
+                char lw[256];
+                std::snprintf(lw, sizeof(lw), "#%ld on 0x%08X (%s / %s): %u cell(s), %d piece(s)%s",
+                              seq, B.formID, OriginName(W.origin), flesh::Lattice::FormName(W.form),
+                              unsigned(taken.size()), made,
+                              dismembered ? (nolethal ? " [SURVIVABLE SEVER]" : " [LETHAL SEVER]") : "");
+                g_lastWoundSummary = lw;
+            }
+            SyncBodyMirror(B);
+            if (!remain.empty() && g_mirrorLockReady) {
+                EnterCriticalSection(&g_csMirror);
+                g_actorMirror[B.formID].remainStr = remain;
+                LeaveCriticalSection(&g_csMirror);
+            }
         }
         // A WOUND ALWAYS POSTS, EVEN AN EMPTY ONE -- AND ALWAYS DOWN THE SAME
         // PIPE.
@@ -17283,6 +18528,44 @@ static int Separate(Body& B, const float pIn[3], const Wound& W)
 static bool AimFrom(const void* casterRefr, Aim& aim, bool quiet = false)
 {
     if (!casterRefr) return false;
+    // Better 1st/3rd-Person Aim (#18b): when caster is the Player (0x14), trace directly from
+    // PlayerCamera->cameraRoot (exact crosshair ray in 1st-person, vanilla 3rd-person, SmoothCam & TDM),
+    // advancing the ray origin to the player's plane so behind-the-back camera parallax never hits behind the player!
+    u32 casterFid = 0;
+    Peek(casterRefr, fact::kForm_formID, &casterFid);
+    if (casterFid == fact::kPlayerFormID && g_base) {
+        const void* pc = nullptr;
+        if (Peek(reinterpret_cast<const void*>(g_base + fact::kPlayerCameraGlobal), 0, &pc) &&
+            pc && Readable(pc, fact::kPlayerCamera_size)) {
+            const void* camRoot = nullptr;
+            if (Peek(pc, fact::kTESCamera_cameraRoot, &camRoot) && camRoot && IsA(camRoot, "NiNode")) {
+                float cm[9], co[3];
+                if (Peek(camRoot, fact::kAV_worldRotate, &cm) && Peek(camRoot, fact::kAV_worldTranslate, &co)) {
+                    float cd[3] = { cm[1], cm[4], cm[7] };
+                    const float cL = std::sqrt(cd[0]*cd[0] + cd[1]*cd[1] + cd[2]*cd[2]);
+                    if (cL > 0.5f && cL < 2.0f) {
+                        cd[0] /= cL; cd[1] /= cL; cd[2] /= cL;
+                        float ppos[3] = { co[0], co[1], co[2] };
+                        if (Readable(casterRefr, fact::kREFR_size)) {
+                            std::memcpy(ppos, static_cast<const std::uint8_t*>(casterRefr) + fact::kREFR_pos, sizeof(ppos));
+                            ppos[2] += 96.0f; // chest/eye height anchor
+                        }
+                        const float fwdProj = (ppos[0] - co[0]) * cd[0] + (ppos[1] - co[1]) * cd[1] + (ppos[2] - co[2]) * cd[2];
+                        const float adv = (fwdProj > 8.0f && fwdProj < 600.0f) ? fwdProj : 0.0f;
+                        aim.o[0] = co[0] + cd[0] * adv;
+                        aim.o[1] = co[1] + cd[1] * adv;
+                        aim.o[2] = co[2] + cd[2] * adv;
+                        aim.d[0] = cd[0]; aim.d[1] = cd[1]; aim.d[2] = cd[2];
+                        aim.ray = true;
+                        if (!quiet)
+                            Log("  aim: from PlayerCamera crosshair ray (%.0f %.0f %.0f) along (%+.2f %+.2f %+.2f)",
+                                aim.o[0], aim.o[1], aim.o[2], aim.d[0], aim.d[1], aim.d[2]);
+                        return true;
+                    }
+                }
+            }
+        }
+    }
     const void* loaded = nullptr; const void* root = nullptr;
     if (!Peek(casterRefr, fact::kREFR_loadedData, &loaded) || !loaded) return false;
     if (!Peek(loaded, fact::kLoaded_data3D, &root) || !root) return false;
@@ -17697,7 +18980,7 @@ static const char* ArmourItemName(const Body& B, std::uint32_t shape, u32& fidOu
 }
 // A WORLD POINT INTO THEIR BIND SPACE, by their root's world transform -- the
 // same arithmetic SeedFromAim does for a shot (bind = R^T (world - T) / s).
-static bool WorldToBind(const void* root, const float w[3], float out[3])
+[[maybe_unused]] static bool WorldToBind(const void* root, const float w[3], float out[3])
 {
     float R[9], T[3], sc = 1.0f;
     if (!Peek(root, fact::kAV_worldRotate, &R)) return false;
@@ -17833,6 +19116,7 @@ static int WoundActor(const void* refr, const char* seedBone, Aim* aim, const Wo
     // so it cannot be the only test; the number of skinned shapes hanging off
     // it cannot survive one.
     bool dressChanged = false;
+    bool rawStale = false;      // only the records under their skin instances changed (CheckLiveRaw below)
     if (B.live && B.root == root) {
         g_shapeCount = 0; g_budgetWalk = 6000; g_decalsSkipped = 0; g_overlaysSkipped = 0;
         Harvest(root, 0);
@@ -17886,6 +19170,27 @@ static int WoundActor(const void* refr, const char* seedBone, Aim* aim, const Wo
                 dressChanged = true;
             }
         }
+        // ---- THE SAME INSTANCES ARE NOT ALWAYS THE SAME RECORDS ----
+        //
+        // A body-morph update can swap the partition under a skin instance the
+        // walk just found and free the records this body was built from (see
+        // CheckLiveRaw). A fresh copy of the same mesh is re-pointed there and
+        // cut at once -- a shape whose cut was on the replaced copy is re-cut
+        // onto the new one first, when that is all that changed (recut);
+        // anything else is re-read first, by the road a re-dress
+        // takes -- handed to the worker and cut when it lands for a blow (WD),
+        // rebuilt on the frame for a command or API wound -- and then cut.
+        // Never cut from records that are no longer theirs: that is what made
+        // the stretched pieces.
+        if (!dressChanged) {
+            const char* nm = nullptr;
+            if (const int n = CheckLiveRaw(B, &nm, nullptr, true)) {
+                Log("  their vertex data was replaced under the same skin instance(s) -- %d shape(s), first '%s':"
+                    " re-reading them rather than cutting from records that are no longer theirs", n, nm ? nm : "?");
+                dressChanged = true;
+                rawStale = true;
+            }
+        }
     }
     if (!B.live || B.root != root || dressChanged) {
         // A TARGET THE RESTORE HANDED TO THE WATCHER COMES BACK WHOLE, on
@@ -17896,7 +19201,8 @@ static int WoundActor(const void* refr, const char* seedBone, Aim* aim, const Wo
         // root or a re-dress, the same three signs the tick reads -- is
         // Resurrect() or the Dress() after it: the restore FINISHING. The
         // stamp is spent either way. Caller holds g_csBodies (Claim above).
-        if (B.live && (B.root != root || dressChanged)) {
+        // A swapped vertex buffer is not a new 3D: it is not the revive finishing.
+        if (B.live && (B.root != root || (dressChanged && !rawStale))) {
             auto rv = g_reviving.find(formID);
             if (rv != g_reviving.end()) {
                 if (LONG(GetTickCount() - rv->second) <= kReviveWindowMs) {
@@ -17924,7 +19230,8 @@ static int WoundActor(const void* refr, const char* seedBone, Aim* aim, const Wo
         // synchronous build below is reached from a replay only when there was
         // no worker to hand them to, and then at most voxPerFrame a frame.
         const char* why = !B.live ? "they are cold -- no lattice"
-                        : (B.root != root ? "their 3D root changed" : "their geometry changed");
+                        : (B.root != root ? "their 3D root changed"
+                           : rawStale ? "their vertex data was replaced" : "their geometry changed");
         const bool deferable = (W.origin == 2 || W.origin == 5) || (g_cfg.woundDefer == 2 && W.origin == 1);
         if (!g_inReplay && g_cfg.woundDefer && deferable &&
             DeferWound(B, formID, root, seedBone, aim, W, why))
@@ -18015,7 +19322,7 @@ static int WoundActor(const void* refr, const char* seedBone, Aim* aim, const Wo
         // worn interior would fix that. Keying this on
         // fillFrac alone would have silenced the request the moment the lending
         // succeeded, which is the one case where it matters most.
-        const bool hasHeadFill = (B.partsAtBirth & (1u << unsigned(flesh::Part::Head))) != 0;
+        const bool hasHeadFill = B.beastNoSkull || ((B.partsAtBirth & (1u << unsigned(flesh::Part::Head))) != 0);
         if (B.solid && B.ownFillFrac >= 0.30f && hasHeadFill) {
             DressingSatisfied(B);
         } else {
@@ -18078,23 +19385,77 @@ static int WoundActor(const void* refr, const char* seedBone, Aim* aim, const Wo
     }
     if (!have) { Log("  no seed for this wound"); return 0; }
     Wound Wm = W;
+    // DF / NGD Double-Cut Guard (#19): check skeleton bone localScale <= 0.015f for parts already
+    // severed by Dismembering Framework or Next-Gen Decapitations so FleshCore never double-cuts!
+    {
+        static const struct { const char* bone; flesh::Part part; } kExtBones[] = {
+            { "NPC Head [Head]",       flesh::Part::Head },
+            { "NPC L UpperArm [LUar]", flesh::Part::LUpperArm },
+            { "NPC L Forearm [LLar]",  flesh::Part::LForearm },
+            { "NPC L Hand [LHnd]",     flesh::Part::LHand },
+            { "NPC R UpperArm [RUar]", flesh::Part::RUpperArm },
+            { "NPC R Forearm [RLar]",  flesh::Part::RForearm },
+            { "NPC R Hand [RHnd]",     flesh::Part::RHand },
+            { "NPC L Thigh [LThg]",    flesh::Part::LThigh },
+            { "NPC L Calf [LLClf]",    flesh::Part::LCalf },
+            { "NPC L Foot [Lft ]",     flesh::Part::LFoot },
+            { "NPC R Thigh [RThg]",    flesh::Part::RThigh },
+            { "NPC R Calf [RLClf]",    flesh::Part::RCalf },
+            { "NPC R Foot [Rft ]",     flesh::Part::RFoot },
+        };
+        u32 extSevered = 0;
+        for (const auto& eb : kExtBones) {
+            if (const void* bn = FindNode(root, eb.bone, 0)) {
+                float sc = 1.0f;
+                if (Peek(bn, fact::kAV_localScale, &sc) && sc >= 0.0f && sc <= 0.015f)
+                    extSevered |= (1u << unsigned(eb.part));
+            }
+        }
+        if (extSevered) {
+            if (extSevered & (1u << unsigned(flesh::Part::LUpperArm))) extSevered |= (1u << unsigned(flesh::Part::LForearm)) | (1u << unsigned(flesh::Part::LHand));
+            if (extSevered & (1u << unsigned(flesh::Part::LForearm)))  extSevered |= (1u << unsigned(flesh::Part::LHand));
+            if (extSevered & (1u << unsigned(flesh::Part::RUpperArm))) extSevered |= (1u << unsigned(flesh::Part::RForearm)) | (1u << unsigned(flesh::Part::RHand));
+            if (extSevered & (1u << unsigned(flesh::Part::RForearm)))  extSevered |= (1u << unsigned(flesh::Part::RHand));
+            if (extSevered & (1u << unsigned(flesh::Part::LThigh)))    extSevered |= (1u << unsigned(flesh::Part::LCalf)) | (1u << unsigned(flesh::Part::LFoot));
+            if (extSevered & (1u << unsigned(flesh::Part::LCalf)))     extSevered |= (1u << unsigned(flesh::Part::LFoot));
+            if (extSevered & (1u << unsigned(flesh::Part::RThigh)))    extSevered |= (1u << unsigned(flesh::Part::RCalf)) | (1u << unsigned(flesh::Part::RFoot));
+            if (extSevered & (1u << unsigned(flesh::Part::RCalf)))     extSevered |= (1u << unsigned(flesh::Part::RFoot));
+            B.partsLost |= extSevered;
+            const u32 allNamed = ((1u << unsigned(flesh::Part::Count)) - 2u);
+            const u32 allowedParts = (Wm.parts ? Wm.parts : allNamed) & ~extSevered;
+            if (!allowedParts) {
+                Log("  [COMPAT] 0x%08X: target part(s) 0x%X already dismembered by DF/NGD -- skipping duplicate cut",
+                    formID, unsigned(extSevered));
+                return 0;
+            }
+            Wm.parts = allowedParts;
+        }
+    }
+    const bool isCombatBridge = (W.origin == 2) || (W.origin == 5 && W.caller == "HQ");
     if (formID == fact::kPlayerFormID) {
-        if (!HQPlayerAllows()) {
-            Declined(formID, W.origin, "who", "player");
-            return 0;
-        }
-        const u32 pMask = HQPlayerLayerMask();
-        if (Wm.layers) {
-            Wm.layers &= pMask;
-        } else {
-            Wm.layers = flesh::DepthMask(Wm.depth) & pMask;
-        }
-        if (!Wm.layers) {
-            Declined(formID, W.origin, "player", "layers");
-            return 0;
-        }
-        if (!g_hq.playerSever) {
-            Wm.noSever = true;
+        if (isCombatBridge) {
+            if (!HQPlayerAllows()) {
+                Declined(formID, W.origin, "who", "player");
+                return 0;
+            }
+            const u32 pMask = HQPlayerLayerMask();
+            if (Wm.layers) {
+                Wm.layers &= pMask;
+            } else {
+                Wm.layers = flesh::DepthMask(Wm.depth) & pMask;
+            }
+            if (!Wm.layers) {
+                Declined(formID, W.origin, "player", "layers");
+                return 0;
+            }
+            if (!g_hq.playerSever) {
+                Wm.noSever = true;
+            }
+        } else if (W.caller != "Tester") {
+            if (!HQSystemPlayerAllows()) {
+                Declined(formID, W.origin, "who", "modplayer");
+                return 0;
+            }
         }
     }
     if (W.origin == 2 || W.origin == 5) {
@@ -18130,7 +19491,7 @@ static int WoundActor(const void* refr, const char* seedBone, Aim* aim, const Wo
     // typed effects and the windows stamp origin 2 too, and their 12 / 3 cap
     // below 85 -- and HQBuild's own budget for them (2; 4 from 85 since
     // the cleave) -- stand untouched here.
-    if (W.origin == 2) {
+    if (W.origin == 2 && Wm.form != flesh::Lattice::Form::Detonate) {
         const bool magic = (Wm.fam == armour::kMagic);
         // EACH WEAPON'S OWN LIMIT, after the per-actor scalar, so
         // no multiplier can carry a wound past it. A bite is flooded from the
@@ -18335,8 +19696,13 @@ static ParkedBody RecheckParkedBody(Body& B, u32 fid, const char* why)
         Peek(loaded, fact::kLoaded_data3D, &root) && root && root == B.root)
         count = WalkQuiet(root, &ids);
     if (!root) return ParkedBody::Away;
+    // ...and the records under the same instances (CheckLiveRaw): a morph that
+    // swapped a partition since the build goes back to the worker; it is not
+    // cut from freed records. A cut that only lost the copy it was written into
+    // is re-cut in place there (recut), when their identity was compared.
     const bool stale = !B.live || root != B.root || count != B.nGeom ||
-                       (count <= kMaxShapes && ids != B.walkMix);
+                       (count <= kMaxShapes && ids != B.walkMix) ||
+                       CheckLiveRaw(B, nullptr, nullptr, count <= kMaxShapes) > 0;
     if (!stale) return ParkedBody::Current;
     return QueueHitRebuild(B, fid, root, why) ? ParkedBody::HandedOut : ParkedBody::NoWorker;
 }
@@ -18801,6 +20167,29 @@ static bool RaceGateRefuses(u32 fid)
             if (flags & fact::kRaceFlag_Child)  v = RaceVerdict::Child;
             else if (NamesAChild(ed))           v = RaceVerdict::ChildName;
             else if (!(flags & fact::kRaceFlag_Playable) && !RaceGateAdmits(race)) v = RaceVerdict::Race;
+            // Also block child-voiced NPCs placed on adult playable races (#7)
+            if (v == RaceVerdict::Target) {
+                const void* baseNpc = nullptr;
+                if (Peek(refr, fact::kREFR_baseForm, &baseNpc) && baseNpc && Readable(baseNpc, fact::kNPC_voiceSpan)) {
+                    std::uint8_t bft = 0;
+                    if (Peek(baseNpc, fact::kForm_formType, &bft) && bft == fact::kFormType_NPC) {
+                        const void* vform = nullptr;
+                        if (Peek(baseNpc, fact::kNPC_voiceType, &vform) && vform && Readable(vform, fact::kVoice_readSpan)) {
+                            std::uint8_t vft = 0; u32 vfid = 0;
+                            if (Peek(vform, fact::kForm_formType, &vft) && vft == fact::kFormType_VoiceType &&
+                                Peek(vform, fact::kForm_formID, &vfid)) {
+                                if (vfid == 0x00013AE8u || vfid == 0x00013AE9u) {
+                                    v = RaceVerdict::Child;
+                                } else {
+                                    const char* vedp = nullptr; const char* ved = nullptr;
+                                    if (Peek(vform, fact::kVoice_editorID, &vedp) && vedp && (ved = SafeStr(vedp)) && NamesAChild(ved))
+                                        v = RaceVerdict::ChildName;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             if (it != g_raceSeen.end() || g_raceSeen.size() < kRaceGateMax) {
                 RaceSeen& s = g_raceSeen[fid];
                 s.race = race; s.flags = flags; s.verdict = v;
@@ -18825,11 +20214,63 @@ static bool RaceGateRefuses(u32 fid)
     return enforce;
 }
 
+bool IsBeastActorHelper(u32 fid)
+{
+    if (!fid || HandsOff()) return false;
+    const void* refr = LookupForm(fid, fact::kFormType_ACHR);
+    if (!refr || !Readable(refr, fact::kActor_raceSpan)) return false;
+    const void* rf = nullptr;
+    if (!Peek(refr, fact::kActor_race, &rf) || !rf || !Readable(rf, fact::kRace_readSpan)) return false;
+    std::uint8_t rt = 0; u32 race = 0;
+    if (!Peek(rf, fact::kForm_formType, &rt) || rt != fact::kFormType_Race || !Peek(rf, fact::kForm_formID, &race))
+        return false;
+    if (race == 0x00013740u || race == 0x0008883Au || race == 0x00013745u || race == 0x00088845u)
+        return true;
+    const char* edp = nullptr; const char* ed = nullptr;
+    if (Peek(rf, fact::kRace_editorID, &edp) && edp && (ed = SafeStr(edp))) {
+        std::string low(ed);
+        for (char& ch : low) ch = char(std::tolower(static_cast<unsigned char>(ch)));
+        if (low.find("argonian") != std::string::npos || low.find("khajiit") != std::string::npos)
+            return true;
+    }
+    return false;
+}
+
+static bool IsNgdSpawnedHeadActor(u32 fid)
+{
+    if (fid < 0xFF000000u) return false;
+    const void* refr = LookupForm(fid, fact::kFormType_ACHR);
+    if (!refr || !Readable(refr, fact::kActor_bipedSpan)) return false;
+    const void* bip = nullptr;
+    if (!Peek(refr, fact::kActor_biped, &bip) || !bip || !Readable(bip, fact::kBiped_size)) return false;
+    const std::uint8_t* objs = static_cast<const std::uint8_t*>(bip) + fact::kBiped_objects;
+    for (std::size_t i = 0; i < fact::kBiped_count; ++i) {
+        const void* item = nullptr;
+        if (!Peek(objs + i * fact::kBipObj_stride, fact::kBipObj_item, &item) || !item || !Readable(item, 0x40))
+            continue;
+        std::uint8_t ft = 0;
+        if (Peek(item, fact::kForm_formType, &ft) && ft == 26 && Readable(item, fact::kARMO_size)) {
+            const char* np = nullptr; const char* nm = nullptr;
+            if (Peek(item, fact::kARMO_name, &np) && np && (nm = SafeStr(np))) {
+                if (std::strstr(nm, "NGD") || std::strstr(nm, "Decapitated")) return true;
+            }
+        }
+    }
+    const void* loaded = nullptr; const void* root = nullptr;
+    if (Peek(refr, fact::kREFR_loadedData, &loaded) && loaded && Peek(loaded, fact::kLoaded_data3D, &root) && root) {
+        if (const void* pelv = FindNode(root, "NPC Pelvis [Pelv]", 0)) {
+            float sc = 1.0f;
+            if (Peek(pelv, fact::kAV_localScale, &sc) && sc >= 0.0f && sc <= 0.015f) return true;
+        }
+    }
+    return false;
+}
+
 static bool Refused(u32 fid)
 {
-    if (fid == fact::kPlayerFormID && !HQPlayerAllows()) return true;
     { const char* who = nullptr; if (Immune(fid, who)) return true; }
     if (RaceGateRefuses(fid)) return true;
+    if (fid >= 0xFF000000u && IsNgdSpawnedHeadActor(fid)) return true;
     return fid && g_refused.find(fid) != g_refused.end();
 }
 
@@ -18978,7 +20419,10 @@ static u32 Load_ProcessEventBody(void*, const void* ev, void*)
                 refr ? "found" : "NOT IN THE FORM MAP", unsigned(ft),
                 loaded, d3);
         }
-        return 0;
+        // Allow dynamic 0xFF...... playable-race ambush enemies (ACHR == 62) to proceed (#10);
+        // only non-actor refs (chunk REFR == 61, projectiles, etc.) stop here!
+        void* ffActor = LookupForm(fid, fact::kFormType_ACHR);
+        if (!ffActor) return 0;
     }
     if (!on) {
         // THEY ARE GOING AWAY, AND EVERY POINTER HELD INTO THEIR 3D GOES WITH THEM.
@@ -18986,7 +20430,32 @@ static u32 Load_ProcessEventBody(void*, const void* ev, void*)
         // root had changed; noticing it here is both earlier and cheaper, and
         // it stops the registry filling with bodies that no longer exist.
         Guard lk(&g_csBodies);
-        if (g_bodies.erase(fid)) Log("[LOAD] 0x%08X unloaded -- lattice released", fid);
+        auto uit = g_bodies.find(fid);
+        if (uit != g_bodies.end()) {
+            const Body& ub = uit->second;
+            if (Wounded(ub) || ub.partsLost || ub.headOff) {
+                SavedWounds sw;
+                sw.partsLost = ub.partsLost;
+                sw.headOff   = ub.headOff;
+                sw.cellSize  = ub.lat.cell;
+                sw.cells     = ub.ledger;
+                for (const auto& ck : ub.lat.cells)
+                    if (ck.second.gone) sw.cells[ck.first] |= ck.second.gone;
+                SyncSavedMirror(fid, sw);
+                g_restore[fid] = std::move(sw);
+            } else {
+                ClearBodyMirror(fid);
+            }
+            g_bodies.erase(uit);
+            g_activeBodyCountAtomic = g_bodies.size();
+            Log("[LOAD] 0x%08X unloaded -- lattice released", fid);
+        }
+        // Prune unloaded actors from pending dressing queue (#9 F4)
+        for (std::size_t di = 0; di < g_dress.size(); ) {
+            if (g_dress[di] == fid) g_dress.erase(g_dress.begin() + std::ptrdiff_t(di));
+            else ++di;
+        }
+        g_dressNeed.erase(fid);
         // AND THE WARM THREAD STANDS BACK: an unload is a cell in
         // motion, and a walk over an actor whose neighbours are being freed
         // is the worst moment for one. See WarmThread.
@@ -19059,6 +20528,7 @@ static bool PreWarmActor(u32 fid, const char* why, long stopEpoch)
         // the function, so every caller -- the load sink and the warm thread
         // -- gets the same refusal.
         if (Refused(fid)) return false;
+        if (fid == fact::kPlayerFormID && !HQPlayerAllows() && !HQSystemPlayerAllows()) return false;
         if (g_notFlesh.find(fid) != g_notFlesh.end()) return false;
     }
     // BEFORE THE FORM TABLE IS EVEN TOUCHED.
@@ -19292,7 +20762,11 @@ static bool PreWarmActor(u32 fid, const char* why, long stopEpoch)
             return false;
         }
         auto rit = g_restore.find(fid);
-        if (rit != g_restore.end()) { local.partsLost |= rit->second.partsLost; g_restore.erase(rit); }
+        if (rit != g_restore.end()) {
+            local.partsLost |= rit->second.partsLost;
+            if (rit->second.headOff) local.headOff = true;
+            g_restore.erase(rit);
+        }
         Body& B = Claim(fid);
         // The ledger is the one thing a hand-over must not drop.
         // Read off them BEFORE the move; see Body::everPriv.
@@ -19309,12 +20783,13 @@ static bool PreWarmActor(u32 fid, const char* why, long stopEpoch)
         CarryPriv(B, keepPriv, keepRoot);
         B.touched = GetTickCount();
         B.gen = NextGen();
-        const bool hasHeadFill = (B.partsAtBirth & (1u << unsigned(flesh::Part::Head))) != 0;
+        const bool hasHeadFill = B.beastNoSkull || ((B.partsAtBirth & (1u << unsigned(flesh::Part::Head))) != 0);
         if (B.solid && B.ownFillFrac >= 0.30f && hasHeadFill) {
             DressingSatisfied(B);
-        } else if (fid != fact::kPlayerFormID || HQPlayerAllows()) {
+        } else if (fid != fact::kPlayerFormID || HQPlayerAllows() || HQSystemPlayerAllows()) {
             RequestDressing(B);
         }
+        SyncBodyMirror(B);
         // THEY ARRIVED ALREADY WOUNDED, so the mesh has to be cut to match.
         //
         // This is the branch for a target whose 3D really was rebuilt across the
@@ -19324,9 +20799,10 @@ static bool PreWarmActor(u32 fid, const char* why, long stopEpoch)
         // every triangle is still drawn, and they would look whole until the
         // next blow landed. Ordinary pre-warms carry no damage and are
         // untouched by it.
-        if (B.restored) {
+        if (B.restored || B.headOff || B.partsLost) {
             B.lastCut = 1;             // non-zero: never overwrite a cut body
             if (void* dev = Device()) Redraw(B, dev, false);
+            SyncBodyMirror(B);
             WatchFrom(fid);
         }
     }
@@ -19352,18 +20828,115 @@ static HANDLE g_warmSem = nullptr;
 static HANDLE g_warmThread = nullptr;
 static DWORD WINAPI WarmThreadBody(LPVOID);
 static DWORD WINAPI WarmThread(LPVOID p) { return GuardedThread("WarmThread", WarmThreadBody, p); }
+// ---- NEAREST THE PLAYER FIRST -------------------------------------
+//
+// FIELD PROOF (one test log, load stamp 4): sixteen targets were
+// queued at the load in the order the session first met them, and the warm
+// thread built them in that order, one every 0.4 s. The player's first two
+// blows landed 15 s and 21 s after the load on the two targets they were
+// fighting -- neither reached yet -- so both blows found them cold and were
+// parked 356 ms and 320 ms for a rebuild, where a warm target cuts in about
+// 30 ms. RosterTick already offers the never-offered nearest the player
+// first, for this exact reason; the queue itself now does the same.
+//
+// WHAT CHANGES: only WHICH queued job runs next. Among the jobs that are due
+// (their notBefore has passed) and belong to this timeline, the nearest the
+// player goes first -- the player themselves at distance 0, a roster sweep
+// ahead of everyone (it builds nothing, it only lists who is in the room).
+// A due job left waiting more than five seconds past its time goes first
+// whatever its distance, so a far target is delayed, never starved.
+// WHAT DOES NOT: every gate, every check and every build step after the
+// pick, all of it in WarmThreadBody and PreWarmActor exactly as before. With
+// the gate closed (a load screen, a stall, a transition, a teardown), or with
+// one job queued, or the player unresolvable, it is the front job as always,
+// and no engine memory is read here at all.
+static const void* ResolveActor(u32 fid);                  // defined with the test strike
+static bool RefPosition(const void* refr, float out[3]);   // defined with the test strike
+static bool TakeWarmJob(WarmJob& out)
+{
+    const bool gateOpen = !LoadScreenUp() && !IsGameThreadStalledOrInTransition(10000ULL);
+    std::vector<WarmJob> snap;
+    {
+        Guard q(&g_csWarm);
+        if (g_warmQ.empty()) return false;
+        if (!gateOpen || g_warmQ.size() == 1) {
+            out = g_warmQ.front();
+            g_warmQ.erase(g_warmQ.begin());
+            return true;
+        }
+        snap = g_warmQ;                  // copied: positions are read with no lock held
+    }
+    const DWORD now = GetTickCount();
+    const long epoch = g_loadEpoch;
+    ForgetMemory();
+    float pp[3] = { 0.0f, 0.0f, 0.0f };
+    const void* pl = ResolveActor(fact::kPlayerFormID);
+    const bool havePP = pl && RefPosition(pl, pp);
+    // -2 = not considered (stale or not due), -1 = a roster sweep, 3e38 = no position
+    std::vector<float> nfDist(snap.size(), -2.0f);
+    int nfPick = -1, nfLate = -1;
+    DWORD nfLateBy = 0;
+    if (havePP) {
+        for (std::size_t i = 0; i < snap.size(); ++i) {
+            const WarmJob& w = snap[i];
+            if (w.epoch != epoch) continue;                          // stale: the front path drops it
+            if (w.notBefore && LONG(now - w.notBefore) < 0) continue; // not due yet
+            if (w.notBefore && DWORD(now - w.notBefore) > 5000u && DWORD(now - w.notBefore) > nfLateBy) {
+                nfLateBy = DWORD(now - w.notBefore); nfLate = int(i);
+            }
+            float d2 = 3.0e38f;
+            if (w.sweep) d2 = -1.0f;
+            else if (w.fid == fact::kPlayerFormID) d2 = 0.0f;
+            else {
+                float wp[3];
+                const void* wr = ResolveActor(w.fid);
+                if (wr && RefPosition(wr, wp)) {
+                    const float dx = wp[0] - pp[0], dy = wp[1] - pp[1], dz = wp[2] - pp[2];
+                    d2 = dx * dx + dy * dy + dz * dz;
+                }
+            }
+            nfDist[i] = d2;
+            if (nfPick < 0 || d2 < nfDist[std::size_t(nfPick)]) nfPick = int(i);
+        }
+    }
+    if (nfLate >= 0) nfPick = nfLate;
+    Guard q(&g_csWarm);
+    if (g_warmQ.empty()) return false;
+    if (nfPick > 0) {
+        const WarmJob& want = snap[std::size_t(nfPick)];
+        for (std::size_t i = 0; i < g_warmQ.size(); ++i) {
+            const WarmJob& w = g_warmQ[i];
+            if (w.fid == want.fid && w.epoch == want.epoch && w.why == want.why &&
+                w.notBefore == want.notBefore && w.sweep == want.sweep) {
+                out = w;
+                g_warmQ.erase(g_warmQ.begin() + std::ptrdiff_t(i));
+                static volatile long saidNear = 0;
+                if (InterlockedIncrement(&saidNear) <= 48) {
+                    const float pd = nfDist[std::size_t(nfPick)], fd = nfDist[0];
+                    Log("[WARM] nearest first: 0x%08X (%s, %.0f units from the player) taken ahead of"
+                        " %u queued job(s)%s; the front job 0x%08X was %s%.0f units away",
+                        out.fid, out.why ? out.why : "?",
+                        (pd >= 0.0f && pd < 1.0e37f) ? double(std::sqrt(pd)) : -1.0,
+                        unsigned(i), nfLate == nfPick ? " -- it was overdue" : "",
+                        snap[0].fid,
+                        fd == -2.0f ? "not due or stale, " : "",
+                        (fd >= 0.0f && fd < 1.0e37f) ? double(std::sqrt(fd)) : -1.0);
+                }
+                return true;
+            }
+        }
+    }
+    out = g_warmQ.front();               // the front, as always
+    g_warmQ.erase(g_warmQ.begin());
+    return true;
+}
 static DWORD WINAPI WarmThreadBody(LPVOID)
 {
     for (;;) {
         LogFlush();
         WaitForSingleObject(g_warmSem, INFINITE);
         WarmJob J{};
-        {
-            Guard q(&g_csWarm);
-            if (g_warmQ.empty()) continue;
-            J = g_warmQ.front();
-            g_warmQ.erase(g_warmQ.begin());
-        }
+        if (!TakeWarmJob(J)) continue;
         if (J.epoch != g_loadEpoch || !g_cfg.ok || !g_armed || !g_cfg.prewarm) continue;
         // NOT BEFORE ITS TIME. An equip event arrives before the
         // engine has rebuilt their biped, so a walk taken at once would read the
@@ -19377,15 +20950,18 @@ static DWORD WINAPI WarmThreadBody(LPVOID)
             // ran at once).
             if (DWORD(J.notBefore - now) < 30000u) Sleep(J.notBefore - now);
         }
-        for (int hold = 0; hold < 480 && J.epoch == g_loadEpoch; ++hold) {
+        // POLLED EVERY 50 MS, BOUNDED AS BEFORE (120 s, then 6 s). Both gates
+        // are unchanged; only the poll is finer, so a job no longer waits up to
+        // a further quarter second after its gate has already opened.
+        for (int hold = 0; hold < 2400 && J.epoch == g_loadEpoch; ++hold) {
             if (!LoadScreenUp() && !IsGameThreadStalledOrInTransition(10000ULL)) break;
-            Sleep(250);
+            Sleep(50);
         }
         if (J.epoch != g_loadEpoch || LoadScreenUp() || IsGameThreadStalledOrInTransition(10000ULL)) continue;
-        for (int hold = 0; hold < 24; ++hold) {
+        for (int hold = 0; hold < 120; ++hold) {
             const DWORD sinceUnload = GetTickCount() - DWORD(InterlockedCompareExchange(&g_lastUnloadTick, 0, 0));
             if (sinceUnload >= 4000u) break;
-            Sleep(250);
+            Sleep(50);
         }
         if (J.epoch != g_loadEpoch || LoadScreenUp() || IsGameThreadStalledOrInTransition(10000ULL)) continue;
         ForgetMemory();
@@ -19398,7 +20974,11 @@ static DWORD WINAPI WarmThreadBody(LPVOID)
         if (J.sweep) RosterSweep(std::strcmp(J.why, "roster sweep") != 0);
         else {
             PreWarmActor(J.fid, J.why, J.epoch);
-            Sleep(100);
+            // A short yield between jobs, not a tenth of a second: after a load
+            // sixteen to twenty-five targets queue at once, and 100 ms each was
+            // 1.6-2.5 s of the warm-up spent asleep while the next blow could
+            // land on a target still cold. Every gate above still runs per job.
+            Sleep(10);
         }
     }
     return 0;
@@ -19455,7 +21035,7 @@ static CRITICAL_SECTION g_csRoster;
 static std::map<u32, DWORD> g_roster;      // fid -> GetTickCount() when last offered
 static bool RosterSee(u32 fid)
 {
-    if (!fid || fid >= 0xFF000000u) return false;   // created references are not actors
+    if (!fid || fid == 0xFFFFFFFFu) return false;   // allow 0xFF...... ambush ACHRs (#10)
     if (!g_cfg.roster) return false;                // off means off, including the bookkeeping
     Guard lk(&g_csRoster);
     if (g_roster.size() >= 512 && g_roster.find(fid) == g_roster.end()) {
@@ -19570,7 +21150,7 @@ static void RosterSweep(bool inPlay)
         ++seen;
         u32 key = 0;
         std::memcpy(&key, e + fact::kMapEntry_key, 4);
-        if (!key || key >= 0xFF000000u) continue;  // skip temp/created refs before touching form memory
+        if (!key || key == 0xFFFFFFFFu) continue;  // FastPeekFormType below filters strictly to ACHR (#10)
         void* form = nullptr;
         std::memcpy(&form, e + fact::kMapEntry_value, sizeof(void*));
         std::uint8_t ft = 0;
@@ -19763,7 +21343,12 @@ static u32 Equip_ProcessEventBody(void*, const void* ev, void*)
         }
         return 0;
     }
+    g_dressFinalMask.erase(fid);
     it->second.hotTick = GetTickCount();
+    if (Wounded(it->second) || it->second.partsLost != 0 || it->second.headOff) {
+        it->second.equipFastRebuild = true;
+        WatchFrom(fid);
+    }
     if (InterlockedIncrement(&said) <= 16)
         Log("[EQUIP] 0x%08X %s 0x%08X -- watching them closely", fid,
             on ? "equipped" : "unequipped", base);
@@ -19899,9 +21484,10 @@ static void RestoreEverything()
         char hd[16];
         std::snprintf(hd, sizeof(hd), "%d|", int(g_cfg.headLocal ? g_prefix + g_cfg.headLocal : 0u));
         const std::string body = std::string(hd) + ids;
-        FILE* f = std::fopen("Data\\SKSE\\Plugins\\FleshCore.revive.txt", "wb");
-        if (f) { std::fputs(body.c_str(), f); std::fclose(f); }
+        PushMemRevive(body);
     }
+    for (u32 fid : damaged) RestoreActorProtectionFlags(fid);
+    for (u32 fid : g_everCut) RestoreActorProtectionFlags(fid);
     // ---- THE UN-CUT ARE KEPT; ONLY THE UNTOUCHED ARE FORGOTTEN --
     //
     // Erasing every body that carries damage here, on the
@@ -19940,7 +21526,8 @@ static void RestoreEverything()
                 continue;
             }
             Body& B = bt->second;
-            B.partsLost = 0; B.restored = 0; B.lastCut = 0; B.lastSeq = 0; B.lastOrigin = 0;
+            B.partsLost = 0; B.restored = 0; B.lastCut = 0; B.lastSeq = 0; B.lastOrigin = 0; B.wasDead = false;
+            SyncBodyMirror(B);
             B.baseSections = 1;    // an un-cut lattice is one section (Voxelise forces this whenever there is flesh)
             ++kept;
         }
@@ -20082,7 +21669,12 @@ static u32 Magic_ProcessEventBody(void*, const void* ev, void*)
             if (Refused(dfid)) {
                 const char* who = nullptr;
                 if (Immune(dfid, who)) { Log("[DRAIN] effect 0x%08X on 0x%08X -- REFUSED, immune (set by %s)", effect, dfid, who); Declined(dfid, 1, "immune", who); }
-                else Log("[DRAIN] effect 0x%08X on 0x%08X -- REFUSED, not one this mod dresses", effect, dfid);
+                else { static std::set<u32> s_drRef; if (s_drRef.size() < 512 && s_drRef.insert(dfid).second) Log("[DRAIN] effect 0x%08X on 0x%08X -- REFUSED, not one this mod dresses", effect, dfid); }
+                return 0;
+            }
+            if (dfid == fact::kPlayerFormID && !HQSystemPlayerAllows()) {
+                Log("[DRAIN] effect 0x%08X on 0x%08X -- REFUSED, external systems/spells targeting the player is off in the HQ", effect, dfid);
+                Declined(dfid, 1, "who", "modplayer");
                 return 0;
             }
             Wound W; W.form = flesh::Lattice::Form::Bite; W.size = 4.0f; W.count = 1; W.maxCells = 34; W.budget = 1;
@@ -20119,9 +21711,16 @@ static u32 Magic_ProcessEventBody(void*, const void* ev, void*)
             Log("[SPELL] effect 0x%08X on 0x%08X -- REFUSED, the registry says they are"
                 " immune (set by %s); no wound", effect, fid, who);
             Declined(fid, 1, "immune", who);   // a spell is rare; every one is told
-        } else
-            Log("[SPELL] effect 0x%08X on 0x%08X -- REFUSED, they are not one this mod"
-                " dresses; no wound", effect, fid);
+        } else {
+            static std::set<u32> s_spRef;
+            if (s_spRef.size() < 512 && s_spRef.insert(fid).second) Log("[SPELL] effect 0x%08X on 0x%08X -- REFUSED, they are not one this mod dresses; no wound", effect, fid);
+        }
+        return 0;
+    }
+    if (fid == fact::kPlayerFormID && !HQSystemPlayerAllows()) {
+        Log("[SPELL] effect 0x%08X on 0x%08X -- REFUSED, external systems/spells targeting"
+            " the player is off in the HQ; no wound", effect, fid);
+        Declined(fid, 1, "who", "modplayer");
         return 0;
     }
     Log("==================================================================");
@@ -20246,6 +21845,8 @@ struct Blow {
     bool  havePos = false;
     float damage = 0.0f;
     float pos[3] = {0, 0, 0};
+    bool  haveDir = false;
+    float dir[3] = {0, 0, 0};
     // The blow's type, resolved from what swung: blunt slash pierce unarmed,
     // or "" when the source could not be read (only `any` rows then match).
     std::string type;
@@ -20373,6 +21974,14 @@ static bool ReadBlow(const void* target, u32 source, u32 projectile, bool power,
     if (!(d2 >= 0.0f) || d2 > kReach * kReach) {
         Log("[HIT]   HitData: hitPosition is %.0f units from them -- not used", std::sqrt(std::max(0.0f, d2)));
         return false;
+    }
+    float hdir[3] = {0, 0, 0};
+    std::memcpy(hdir, static_cast<const std::uint8_t*>(hd) + fact::kHD_hitDirection, sizeof(hdir));
+    const float hdL2 = hdir[0]*hdir[0] + hdir[1]*hdir[1] + hdir[2]*hdir[2];
+    if (hdL2 > 0.01f && hdL2 < 1e6f) {
+        const float hdL = std::sqrt(hdL2);
+        out.dir[0] = hdir[0] / hdL; out.dir[1] = hdir[1] / hdL; out.dir[2] = hdir[2] / hdL;
+        out.haveDir = true;
     }
     out.haveDamage = true; out.damage = total;
     out.havePos = true; std::memcpy(out.pos, pos, sizeof(pos));
@@ -20863,6 +22472,131 @@ static const char* HitNeverCuts(u32 source, u32 projectile, bool bash)
     return nullptr;
 }
 
+static int OverkillChancePct()
+{
+    int p = g_cfg.fodderOverkillPct + g_cfg.fodderOverkillBonusPct;
+    if (p < 0) p = 0; else if (p > 100) p = 100;
+    return p;
+}
+
+static bool TryStaggerRagdollOverkill(const void* target, const void* cause, u32 fid,
+                                      bool power, bool sneak, bool bash,
+                                      const Blow& blow, bool haveHP, float maxHP, DWORD now)
+{
+    const int chance = OverkillChancePct();
+    if (chance <= 0 || !target || !cause || bash) return false;
+    if (fid == fact::kPlayerFormID) return false;
+
+    u32 causeFid = 0;
+    if (!Peek(cause, fact::kForm_formID, &causeFid) || causeFid != fact::kPlayerFormID) return false;
+
+    const bool heavy = (blow.haveDamage && haveHP && maxHP > 0.0f && blow.damage >= 0.20f * maxHP);
+    if (!power && !sneak && !heavy) return false;
+
+    // Target must be alive (lifeState == 0) AND knocked down/ragdolled OR staggered
+    if (!Readable(target, fact::kActor_stateSpan)) return false;
+    u32 s1 = 0, s2 = 0;
+    Peek(target, fact::kActor_state1, &s1);
+    Peek(target, fact::kActor_state2, &s2);
+    const u32 lifeState  = (s1 >> 21) & 0xFu;
+    const u32 knockState = (s1 >> 25) & 0x7u;
+    const bool staggered = (s2 & fact::kActorState2_Staggered) != 0u;
+    if (lifeState != 0u || (knockState == 0u && !staggered)) return false;
+
+    // Exclude NoKill actors
+    if (g_memIpcLockReady) {
+        bool memNK = false;
+        EnterCriticalSection(&g_csMemIPC);
+        memNK = (g_memNoKill.count(fid) != 0);
+        LeaveCriticalSection(&g_csMemIPC);
+        if (memNK) return false;
+    }
+
+    // Exclude follower / essential / protected on runtime Actor
+    if (!Readable(target, fact::kActor_flagsSpan)) return false;
+    u32 boolBits = 0, boolFlags = 0;
+    Peek(target, fact::kActor_boolBits, &boolBits);
+    Peek(target, fact::kActor_boolFlags, &boolFlags);
+    if (boolBits & fact::kActorBit_PlayerTeammate) return false;
+    if (boolFlags & (fact::kActorFlag_Essential | fact::kActorFlag_Protected)) return false;
+
+    // Exclude essential / protected / unique / ghost / invulnerable on TESNPC and enforce fodder level cap
+    const void* base = nullptr;
+    if (!Peek(target, fact::kREFR_baseForm, &base) || !base || !Readable(base, fact::kNPC_levelSpan)) return false;
+    std::uint8_t bt = 0;
+    Peek(base, fact::kForm_formType, &bt);
+    if (bt != fact::kFormType_NPC) return false;
+    u32 acbsFlags = 0;
+    std::uint16_t npcLevel = 0;
+    Peek(base, fact::kNPC_acbsFlags, &acbsFlags);
+    Peek(base, fact::kNPC_acbsLevel, &npcLevel);
+    if (acbsFlags & (fact::kACBS_Essential | fact::kACBS_Protected |
+                     fact::kACBS_Unique | fact::kACBS_IsGhost | fact::kACBS_Invulnerable))
+        return false;
+
+    const int pLvl = PlayerLevel();
+    if (acbsFlags & fact::kACBS_PCLevelMult) {
+        if (npcLevel > 750u) return false;
+    } else {
+        const int maxFodder = (pLvl > 0) ? std::max(10, (pLvl * 3) / 4) : 10;
+        if (npcLevel < 1u || int(npcLevel) > maxFodder) return false;
+    }
+
+    // Roll 0..99 < chance
+    static u32 s_okRng = 0x13572468u;
+    s_okRng = (s_okRng * 1664525u + 1013904223u) ^ u32(now) ^ fid;
+    const int roll = int((s_okRng >> 16) % 100u);
+    if (roll >= chance) return false;
+
+    Aim aim;
+    bool haveW = false;
+    if (blow.havePos) { std::memcpy(aim.o, blow.pos, sizeof(aim.o)); aim.ray = false; haveW = true; }
+    if (!haveW) {
+        const void* cl = nullptr; const void* cr = nullptr;
+        if (Peek(cause, fact::kREFR_loadedData, &cl) && cl && Peek(cl, fact::kLoaded_data3D, &cr) && cr) {
+            if (const void* wn = FindNode(cr, "WEAPON", 0)) {
+                float wp[3];
+                if (Peek(wn, fact::kAV_worldTranslate, &wp)) {
+                    std::memcpy(aim.wpos, wp, sizeof(wp)); aim.haveWpos = true;
+                    std::memcpy(aim.o, wp, sizeof(wp)); aim.ray = false; haveW = true;
+                }
+            }
+        }
+    }
+    if (!haveW) haveW = AimFrom(cause, aim);
+    if (!haveW && Readable(target, fact::kREFR_size)) {
+        std::memcpy(aim.o, static_cast<const std::uint8_t*>(target) + fact::kREFR_pos, sizeof(aim.o));
+        aim.o[2] += 60.0f;
+        aim.ray = false;
+        haveW = true;
+    }
+    if (!haveW) return false;
+
+    Wound W;
+    W.form = flesh::Lattice::Form::Detonate;
+    W.size = 1.0f;
+    W.count = 1;
+    W.maxCells = 20;
+    W.budget = 20;
+    W.depth = 3;
+    W.anchor = flesh::Anchor::Centre;
+    W.origin = 2;
+    W.mark = 0;
+    W.noKill = false;
+    W.caller = "Overkill";
+    if (WoundActor(target, nullptr, &aim, W) > 0) {
+        auto jt = g_bodies.find(fid);
+        if (jt != g_bodies.end()) jt->second.lastCut = now;
+        auto tt = g_track.find(fid);
+        if (tt != g_track.end()) tt->second.blows.clear();
+        Log("[OVERKILL] 0x%08X (knock=%u stag=%d lvl=%u%s roll=%d<%d%%) -> Detonate blow-apart",
+            fid, unsigned(knockState), staggered ? 1 : 0, unsigned(npcLevel),
+            (acbsFlags & fact::kACBS_PCLevelMult) ? "*" : "", roll, chance);
+        return true;
+    }
+    return false;
+}
+
 static u32 Hit_ProcessEventBody(void*, const void* ev, void*)
 {
     ForgetMemory();
@@ -20873,8 +22607,9 @@ static u32 Hit_ProcessEventBody(void*, const void* ev, void*)
     // or with no rows at all, is the old behaviour: nothing below runs.
     LoadRefusals();
     const bool rows = g_cfg.hooksOn && AnyRows();
+    const bool overkillOn = (OverkillChancePct() > 0);
     // With the HQ on, the H row stands down (see the HQ block): only rows act.
-    if ((g_cfg.hitMode <= 0 || g_hq.on) && !rows) return 0;
+    if ((g_cfg.hitMode <= 0 || g_hq.on) && !rows && !overkillOn) return 0;
     if (!g_armed) { if (LoadIds()) g_armed = true; else return 0; }
     const void* target = nullptr; const void* cause = nullptr;
     u32 source = 0, projectile = 0;
@@ -20894,7 +22629,7 @@ static u32 Hit_ProcessEventBody(void*, const void* ev, void*)
     // THE GATE, HOISTED. Refusal, immunity and the cooldown are asked before
     // anything is read, so a refused target costs one map lookup per blow.
     u32 fid = 0; Peek(target, fact::kForm_formID, &fid);
-    if (!fid || fid >= 0xFF000000u) return 0;
+    if (!fid || fid == 0xFFFFFFFFu) return 0; // targetFt == ACHR already verified above (#10)
     // TWO KINDS OF HIT NEVER VOXELISE.
     //
     // AN UNARMED BLOW, without exception: anything the
@@ -20988,8 +22723,8 @@ static u32 Hit_ProcessEventBody(void*, const void* ev, void*)
     int vh = 0;
     bool hasVuln = RegistryGet(fid, "vulnhp", vh) && vh > 0 && vh < 100;
     if (!hasVuln && g_hq.on && g_hq.vulnHp > 0 && g_hq.vulnHp < 100) { vh = g_hq.vulnHp; hasVuln = true; }
-    if (rows) ReadBlow(target, source, projectile, power, sneak, bash, blow);
-    if (rows || hasVuln) haveHP = ReadHealth(target, cur, maxHP);
+    if (rows || overkillOn) ReadBlow(target, source, projectile, power, sneak, bash, blow);
+    if (rows || hasVuln || overkillOn) haveHP = ReadHealth(target, cur, maxHP);
     double recordedMs = 0.0;   // the blow just remembered, so the swing plane read below can be stamped on it
     if (blow.haveDamage && g_anyWindowRows) {
         // Remembered for the window rows. The sample the tick takes
@@ -21004,6 +22739,8 @@ static u32 Hit_ProcessEventBody(void*, const void* ev, void*)
         if (haveHP) T.lastHealth = cur;
         if (T.blows.size() > 64) T.blows.erase(T.blows.begin());
     }
+    if (overkillOn && TryStaggerRagdollOverkill(target, cause, fid, power, sneak, bash, blow, haveHP, maxHP, now))
+        return 0;
     // vulnhp, the engine's own half at last. Only wound them at
     // or below N % of their health; above it the blow is declined and the
     // reason is logged once per cooldown, not once per swing.
@@ -21086,7 +22823,34 @@ static u32 Hit_ProcessEventBody(void*, const void* ev, void*)
                 // -- thin and reach-bounded -- and says so. Only a slash: a
                 // mace and a bash crush, and the HQ gives them a bite.
                 if (slashing) {
-                    if (g_cfg.bladeAxis < 0) {
+                    // True 3D Swing-Arc Plane (#18a): cross(hitDirection, attackerToImpact) gives the exact
+                    // plane of horizontal, vertical, and diagonal vanilla/MCO/BFCO swings! Falls back to WEAPON axis.
+                    bool gotArcPlane = false;
+                    if (blow.haveDir && Readable(cause, fact::kREFR_size)) {
+                        float cpos[3] = {0, 0, 0};
+                        std::memcpy(cpos, static_cast<const std::uint8_t*>(cause) + fact::kREFR_pos, sizeof(cpos));
+                        cpos[2] += 92.0f;
+                        const float* ip = blow.havePos ? blow.pos : wp;
+                        float fwd[3] = { ip[0] - cpos[0], ip[1] - cpos[1], ip[2] - cpos[2] };
+                        const float fL = std::sqrt(fwd[0]*fwd[0] + fwd[1]*fwd[1] + fwd[2]*fwd[2]);
+                        if (fL > 4.0f) {
+                            fwd[0] /= fL; fwd[1] /= fL; fwd[2] /= fL;
+                            float nx = blow.dir[1]*fwd[2] - blow.dir[2]*fwd[1];
+                            float ny = blow.dir[2]*fwd[0] - blow.dir[0]*fwd[2];
+                            float nz = blow.dir[0]*fwd[1] - blow.dir[1]*fwd[0];
+                            const float nL = std::sqrt(nx*nx + ny*ny + nz*nz);
+                            if (nL > 0.18f) {
+                                aim.n[0] = nx / nL; aim.n[1] = ny / nL; aim.n[2] = nz / nL;
+                                aim.haveN = true;
+                                gotArcPlane = true;
+                                Log("[HIT]   swing plane: normal (%.2f %.2f %.2f) from HitData swing-arc (dir x fwd)",
+                                    aim.n[0], aim.n[1], aim.n[2]);
+                            }
+                        }
+                    }
+                    if (gotArcPlane) {
+                        // True swing arc resolved from HitData::hitDirection!
+                    } else if (g_cfg.bladeAxis < 0) {
                         // A constant carries no measurement: said once a session;
                         // the per-slash line below is for reading
                         // the axis, which needs CL 0, 1 or 2.
@@ -21425,19 +23189,24 @@ static const char* kFeatures[] = {
     "hq",         // the HQ's combat rows, gates and reset clocks; the `bash` type; a row's blows filter
     "drainspell", // DR rows, FL_Api.Drain / StopDrain, the drain / stopdrain verbs
     "armour",     // worn armour by area: hard / soft / clothing against slash / pierce / blunt / magic; AR, AM rows; the HQ's Armour card
+    "bridges",    // two-bridge separation: Combat Bridge (combatwound*, who.player) vs External Systems Bridge (syswound*, who.modPlayer)
     nullptr
 };
 static void WriteActive(bool on)
 {
     const char* p = "Data\\SKSE\\Plugins\\FleshCore.active.txt";
     const char* q = "Data\\SKSE\\Plugins\\FleshCore.features.txt";
+    const char* b = "Data\\SKSE\\Plugins\\FleshCore.bridges.txt";
     if (on) {
         FILE* f = std::fopen(p, "wb"); if (f) { std::fputs("1\n", f); std::fclose(f); }
         FILE* g = std::fopen(q, "wb");
         if (g) { for (int i = 0; kFeatures[i]; ++i) { std::fputs(kFeatures[i], g); std::fputc(kFeatures[i + 1] ? ' ' : '\n', g); } std::fclose(g); }
+        HQState stCopy;
+        { Guard lk(&g_csBodies); stCopy = g_hq; }
+        WriteBridgeState(stCopy);
         // Once per arming: ask Papyrus to re-push what it holds.
         Emit("FL_Resync", 0, 0.0f, "");
-    } else { DeleteFileA(p); DeleteFileA(q); }
+    } else { DeleteFileA(p); DeleteFileA(q); DeleteFileA(b); }
 }
 static DWORD WINAPI ArmThreadBody(LPVOID);
 static DWORD WINAPI ArmThread(LPVOID p) { return GuardedThread("ArmThread", ArmThreadBody, p); }
@@ -21789,23 +23558,50 @@ static void RunCommand(const Cmd& c)
     auto arg = [&](std::size_t i) -> const std::string& { static const std::string e; return i < c.a.size() ? c.a[i] : e; };
     auto fidOf = [&](std::size_t i) -> u32 { return u32(std::strtoll(arg(i).c_str(), nullptr, 10)); };
     if (v == "ping") { Emit("FL_Ping", 0, float(c.ticket), c.caller); return; }
-    if (v == "wound" || v == "woundat") {
-        const bool at = (v == "woundat");
+    if (v == "wound" || v == "woundat" || v == "syswound" || v == "syswoundat" || v == "combatwound" || v == "combatwoundat") {
+        const bool at = (v == "woundat" || v == "syswoundat" || v == "combatwoundat");
+        const bool isCombatCmd = (v == "combatwound" || v == "combatwoundat");
         const u32 fid = fidOf(0);
         const void* refr = ResolveActor(fid);
         if (!refr) { Done(fid, c.ticket, v.c_str(), c.caller, 4, "no such actor loaded"); return; }
         Wound W; std::string why;
         if (!ParseWoundColumns(c.a, at ? 4 : 1, W, why, !at, true)) { Done(fid, c.ticket, v.c_str(), c.caller, 7, why); return; }
-        W.origin = 3; W.caller = c.caller;
+        W.origin = isCombatCmd ? 2 : 3; W.caller = c.caller;
         Aim aim; Aim* ap = nullptr;
         if (at) {
             if (!NumReal(arg(1)) || !NumReal(arg(2)) || !NumReal(arg(3))) { Done(fid, c.ticket, v.c_str(), c.caller, 7, "x y z"); return; }
             aim.o[0] = float(std::atof(arg(1).c_str())); aim.o[1] = float(std::atof(arg(2).c_str())); aim.o[2] = float(std::atof(arg(3).c_str()));
             aim.ray = false; ap = &aim;
         }
+        if (isCombatCmd) {
+            const char* whoWhy = nullptr;
+            if (!HQWhoAllows(fid, refr, whoWhy)) {
+                Declined(fid, 2, "who", whoWhy ? whoWhy : "declined");
+                Done(fid, c.ticket, v.c_str(), c.caller, 1, std::string("who:") + (whoWhy ? whoWhy : "declined"));
+                return;
+            }
+            if (fid == fact::kPlayerFormID && !HQPlayerLayerMask()) {
+                Declined(fid, 2, "player", "layers");
+                Done(fid, c.ticket, v.c_str(), c.caller, 1, "player:layers");
+                return;
+            }
+            float curHP = 0.0f, maxHP = 0.0f;
+            int vh = 0;
+            bool hasVuln = RegistryGet(fid, "vulnhp", vh) && vh > 0 && vh < 100;
+            if (!hasVuln && g_hq.on && g_hq.vulnHp > 0 && g_hq.vulnHp < 100) { vh = g_hq.vulnHp; hasVuln = true; }
+            if (hasVuln && ReadHealth(refr, curHP, maxHP) && maxHP > 0.0f && curHP / maxHP * 100.0f > float(vh)) {
+                Declined(fid, 2, "vulnhp", std::to_string(vh));
+                Done(fid, c.ticket, v.c_str(), c.caller, 1, "vulnhp:" + std::to_string(vh));
+                return;
+            }
+        } else if (fid == fact::kPlayerFormID && !HQSystemPlayerAllows()) {
+            Declined(fid, 3, "who", "modplayer");
+            Done(fid, c.ticket, v.c_str(), c.caller, 1, "who:modplayer");
+            return;
+        }
         Log("==================================================================");
-        Log("[CMD] %s #%ld from %s on 0x%08X: %s %.1f depth %d parts 0x%X anchor %s", v.c_str(), c.ticket, c.caller.c_str(), fid,
-            flesh::Lattice::FormName(W.form), W.size, W.depth, unsigned(W.parts), flesh::AnchorName(W.anchor));
+        Log("[CMD] %s #%ld from %s on 0x%08X: %s %.1f depth %d parts 0x%X anchor %s (%s bridge)", v.c_str(), c.ticket, c.caller.c_str(), fid,
+            flesh::Lattice::FormName(W.form), W.size, W.depth, unsigned(W.parts), flesh::AnchorName(W.anchor), isCombatCmd ? "combat" : "system");
         unsigned taken = 0;
         const int r = CommandWound(refr, fid, ap, W, taken);
         Done(fid, c.ticket, v.c_str(), c.caller, r, r == 0 ? std::to_string(taken) : r == 1 ? "immune" : r == 2 ? "no body" : "nothing to take");
@@ -21840,7 +23636,8 @@ static void RunCommand(const Cmd& c)
         if (it == g_bodies.end() || !it->second.live) { Done(fid, c.ticket, "heal", c.caller, 2, "no body"); return; }
         HealJob h; h.ticket = c.ticket; h.caller = c.caller; h.fid = fid;
         h.rate = NumReal(arg(1)) ? float(std::atof(arg(1).c_str())) : 4.0f;
-        if (h.rate < 0.1f) h.rate = 0.1f; if (h.rate > 500.0f) h.rate = 500.0f;
+        if (h.rate < 0.1f) h.rate = 0.1f;
+        if (h.rate > 500.0f) h.rate = 500.0f;
         h.lastMs = NowMs(); h.lastRedrawMs = h.lastMs;
         for (HealJob& o : g_heals) if (o.fid == fid) { if (o.ticket) Done(fid, o.ticket, "heal", o.caller, 5, "replaced"); o.fid = 0; }
         g_heals.push_back(h);
@@ -21853,6 +23650,7 @@ static void RunCommand(const Cmd& c)
         const void* refr = ResolveActor(fid);
         if (!refr) { Done(fid, c.ticket, "drain", c.caller, 4, "no such actor loaded"); return; }
         { const char* who = nullptr; if (Immune(fid, who) || Refused(fid)) { Done(fid, c.ticket, "drain", c.caller, 1, "immune"); return; } }
+        if (fid == fact::kPlayerFormID && !HQSystemPlayerAllows()) { Declined(fid, 5, "who", "modplayer"); Done(fid, c.ticket, "drain", c.caller, 1, "who:modplayer"); return; }
         float rate = NumReal(arg(1)) ? float(std::atof(arg(1).c_str())) : 4.0f;
         float secs = NumReal(arg(2)) ? float(std::atof(arg(2).c_str())) : 30.0f;
         if (rate < 0.1f || rate > 100.0f || secs < 0.5f || secs > 600.0f) { Done(fid, c.ticket, "drain", c.caller, 7, "rate 0.1..100, seconds 0.5..600"); return; }
@@ -22014,8 +23812,42 @@ static bool HaveCommandFiles()
     FindClose(h);
     return true;
 }
+static void ParseCommandLineToCmd(std::string line, std::vector<Cmd>& out)
+{
+    std::size_t end = line.find_last_not_of("\r\n ");
+    if (end != std::string::npos && line[end] == '#') line.erase(end);
+    while (!line.empty() && (line.back() == '\n' || line.back() == '\r' || line.back() == ' ')) line.pop_back();
+    std::vector<std::string> t = Split(line, '|');
+    if (t.size() < 3) return;
+    Cmd c; c.ticket = std::atol(t[0].c_str()); c.verb = t[1]; c.caller = t[2];
+    for (char& ch : c.verb) ch = char(std::tolower(static_cast<unsigned char>(ch)));
+    c.a.assign(t.begin() + 3, t.end());
+    out.push_back(std::move(c));
+}
+
+static bool HaveMemCommands()
+{
+    if (!g_memIpcLockReady) return false;
+    EnterCriticalSection(&g_csMemIPC);
+    const bool any = !g_memCmds.empty();
+    LeaveCriticalSection(&g_csMemIPC);
+    return any;
+}
+
 static void ReadCommands(std::vector<Cmd>& out)
 {
+    if (g_memIpcLockReady) {
+        EnterCriticalSection(&g_csMemIPC);
+        while (!g_memCmds.empty() && out.size() < 32) {
+            std::string ln = std::move(g_memCmds.front());
+            g_memCmds.pop_front();
+            LeaveCriticalSection(&g_csMemIPC);
+            ParseCommandLineToCmd( std::move(ln), out );
+            EnterCriticalSection(&g_csMemIPC);
+        }
+        LeaveCriticalSection(&g_csMemIPC);
+        if (out.size() >= 32) return;
+    }
     std::vector<std::pair<long, std::string>> files;
     WIN32_FIND_DATAA fd;
     HANDLE h = FindFirstFileA("Data\\SKSE\\Plugins\\FleshCore.cmd*.txt", &fd);
@@ -22523,7 +24355,8 @@ static void RunPendingTestStrike()
     }
 
     Body& B = Claim(fid);
-    if (!B.live || B.root != root) {
+    // CheckLiveRaw: a test strike never cuts records that are no longer theirs either.
+    if (!B.live || B.root != root || CheckLiveRaw(B) > 0) {
         bool notEligible = false;
         if (!Voxelise(B, root, &notEligible)) {
             if (notEligible) { B.formID = fid; RequestDressing(B); }
@@ -22699,8 +24532,11 @@ static void HookRunBody(void*)
     std::vector<Cmd> cmds;
     ReadCommands(cmds);
     bool didTestStrike = false;
+    bool didWhyCheck = false;
+    std::string whyMsg;
     {
         Guard lk(&g_csBodies);
+        DrainMemDressDoneLocked();
         LoadRefusals();
         for (const Cmd& c : cmds) {
             if (!g_armed) { Done(0, c.ticket, c.verb.c_str(), c.caller, 4, "not armed"); continue; }
@@ -22709,6 +24545,45 @@ static void HookRunBody(void*)
         if (g_armed && InterlockedExchange(&g_testStrikePending, 0) != 0) {
             RunPendingTestStrike();
             didTestStrike = true;
+        }
+        if (g_armed && InterlockedExchange(&g_whyCheckPending, 0) != 0) {
+            didWhyCheck = true;
+            u32 bestFid = 0; float bestD2 = 1e30f;
+            void* pRef = LookupForm(fact::kPlayerFormID, fact::kFormType_ACHR);
+            float ppos[3] = {0,0,0};
+            if (pRef && Readable(pRef, fact::kREFR_size))
+                std::memcpy(ppos, static_cast<const std::uint8_t*>(pRef) + fact::kREFR_pos, sizeof(ppos));
+            for (const auto& kv : g_bodies) {
+                if (kv.first == fact::kPlayerFormID) continue;
+                void* r = LookupForm(kv.first, fact::kFormType_ACHR);
+                if (!r || !Readable(r, fact::kREFR_size)) continue;
+                float rpos[3] = {0,0,0};
+                std::memcpy(rpos, static_cast<const std::uint8_t*>(r) + fact::kREFR_pos, sizeof(rpos));
+                const float dx = rpos[0]-ppos[0], dy = rpos[1]-ppos[1], dz = rpos[2]-ppos[2];
+                const float d2 = dx*dx + dy*dy + dz*dz;
+                if (d2 < bestD2 && d2 <= 1600.0f*1600.0f) { bestD2 = d2; bestFid = kv.first; }
+            }
+            char msg[384];
+            if (!bestFid) {
+                std::snprintf(msg, sizeof(msg), "No nearby loaded NPC in registry within 1600 units (player 0x14 combat allowed: %s).",
+                              HQPlayerAllows() ? "YES" : "NO");
+            } else {
+                const char* imm = nullptr;
+                const bool isImm = Immune(bestFid, imm);
+                const bool rgRef = RaceGateRefuses(bestFid);
+                const void* r = LookupForm(bestFid, fact::kFormType_ACHR);
+                const char* whoWhy = nullptr;
+                const bool whoOk = r ? HQWhoAllows(bestFid, r, whoWhy) : false;
+                auto bit = g_bodies.find(bestFid);
+                const bool solid = (bit != g_bodies.end() && bit->second.solid);
+                const bool beast = (bit != g_bodies.end() && bit->second.beastNoSkull);
+                if (isImm) std::snprintf(msg, sizeof(msg), "0x%08X DECLINED: Immune rule set by '%s'.", bestFid, imm ? imm : "mod");
+                else if (rgRef) std::snprintf(msg, sizeof(msg), "0x%08X DECLINED: Blocked by RaceGate (child or unsupported non-playable race).", bestFid);
+                else if (!whoOk) std::snprintf(msg, sizeof(msg), "0x%08X DECLINED: HQ target filter excludes %s.", bestFid, whoWhy ? whoWhy : "them");
+                else std::snprintf(msg, sizeof(msg), "0x%08X ELIGIBLE: Ready to cut (%s%s, dist %.0f u).",
+                                   bestFid, solid ? "interior active" : "awaiting interior", beast ? ", beast skull-exempt" : "", std::sqrt(bestD2));
+            }
+            whyMsg = msg;
         }
         int woundsLeft = 2;   // a separation is 55-300 ms; two per pass is the cap
         if (g_armed) {
@@ -22732,7 +24607,10 @@ static void HookRunBody(void*)
             StepTracks(woundsLeft);
         }
     }
-    if (didTestStrike) PanelPush();
+    if (didWhyCheck) { Guard lkP(&g_csPanel); g_lastWhyLog = whyMsg; }
+    const bool didPanelPush = (InterlockedExchange(&g_panelPushPending, 0) != 0);
+    if (didTestStrike || didWhyCheck || didPanelPush) PanelPush();
+    FlushWakePending();
 }
 static std::vector<std::uint8_t> g_voiceWavBufA;
 static std::vector<std::uint8_t> g_voiceWavBufB;
@@ -22904,20 +24782,39 @@ static void StepVoiceMailbox()
 static void HookRun(void* self) { GuardedTask("Hook", HookRunBody, self); InterlockedExchange(&g_hookInFlight, 0); }
 static void HookDispose(void* self) { InterlockedExchange(&g_hookInFlight, 0); delete static_cast<TaskObj*>(self); }
 static const TaskVtbl g_hookVtbl = { HookRun, HookDispose };
+static void RequestHookTick()
+{
+    if (g_task && g_task->AddTask && InterlockedCompareExchange(&g_hookInFlight, 1, 0) == 0)
+        g_task->AddTask(new TaskObj{ &g_hookVtbl });
+}
 static DWORD WINAPI HookThreadBody(LPVOID);
 static DWORD WINAPI HookThread(LPVOID p) { return GuardedThread("HookThread", HookThreadBody, p); }
 static DWORD WINAPI HookThreadBody(LPVOID)
 {
     unsigned cmdPollDiv = 0;
     for (;;) {
+        StepHitStopWatchdog();
         Sleep(DWORD(g_cfg.tickMs >= 50 && g_cfg.tickMs <= 1000 ? g_cfg.tickMs : 100));
+        StepHitStopWatchdog();
         if (!g_cfg.ok || !g_task || !g_task->AddTask) continue;
-        if (LoadScreenUp() || IsGameThreadStalledOrInTransition(12000ULL)) continue;
+        if (LoadScreenUp() || TearingDown()) continue;
         StepVoiceMailbox();
+        // A HELD WAKE WHOSE ANSWER NEVER CAME is offered again once the rearm
+        // time has passed (see g_wakeOutstanding); until then it does not make
+        // this ticker urgent.
+        if (InterlockedCompareExchange(&g_wakeHeldFlag, 0, 0) != 0 &&
+            DWORD(GetTickCount() - DWORD(InterlockedCompareExchange(&g_wakeSentTick, 0, 0))) >= kWakeRearmMs &&
+            InterlockedExchange(&g_wakeHeldFlag, 0) != 0)
+            InterlockedExchange(&g_wakePending, 1);
+        const bool memUrgent = HaveMemCommands() ||
+                               InterlockedCompareExchange(&g_outPending, 0, 0) != 0 ||
+                               InterlockedCompareExchange(&g_wakePending, 0, 0) != 0 ||
+                               InterlockedCompareExchange(&g_testStrikePending, 0, 0) != 0 ||
+                               InterlockedCompareExchange(&g_whyCheckPending, 0, 0) != 0 ||
+                               InterlockedCompareExchange(&g_panelPushPending, 0, 0) != 0;
+        if (!memUrgent && IsGameThreadStalledOrInTransition(12000ULL)) continue;
         ++cmdPollDiv;
-        bool work = InterlockedCompareExchange(&g_outPending, 0, 0) != 0 ||
-                    InterlockedCompareExchange(&g_testStrikePending, 0, 0) != 0 ||
-                    ((cmdPollDiv % 5u == 0u) && HaveCommandFiles());
+        bool work = memUrgent || ((cmdPollDiv % 5u == 0u) && HaveCommandFiles());
         if (!work) {
             Guard lk(&g_csBodies);
             work = !g_vortex.empty() || !g_heals.empty();
@@ -22943,6 +24840,26 @@ static void ForgetEveryBody(const char* why)
     Guard lk(&g_csBodies);
     const std::size_t nb = g_bodies.size(), nt = g_tintMemo.size(), nd = g_dress.size();
     g_bodies.clear();
+    g_activeBodyCountAtomic = 0;
+    ClearAllBodyMirrors();
+    ClearHitStopNow();
+    g_savedProtFlags.clear();
+    g_dressFinalMask.clear();
+    g_dressNeed.clear();
+    if (g_memIpcLockReady) {
+        EnterCriticalSection(&g_csMemIPC);
+        g_memWounds.clear();
+        g_memEvents.clear();
+        g_memDressLine.clear();
+        g_memReviveLine.clear();
+        g_memCmds.clear();
+        g_memDeathHeld.clear();
+        g_memDressDoneQ.clear();
+        LeaveCriticalSection(&g_csMemIPC);
+    }
+    InterlockedExchange(&g_wakePending, 0);
+    InterlockedExchange(&g_wakeHeldFlag, 0);
+    InterlockedExchange(&g_wakeOutstanding, 0);   // a wake of the timeline being left is never answered
     // FleshCore's pieces with 3D, and the wounds parked on bodies this
     // just forgot (RetireAcrossLoad has already emptied both; this keeps the
     // forget complete when it is called on its own).
@@ -23048,7 +24965,9 @@ static void ForgetEveryBody(const char* why)
 static SKSESerializationInterface* g_ser = nullptr;
 static const u32 kSaveUID    = 0x46435753;  // 'FCWS' -- FleshCore's namespace in the .skse file
 static const u32 kSaveRecord = 0x4657444E;  // 'FWDN' -- one record holds every body
-static const u32 kSaveVersion = 1;
+static const u32 kSaveVersion = 2;
+static u32 FloatToBitsU32(float f) { u32 u = 0; std::memcpy(&u, &f, 4); return u; }
+static float BitsU32ToFloat(u32 u) { float f = 0.0f; std::memcpy(&f, &u, 4); return f; }
 
 static void PutU32(std::vector<std::uint8_t>& b, u32 v)
 {
@@ -23091,7 +25010,8 @@ static void SaveCallback(SKSESerializationInterface* intfc)
             // freshlyLost masks against partsLost, that bit would have silently
             // eaten the DISMEMBERED verdict and the kill the day they really were
             // beheaded.
-            PutU32(buf, kv.first); PutU32(buf, B.partsLost); PutU32(buf, c);
+            const u32 packedLost = (B.partsLost & 0x7FFFFFFFu) | (B.headOff ? 0x80000000u : 0u);
+            PutU32(buf, kv.first); PutU32(buf, packedLost); PutU32(buf, FloatToBitsU32(B.lat.cell)); PutU32(buf, c);
             for (const auto& ck : all) {
                 PutU32(buf, u32(ck.first.x)); PutU32(buf, u32(ck.first.y));
                 PutU32(buf, u32(ck.first.z)); PutU32(buf, ck.second);
@@ -23106,7 +25026,9 @@ static void SaveCallback(SKSESerializationInterface* intfc)
         // is carried straight through instead.
         for (const auto& kv : g_restore) {
             if (g_bodies.find(kv.first) != g_bodies.end()) continue;
-            PutU32(buf, kv.first); PutU32(buf, kv.second.partsLost);
+            const u32 packedLost = (kv.second.partsLost & 0x7FFFFFFFu) | (kv.second.headOff ? 0x80000000u : 0u);
+            const float cs = kv.second.cellSize > 0.5f ? kv.second.cellSize : g_cfg.cellSize;
+            PutU32(buf, kv.first); PutU32(buf, packedLost); PutU32(buf, FloatToBitsU32(cs));
             PutU32(buf, u32(kv.second.cells.size()));
             for (const auto& ck : kv.second.cells) {
                 PutU32(buf, u32(ck.first.x)); PutU32(buf, u32(ck.first.y));
@@ -23143,8 +25065,8 @@ static void LoadCallback(SKSESerializationInterface* intfc)
     u32 type = 0, ver = 0, len = 0, kept = 0, dropped = 0, cells = 0;
     while (intfc->GetNextRecordInfo(&type, &ver, &len)) {
         if (type != kSaveRecord) continue;
-        if (ver != kSaveVersion) {
-            Log("[LOAD] co-save record is version %u, this build writes %u -- ignored", ver, kSaveVersion);
+        if (ver != 1u && ver != 2u) {
+            Log("[LOAD] co-save record is version %u, supported 1..2 -- ignored", ver);
             continue;
         }
         std::vector<std::uint8_t> buf(len);
@@ -23159,9 +25081,14 @@ static void LoadCallback(SKSESerializationInterface* intfc)
         if (!GetU32(buf, o, nBodies)) continue;
         Guard lk(&g_csBodies);
         for (u32 i = 0; i < nBodies; ++i) {
-            u32 fid = 0, lost = 0, nc = 0;
-            if (!GetU32(buf, o, fid) || !GetU32(buf, o, lost) || !GetU32(buf, o, nc)) break;
-            SavedWounds w; w.partsLost = lost;
+            u32 fid = 0, lost = 0, csBits = 0, nc = 0;
+            if (!GetU32(buf, o, fid) || !GetU32(buf, o, lost)) break;
+            if (ver >= 2u && !GetU32(buf, o, csBits)) break;
+            if (!GetU32(buf, o, nc)) break;
+            SavedWounds w;
+            w.headOff   = (ver >= 2u) ? ((lost & 0x80000000u) != 0) : ((lost & (1u << unsigned(flesh::Part::Head))) != 0);
+            w.partsLost = (ver >= 2u) ? (lost & 0x7FFFFFFFu) : lost;
+            w.cellSize  = (ver >= 2u) ? BitsU32ToFloat(csBits) : 0.0f;
             bool ok = true;
             for (u32 c = 0; c < nc; ++c) {
                 u32 x = 0, y = 0, z = 0, g = 0;
@@ -23175,8 +25102,9 @@ static void LoadCallback(SKSESerializationInterface* intfc)
             // that save was written with; this is the one this session will see.
             u32 now = 0;
             if (!intfc->ResolveFormId(fid, &now) || !now) { ++dropped; continue; }
-            if (w.cells.empty()) continue;
+            if (w.cells.empty() && !w.partsLost && !w.headOff) continue;
             cells += u32(w.cells.size());
+            SyncSavedMirror(now, w);
             g_restore[now] = std::move(w);
             ++kept;
         }
@@ -23225,7 +25153,11 @@ static void RestoreFromSave()
         {
             Guard lk(&g_csBodies);
             auto rit = g_restore.find(fid);
-            if (rit != g_restore.end()) { local.partsLost |= rit->second.partsLost; g_restore.erase(rit); }
+            if (rit != g_restore.end()) {
+                local.partsLost |= rit->second.partsLost;
+                if (rit->second.headOff) local.headOff = true;
+                g_restore.erase(rit);
+            }
             Body& B = Claim(fid);
             // See Body::everPriv.
             std::vector<const void*> keepPriv = std::move(B.everPriv);
@@ -23241,6 +25173,7 @@ static void RestoreFromSave()
             // it "now" would swallow the first blow on them after every load.
             B.lastCut = 1;
             if (void* dev = Device()) Redraw(B, dev, false);
+            SyncBodyMirror(B);
             WatchFrom(fid);
         }
         ++done; cells += back;
@@ -23339,8 +25272,19 @@ static void WatchOne(u32 fid)
     Log("==================================================================");
     Log("[LOAD] 0x%08X had their 3D rebuilt after the load (%s) -- re-cutting them",
         fid, rootChanged ? "new root" : "same root, different shape count");
-    if (!Voxelise(B, root)) { g_bodies.erase(fid); return; }
-    if (B.restored) {
+    const u32 prevLost = B.partsLost;
+    const bool prevHeadOff = B.headOff;
+    if (!Voxelise(B, root)) { g_bodies.erase(fid); g_activeBodyCountAtomic = g_bodies.size(); return; }
+    B.partsLost |= prevLost;
+    if (prevHeadOff) B.headOff = true;
+    auto ritW = g_restore.find(fid);
+    if (ritW != g_restore.end()) {
+        B.partsLost |= ritW->second.partsLost;
+        if (ritW->second.headOff) B.headOff = true;
+        g_restore.erase(ritW);
+    }
+    SyncBodyMirror(B);
+    if (B.restored || B.headOff || B.partsLost) {
         if (void* dev = Device()) Redraw(B, dev, false);
         Log("[LOAD] 0x%08X put back: %u wounded cell(s) re-cut onto their new 3D",
             fid, unsigned(B.restored));
@@ -23599,6 +25543,7 @@ static void RereadTickRunBody(void*)
         // A rebuild that never came back (a task the queue dropped) must not
         // retire them from the watch for the session. Noticed here, for every
         // body, so it does not depend on them being chosen this tick.
+        DrainMemDressDoneLocked();
         for (auto& kv : g_bodies) {
             Body& B = kv.second;
             // ...and not only a live one: a blow hands a COLD body out
@@ -23608,6 +25553,22 @@ static void RereadTickRunBody(void*)
                 B.rereadPending = false;
                 Log("[REREAD] 0x%08X: a rebuild handed out %u s ago never landed -- watching them again",
                     kv.first, unsigned((now - B.pendingTick) / 1000));
+            }
+            // Timed per-body dressing re-ask (#9 F5): retry after kDressPatienceMs (8s) up to kDressAskAgain (5)
+            if (!HandsOff() && !TearingDown() && B.live && B.asked && B.askAgain < kDressAskAgain &&
+                DWORD(now - B.askedAt) >= kDressPatienceMs &&
+                (kv.first != fact::kPlayerFormID || HQPlayerAllows() || HQSystemPlayerAllows())) {
+                const int fm = FinalMaskFor(kv.first);
+                const bool needBody = !(B.solid && B.ownFillFrac >= 0.30f) && ((fm & 1) == 0);
+                const bool hasHeadFill = B.beastNoSkull || ((B.partsAtBirth & (1u << unsigned(flesh::Part::Head))) != 0);
+                const bool needHead = !hasHeadFill && ((fm & 2) == 0);
+                if (needBody || needHead) {
+                    void* r3 = LookupForm(kv.first, fact::kFormType_ACHR);
+                    const void* ld3 = nullptr; const void* d3 = nullptr;
+                    if (r3 && Peek(r3, fact::kREFR_loadedData, &ld3) && ld3 && Peek(ld3, fact::kLoaded_data3D, &d3) && d3) {
+                        RequestDressing(B, false);
+                    }
+                }
             }
         }
         std::vector<u32> order;
@@ -23707,6 +25668,16 @@ static void RereadTickRunBody(void*)
             if (root != B.root) why = "new root";
             else if (count != B.nGeom) why = "shape count";
             else if (count <= kMaxShapes && ids != B.walkMix) why = "identity";
+            // THE SAME 3D WITH OTHER RECORDS UNDER IT (CheckLiveRaw): a body morph
+            // swapped a skin partition. Re-pointed there when it is a fresh copy of
+            // the same mesh that has barely moved; otherwise rebuilt here, off the
+            // game's thread, so the next blow does not find it. It is not a new 3D,
+            // so the revive and head-cull blocks below are not for it. `rawMix`
+            // is what the settle gate below compares from one look to the next.
+            std::uint64_t rawMix = 0;
+            const bool rawOnly = !why && CheckLiveRaw(B, nullptr, &rawMix) > 0;
+            if (rawOnly) why = "vertex data";
+            if (!rawOnly) B.rawSince = 0;
             if (!why) { B.seenCount = -1; B.hotTick = 0; continue; }   // they are what the registry holds
             // A TARGET THE RESTORE HANDED TO THE WATCHER COMES BACK WHOLE.
             // Their 3D changing now is Resurrect() (FL_Watch.ReviveRequested) or the
@@ -23718,7 +25689,23 @@ static void RereadTickRunBody(void*)
             // restore means whole. Done HERE, on the first tick that sees the
             // new 3D, so the head cull just below has no headOff left to write
             // and the carry further down has nothing left to carry.
-            {
+            if (!rawOnly) {
+                // External console / mod Resurrect() auto-detection (#19, zero PO3 alias crash!):
+                // If an actor died with FleshCore wounds (B.wasDead or curHP <= 0 earlier) and their 3D
+                // just rebuilt while they now have positive health, restore their body whole automatically!
+                float curHpChk = 0.0f, maxHpChk = 0.0f;
+                const bool haveHpChk = ReadHealth(refr, curHpChk, maxHpChk);
+                if (haveHpChk && curHpChk <= 0.0f && (Wounded(B) || B.partsLost != 0)) {
+                    B.wasDead = true;
+                }
+                const bool extResurrected = (B.wasDead && haveHpChk && curHpChk > 1.0f);
+                if (extResurrected) {
+                    g_reviving[fid] = now ? now : 1;
+                    RestoreActorProtectionFlags(fid);
+                    Emit("FL_Restored", fid, 0.0f, "resurrect|0|FleshCore");
+                    Log("[REREAD] 0x%08X: detected alive after death (HP %.1f) -- auto-restoring FleshCore wounds & requesting fresh interior",
+                        fid, double(curHpChk));
+                }
                 auto rv = g_reviving.find(fid);
                 if (rv != g_reviving.end()) {
                     const bool reviving = LONG(now - rv->second) <= kReviveWindowMs;
@@ -23726,7 +25713,9 @@ static void RereadTickRunBody(void*)
                     if (reviving) {
                         B.ledger.clear();
                         for (auto& ck : B.lat.cells) ck.second.gone = 0;
-                        B.partsLost = 0; B.restored = 0; B.headOff = false; B.lastCut = 0;
+                        B.partsLost = 0; B.restored = 0; B.headOff = false; B.lastCut = 0; B.wasDead = false;
+                        g_dressFinalMask.erase(fid);
+                        SyncBodyMirror(B);
                         // AND THEIR DRESSING STARTS OVER. Resurrect()
                         // brings them back without the worn interior, and the
                         // rebuild this tick queues must be free to ask for it.
@@ -23798,7 +25787,7 @@ static void RereadTickRunBody(void*)
             // RosterTick takes, for the same reason and with the same comment
             // above it. Nothing is lost by it: a load empties g_bodies before
             // the gate ever matters, so there is no body here to cull anyway.
-            if (B.headOff && !HandsOff() && !TearingDown()) {
+            if (!rawOnly && B.headOff && !HandsOff() && !TearingDown()) {
                 int budget = 4096;
                 const void* fg = FaceGenFromRoot(root, 0, budget);
                 static volatile long saidEarly = 0;
@@ -23824,16 +25813,40 @@ static void RereadTickRunBody(void*)
                 B.hotTick = 0;
                 continue;
             }
-            const bool same = (root == B.seenRoot && count == B.seenCount && ids == B.seenIds);
-            if (!same) {
-                B.seenRoot = root; B.seenCount = count; B.seenIds = ids; B.seenTick = now;
+            bool same = (root == B.seenRoot && count == B.seenCount && ids == B.seenIds);
+            // A MORPH THAT IS STILL RUNNING HAS NOT SETTLED. A body-morph ramp
+            // swaps their partitions a step at a time (in the field, a step about
+            // every 0.4 s for about 3 s), and a rebuild handed out in the middle
+            // of it reads records the next step frees. So for 'vertex data' the
+            // records the engine holds must also be the same on both looks -- the
+            // ramp has ended -- and a ramp costs one rebuild or one re-cut, after
+            // it. Not past 10 s of it: a mod that re-applies morphs for ever must
+            // not keep them stale. The landing re-checks the records either way.
+            if (rawOnly) {
+                if (!B.rawSince) B.rawSince = now ? now : 1;
+                if (same && rawMix != B.seenRaw && LONG(now - B.rawSince) < 10000) same = false;
+            }
+            if (!B.equipFastRebuild && !same) {
+                B.seenRoot = root; B.seenCount = count; B.seenIds = ids; B.seenRaw = rawMix; B.seenTick = now;
                 B.hotTick = now ? now : 1;               // seen once: next tick settles them
                 continue;
             }
+            B.equipFastRebuild = false;
             const LONG needMs = (!B.ledger.empty() || B.restored > 0 || Wounded(B)) ? 50L : LONG(g_cfg.rereadMs);
             if (LONG(now - B.seenTick) < needMs) { B.hotTick = now ? now : 1; continue; }
+            // A CUT THAT ONLY LOST THE COPY IT WAS WRITTEN INTO needs no rebuild:
+            // CheckLiveRaw re-points those shapes and re-cuts them in place when
+            // nothing else about their records changed, and they are current.
+            // Behind the teardown gate, as the head cull above: it writes into
+            // engine memory. Their identity was compared only up to kMaxShapes.
+            if (rawOnly && count <= kMaxShapes && !HandsOff() && !TearingDown() &&
+                CheckLiveRaw(B, nullptr, nullptr, true) == 0) {
+                B.seenCount = -1; B.hotTick = 0; B.rawSince = 0;
+                continue;
+            }
             if (g_rereadInFlight >= 4) { B.hotTick = now ? now : 1; continue; }   // the worker has enough
             B.hotTick = 0;                               // handed over: rereadPending keeps them out of the lane
+            B.rawSince = 0;
             // SETTLED: seen twice, a tick apart. Hand the worker everything it
             // needs and nothing that can dangle -- keys and masks, not pointers.
             RereadJob* J = new RereadJob;
@@ -23900,6 +25913,7 @@ static void RereadLandRunBody(void* self)
     Body old;                       // the body being replaced dies AFTER the lock
     bool landed = false;
     bool currentAfterDiscard = false;   // a discarded build found them current: their parked wounds are cut too
+    const char* replayWhy = nullptr;    // a discarded build whose parked wounds are cut on this frame all the same
     {
         Guard lk(&g_csBodies);
         auto it = g_bodies.find(J->fid);
@@ -23914,26 +25928,30 @@ static void RereadLandRunBody(void* self)
             // Their parked wounds cannot land on an entry that is gone: they go
             // now, with the true reason, rather than ageing out of the queue
             // under "their rebuild never landed".
-            if (J->fromHit)
-                for (std::size_t i = 0; i < g_pendingWounds.size(); )
+            if (J->fromHit) {
+                for (std::size_t i = 0; i < g_pendingWounds.size(); ) {
                     if (g_pendingWounds[i].fid == J->fid) {
                         Log("  [DEFER] wound #%ld for 0x%08X dropped: they left the registry (forgotten or evicted) before their rebuild landed",
                             g_pendingWounds[i].seq, J->fid);
                         g_pendingWounds.erase(g_pendingWounds.begin() + std::ptrdiff_t(i));
                     } else ++i;
+                }
+            }
         } else if (J->dropped) {
             it->second.rereadPending = false;
             Log("[REREAD] 0x%08X: their 3D went away before the rebuild started -- the watch will look again", J->fid);
             // A blow-made job that the worker found 3D-less: the wounds parked
             // on them are rightly lost, and the reason is this, not a rebuild
             // that never landed.
-            if (J->fromHit)
-                for (std::size_t i = 0; i < g_pendingWounds.size(); )
+            if (J->fromHit) {
+                for (std::size_t i = 0; i < g_pendingWounds.size(); ) {
                     if (g_pendingWounds[i].fid == J->fid) {
                         Log("  [DEFER] wound #%ld for 0x%08X dropped: their 3D went away before they could be rebuilt",
                             g_pendingWounds[i].seq, J->fid);
                         g_pendingWounds.erase(g_pendingWounds.begin() + std::ptrdiff_t(i));
                     } else ++i;
+                }
+            }
         } else if (it->second.gen != J->gen) {
             it->second.rereadPending = false;
             Log("[REREAD] 0x%08X: something happened to them while they were being rebuilt"
@@ -23969,12 +25987,36 @@ static void RereadLandRunBody(void* self)
             if (refr && Peek(refr, fact::kREFR_loadedData, &loaded) && loaded &&
                 Peek(loaded, fact::kLoaded_data3D, &root) && root && root == J->root)
                 count = WalkQuiet(root, &ids);
+            // ...AND THE RECORDS IT WAS BUILT FROM ARE STILL THE ONES THEY ARE
+            // DRAWN FROM. The worker read them with no lock, for a few hundred
+            // milliseconds, and a body-morph step in that time swaps a partition
+            // and frees the block it read under the same root, count and skin
+            // instances: a lattice with triangles in the wrong cells. One
+            // pointer compare per shape read from the engine's records.
+            const char* swapped = nullptr;
+            if (root == J->root && count == J->count && ids == J->ids)
+                for (const ShapeSrc& S : J->local.shapes)
+                    if (S.rawLive && S.skinInst && LiveRawOf(S.skinInst, S.rawPart) != S.raw) {
+                        swapped = NodeName(S.geom);
+                        if (!swapped) swapped = "?";
+                        break;
+                    }
             if (root != J->root || count != J->count || ids != J->ids) {
                 B.rereadPending = false;
                 Log("[REREAD] 0x%08X: their 3D changed again while they were being rebuilt"
                     " -- discarded; the watch will look again", J->fid);
                 currentAfterDiscard = RecheckAfterDiscard(B, J->fid,
                                                           "their 3D changed again while they were being rebuilt");
+            } else if (swapped) {
+                // NOT handed back to the worker (RecheckAfterDiscard): while a
+                // morph runs, each rebuild can be spoiled by the next step, and
+                // the wound would age out of the queue. The wounds parked on
+                // them are replayed now instead: WoundActor re-reads them on the
+                // game's thread, from records that cannot change under it.
+                B.rereadPending = false;
+                Log("[REREAD] 0x%08X: their vertex data was replaced again while they were being rebuilt"
+                    " (first '%s') -- discarded; the watch will look again", J->fid, swapped);
+                replayWhy = "their vertex data changed during their rebuild -- re-read on the game's thread";
             } else {
                 // THE HAND-OVER. Everything the in-place rebuild would have kept
                 // on the same Body is copied across by hand; everything else is
@@ -24020,12 +26062,14 @@ static void RereadLandRunBody(void* self)
                 // file; the next request does). Undressed, they are asked for:
                 // that includes a body dressed once and stripped
                 // since, like a revive after a Restore.
-                const bool hasHeadFill = (B.partsAtBirth & (1u << unsigned(flesh::Part::Head))) != 0;
+                B.wasDead = old.wasDead;
+                const bool hasHeadFill = B.beastNoSkull || ((B.partsAtBirth & (1u << unsigned(flesh::Part::Head))) != 0);
                 if (B.solid && B.ownFillFrac >= 0.30f && hasHeadFill) {
                     DressingSatisfied(B);
-                } else if (B.restored || J->fid != fact::kPlayerFormID || HQPlayerAllows()) {
+                } else if (B.restored || J->fid != fact::kPlayerFormID || HQPlayerAllows() || HQSystemPlayerAllows()) {
                     RequestDressing(B);
                 }
+                SyncBodyMirror(B);
                 double tRedraw = 0;
                 // OR IF THEIR HEAD IS BEING HELD OFF.
                 // headOff is CARRIED across the rebuild, and
@@ -24036,7 +26080,7 @@ static void RereadLandRunBody(void* self)
                 // tick re-asserts the cull on their live head every look, so a
                 // stale headOff stops being harmless and starts being a target
                 // with their head really back and permanently invisible.
-                if (B.restored || B.headOff) {
+                if (B.restored || B.headOff || B.partsLost) {
                     const double r0 = NowMs();
                     if (void* dev = Device()) Redraw(B, dev, false);
                     tRedraw = NowMs() - r0;
@@ -24057,9 +26101,10 @@ static void RereadLandRunBody(void* self)
     // the 0.1-15 ms Separate has always cost on the game's thread -- not the
     // 93.6-426.5 ms Voxelise measured there in testing. Under g_csBodies again,
     // taken afresh so `old` can still die outside it.
-    if (landed || currentAfterDiscard) {
+    if (landed || currentAfterDiscard || replayWhy) {
         Guard lk(&g_csBodies);
-        ReplayPendingWounds(J->fid, landed ? "their rebuild landed" : "a discarded rebuild found them current");
+        ReplayPendingWounds(J->fid, landed ? "their rebuild landed"
+                                    : currentAfterDiscard ? "a discarded rebuild found them current" : replayWhy);
     }
 }
 
@@ -24568,6 +26613,11 @@ struct PlacedInfo {
     int rewrites = 0;
     std::vector<const void*> mats, prevMats;    // FacegenTint materials seen on this 3D / the last one
     std::vector<std::string> accTex0, skinTex0; // PlacePiece's: the accessory test (TintAccessoryVerdict)
+    // THE THROW WATCH (ThrowWatchStep): when the 3D first arrived, and the
+    // root's position the first time the watch read it.
+    double got3DAt = 0;
+    bool throwRefSet = false;
+    float throwRef[3] = {0.0f, 0.0f, 0.0f};
     PlacedInfo() = default;
     PlacedInfo(double w, const PlaceJob& PJ, const PlacePiece& P, const void* a, unsigned long long pl)
         : when(w), has3D(false), filled(true), hasTint(PJ.hasTint), skinBlocks(P.skinBlocks),
@@ -24578,6 +26628,14 @@ struct PlacedInfo {
     }
 };
 static std::map<u32, PlacedInfo> g_placedLive;
+// THE THROW WATCH'S LIST: pieces whose 3D has arrived and whose throw has not
+// been timed yet, by FormID and placement number (a reused FormID is a new
+// placement). At most 64; g_csPlace. g_throwWatchN is its size, read without
+// the lock, so a frame with nothing to watch costs one load.
+struct ThrowWatchEntry { u32 fid; unsigned long long place; };
+static std::vector<ThrowWatchEntry> g_throwWatch;
+static volatile long g_throwWatchN = 0;
+static volatile long g_throwLines  = 0;   // [THROW] lines said this session (capped at 600)
 static unsigned long long g_placeSerial = 0;    // g_csPlace: one number per PlaceOne entry
 static bool g_placeSaid = false;
 
@@ -24592,6 +26650,13 @@ static bool PlacedNote3D(u32 fid, bool on, double* msSincePlaced)
     if (it == g_placedLive.end()) return false;
     if (msSincePlaced) *msSincePlaced = NowMs() - it->second.when;
     it->second.has3D = on;
+    if (on && it->second.got3DAt <= 0.0) {
+        it->second.got3DAt = NowMs();
+        if (g_throwWatch.size() < 64) {
+            g_throwWatch.push_back(ThrowWatchEntry{ fid, it->second.place });
+            InterlockedExchange(&g_throwWatchN, long(g_throwWatch.size()));
+        }
+    }
     return true;
 }
 static int LivePieceCount()
@@ -24620,7 +26685,84 @@ static void PlacedForgetAll()
     if (!g_locksReady) return;
     Guard lk(&g_csPlace);
     g_placedLive.clear();
+    g_throwWatch.clear();
+    InterlockedExchange(&g_throwWatchN, 0);
     TintForgetAllLocked();
+}
+
+// ---- THE THROW WATCH -------------------------------------------------------
+//
+// The DLL knows when a piece is placed and when its 3D arrives; the throw is
+// FL_Chunk's, on the script side, and nothing timed it. Once a frame (the frame
+// probe's task, FP 1) this reads the root position of each piece on the list
+// and says when it first moved SIDEWAYS by two units or more. Falling alone
+// moves a piece straight down; the throw gives it its sideways speed (a bounce
+// can too, so read the median over many pieces). Read-only, game thread, at
+// most twelve pieces a frame, one load and nothing else while the list is empty.
+static void ThrowWatchStep(double now)
+{
+    if (!g_locksReady) return;
+    if (InterlockedCompareExchange(&g_throwWatchN, 0, 0) <= 0) return;
+    struct Cand { u32 fid; unsigned long long place; };
+    struct Said { u32 fid; double placedAt; double gotAt; bool section; long seq; bool moved; };
+    Cand cand[12]; int n = 0;
+    Said said[64]; int ns = 0;
+    {
+        Guard lk(&g_csPlace);
+        for (std::size_t i = 0; i < g_throwWatch.size(); ) {
+            const ThrowWatchEntry E = g_throwWatch[i];
+            auto it = g_placedLive.find(E.fid);
+            // Gone, replaced by a later placement, or its 3D lost before it was
+            // timed: dropped without a line.
+            bool drop = it == g_placedLive.end() || it->second.place != E.place || !it->second.has3D;
+            if (!drop && now - it->second.got3DAt > 3000.0) {
+                const PlacedInfo& I = it->second;
+                if (ns < 64) said[ns++] = Said{ E.fid, I.when, I.got3DAt, I.section, I.seq, false };
+                drop = true;
+            }
+            if (drop) { g_throwWatch.erase(g_throwWatch.begin() + std::ptrdiff_t(i)); continue; }
+            if (n < 12) cand[n++] = Cand{ E.fid, E.place };
+            ++i;
+        }
+        InterlockedExchange(&g_throwWatchN, long(g_throwWatch.size()));
+    }
+    if (n) ForgetMemory();
+    for (int i = 0; i < n; ++i) {
+        float w[3] = {0.0f, 0.0f, 0.0f};
+        void* refr = LookupForm(cand[i].fid, fact::kFormType_REFR);
+        const void* loaded = nullptr; const void* d3 = nullptr;
+        if (!refr || !Peek(refr, fact::kREFR_loadedData, &loaded) || !loaded) continue;
+        if (!Peek(loaded, fact::kLoaded_data3D, &d3) || !d3) continue;
+        if (!Peek(d3, fact::kAV_worldTranslate, &w)) continue;
+        Guard lk(&g_csPlace);
+        auto it = g_placedLive.find(cand[i].fid);
+        if (it == g_placedLive.end() || it->second.place != cand[i].place) continue;
+        PlacedInfo& I = it->second;
+        if (!I.throwRefSet) {
+            I.throwRef[0] = w[0]; I.throwRef[1] = w[1]; I.throwRef[2] = w[2];
+            I.throwRefSet = true;
+            continue;
+        }
+        const float dx = w[0] - I.throwRef[0], dy = w[1] - I.throwRef[1];
+        if (dx * dx + dy * dy < 4.0f) continue;
+        if (ns < 64) said[ns++] = Said{ cand[i].fid, I.when, I.got3DAt, I.section, I.seq, true };
+        for (std::size_t j = 0; j < g_throwWatch.size(); ++j)
+            if (g_throwWatch[j].fid == cand[i].fid && g_throwWatch[j].place == cand[i].place) {
+                g_throwWatch.erase(g_throwWatch.begin() + std::ptrdiff_t(j));
+                break;
+            }
+        InterlockedExchange(&g_throwWatchN, long(g_throwWatch.size()));
+    }
+    for (int i = 0; i < ns; ++i) {
+        if (InterlockedIncrement(&g_throwLines) > 600) break;
+        if (said[i].moved)
+            Log("[THROW] 0x%08X moved sideways %.1f ms after its 3D arrived (%.1f ms after it was placed; wound %ld, %s)",
+                said[i].fid, now - said[i].gotAt, now - said[i].placedAt, said[i].seq,
+                said[i].section ? "section" : "shard");
+        else
+            Log("[THROW] 0x%08X did not move sideways within 3 s of its 3D (wound %ld, %s)",
+                said[i].fid, said[i].seq, said[i].section ? "section" : "shard");
+    }
 }
 
 static void PlaceRun(void*);
@@ -24655,6 +26797,22 @@ static void PlaceWatchdog()
         }
     }
     if (post) PlacePost();
+}
+
+// THE REST WAITS FOR THE NEXT FRAME. With the frame probe on (FP 1, the
+// default) the probe's next run posts the placer (g_placeNextFrame); the
+// in-flight flag stays up meanwhile, so StreamPiece/StreamDone/PlaceEnqueue do
+// not post a second one, and the watchdog above still covers a probe that
+// stopped. Without the probe there is no frame to wait for, and the placer is
+// posted at once, as before.
+static void PlaceLater()
+{
+    if (PlacerFramesKnown()) {
+        { Guard lk(&g_csPlace); g_placePostedAt = GetTickCount(); }
+        InterlockedExchange(&g_placeNextFrame, 1);
+    } else {
+        PlacePost();
+    }
 }
 
 // ============================================================================
@@ -25598,6 +27756,43 @@ static void PlaceEnqueue(PlaceJob&& job)
     else PlaceWatchdog();
 }
 
+// STREAMED PLACEMENT: the forge thread's two calls. Both work only under
+// g_csPlace and find the wound's job by its number AND its load epoch (a load
+// clears g_placeQ, and then nothing is found and the piece is dropped), and
+// post the placer if it is idle. The idle test is made under the same lock the
+// placer holds when it goes idle waiting for this forge, so no piece is missed.
+static PlaceJob* FindStreamJobLocked(long seq, long epoch)
+{
+    for (PlaceJob& J : g_placeQ)
+        if (J.streamed && J.seq == seq && J.epoch == epoch) return &J;
+    return nullptr;
+}
+static void StreamPiece(long seq, long epoch, const PlacePiece& P)
+{
+    bool post = false;
+    {
+        Guard lk(&g_csPlace);
+        PlaceJob* J = FindStreamJobLocked(seq, epoch);
+        if (!J || J->forgeDone) return;
+        J->pieces.push_back(P);
+        if (InterlockedCompareExchange(&g_placeInFlight, 1, 0) == 0) post = true;
+    }
+    if (post) PlacePost();
+}
+static void StreamDone(long seq, long epoch)
+{
+    bool post = false;
+    {
+        Guard lk(&g_csPlace);
+        PlaceJob* J = FindStreamJobLocked(seq, epoch);
+        if (!J) return;
+        J->engineCount = J->pieces.size();
+        J->forgeDone = true;
+        if (InterlockedCompareExchange(&g_placeInFlight, 1, 0) == 0) post = true;
+    }
+    if (post) PlacePost();
+}
+
 struct NiPoint3f { float x, y, z; };
 // THE ROLL CHANNEL'S CONSTANTS. FL_Chunk.psc decodes with the same three
 // numbers in degrees (RollBase 7.0702992, RollStep 0.00057295780, PitchSeal
@@ -25609,8 +27804,6 @@ static const float kPlacePitch    = 0.0777f;   // rad, the seal
 // The probe of BSModelDB::Demand (facts.h). Held pointers are never deleted
 // here: the engine's refcount rules for a demanded model are unverified, so a
 // probe leaks a few models rather than free one the engine still draws.
-static void* g_primed[8];
-static u32 g_primedAt = 0;
 static void PrimeModel(const char* rel)
 {
     using Demand_t = u32 (*)(const char*, void**, const void*);
@@ -25636,9 +27829,15 @@ static void PrimeModel(const char* rel)
         Log("    [PROBE prime] '%s' -> %u (%s), node %p, %.1f ms on the game's thread", full, rc,
             rc < 9 ? kErr[rc] : "?", out, NowMs() - p1);
     }
-    if (out) {
-        g_primed[g_primedAt % 8] = out;
-        ++g_primedAt;
+    if (out && Readable(out, 0x10)) {
+        // Release the local NiPointer<NiNode> reference acquired by BSModelDB::Demand (#6)
+        volatile LONG* rcPtr = reinterpret_cast<volatile LONG*>(static_cast<std::uint8_t*>(out) + fact::kNiRefObject_refCount);
+        if (Writable(const_cast<LONG*>(rcPtr), sizeof(LONG)) && InterlockedDecrement(rcPtr) == 0) {
+            void* const* vt = *reinterpret_cast<void* const* const*>(out);
+            if (vt && Readable(vt, 16) && vt[1]) {
+                reinterpret_cast<void (*)(void*)>(vt[1])(out);
+            }
+        }
     }
 }
 
@@ -25674,6 +27873,7 @@ static void PlaceOne(PlaceJob& PJ, PlacePiece& P, void* victimRefr, const void* 
     if (P.slot < 0 || std::size_t(P.slot) >= g_cfg.poolLocals.size()) return;
     void* acti = LookupForm(g_prefix + g_cfg.poolLocals[std::size_t(P.slot)], fact::kFormType_ACTI);
     if (!acti) { Log("    [PLACE] pool record %d not found -- the script places it", P.slot); return; }
+    EvictModelIfUnused(P.rel.c_str());
     if (g_cfg.placePrime) PrimeModel(P.rel.c_str());
 
     const double c0 = NowMs();
@@ -25793,8 +27993,26 @@ static void PlaceRunBody(void*)
     const double t0 = NowMs();
     // Shards go onto the engine a frame before sections, so small shards never
     // wait in the same frame's 3D-load batch behind a large skinned section.
-    bool framePlacedShard   = false;
-    bool framePlacedSection = false;
+    // THE FRAME'S SHARE IS KEPT ACROSS RUNS. A streamed wound posts the placer
+    // again as each piece is written, and SKSE can run that post in the frame
+    // the last run already placed in; per-run locals would hand every such run
+    // a fresh placePerFrame. The frame is the frame probe's counter (FP 1);
+    // without the probe each run is its own frame, as before.
+    static long s_placeFrame       = -1;
+    static int  s_placedThisFrame  = 0;
+    static bool s_shardThisFrame   = false;
+    static bool s_sectThisFrame    = false;
+    {
+        const long f = PlacerFramesKnown() ? long(g_frameHead) : -1;
+        if (f < 0 || f != s_placeFrame) {
+            s_placeFrame = f;
+            s_placedThisFrame = 0;
+            s_shardThisFrame = false;
+            s_sectThisFrame = false;
+        }
+    }
+    bool& framePlacedShard   = s_shardThisFrame;
+    bool& framePlacedSection = s_sectThisFrame;
     for (;;) {
         PlaceJob* PJ = nullptr;
         {
@@ -25827,25 +28045,60 @@ static void PlaceRunBody(void*)
             if (loaded) Peek(loaded, fact::kLoaded_data3D, &root);
         }
         int placedNow = 0;
-        while (PJ->next < PJ->pieces.size() && PJ->next < PJ->engineCount &&
-               placedNow < g_cfg.placePerFrame) {
-            const bool isSect = PJ->pieces[PJ->next].section;
+        // ONE PIECE AT A TIME UNDER THE LOCK. A streamed wound's list grows on
+        // the forge thread while this runs, so each piece is copied out under
+        // g_csPlace, placed with no lock held, and its FormID written back
+        // under the lock. A wound handed over whole takes the same path. Only
+        // this thread moves `next`.
+        while (s_placedThisFrame < g_cfg.placePerFrame) {
+            PlacePiece cur;
+            std::size_t idx = 0;
+            {
+                Guard lk(&g_csPlace);
+                if (PJ->next >= PJ->pieces.size() || PJ->next >= PJ->engineCount) break;
+                idx = PJ->next;
+                cur = PJ->pieces[idx];
+            }
+            const bool isSect = cur.section;
             if (victimRefr && ((isSect && framePlacedShard) || (!isSect && framePlacedSection)))
                 break;
             if (victimRefr) {
-                PlaceOne(*PJ, PJ->pieces[PJ->next], victimRefr, root);
+                PlaceOne(*PJ, cur, victimRefr, root);
                 if (isSect) framePlacedSection = true;
                 else        framePlacedShard   = true;
-            } else if (PJ->next == 0) {
+                if (cur.refID) {
+                    {
+                        Guard lk(&g_csPlace);
+                        PJ->pieces[idx].refID = cur.refID;
+                    }
+                    if (PJ->firstAt <= 0.0) {
+                        PJ->firstAt = NowMs();
+                        Log("  wound %ld: first piece placed %.1f ms after the wound began%s",
+                            PJ->seq, PJ->firstAt - PJ->t0, PJ->streamed ? " (streamed)" : "");
+                    }
+                }
+            } else if (idx == 0) {
                 Log("    [PLACE] victim 0x%08X is not a loaded actor -- the script places this wound",
                     u32(PJ->victim));
             }
             ++PJ->next;
             ++placedNow;
+            ++s_placedThisFrame;
         }
-        if (PJ->next < PJ->pieces.size() && PJ->next < PJ->engineCount) {
+        bool more = false, waiting = false;
+        {
+            Guard lk(&g_csPlace);
+            more    = PJ->next < PJ->pieces.size() && PJ->next < PJ->engineCount;
+            waiting = !more && !PJ->forgeDone;
+            // WAITING ON THE FORGE: go idle. StreamPiece / StreamDone post the
+            // placer again under this same lock, so nothing is missed and this
+            // task never re-posts itself to spin while the forge is writing.
+            if (waiting) InterlockedExchange(&g_placeInFlight, 0);
+        }
+        if (waiting) return;
+        if (more) {
             // More next frame; this frame has done its share.
-            PlacePost();
+            PlaceLater();
             return;
         }
         // THE WOUND FILE, with a third field per piece: the FormID of the
@@ -25877,6 +28130,8 @@ static void PlaceRunBody(void*)
         Log("  wound %ld posted: %d piece(s), %d placed by the engine, %.1f ms after the"
             " wound began (%.1f ms of it on this frame)",
             PJ->seq, made, byEngine, NowMs() - PJ->t0, NowMs() - t0);
+        Log("    [IPC] watcher wakes this session: %ld sent, %ld held while one was unanswered",
+            long(InterlockedCompareExchange(&g_wakeSent, 0, 0)), long(InterlockedCompareExchange(&g_wakeHeld, 0, 0)));
         {
             Guard lk(&g_csPlace);
             g_placeQ.pop_front();
@@ -25884,9 +28139,11 @@ static void PlaceRunBody(void*)
         // A frame that has placed its share hands the next wound to the next
         // frame rather than running two wounds' placements back to back.
         if (placedNow > 0) {
-            Guard lk(&g_csPlace);
-            if (g_placeQ.empty()) { InterlockedExchange(&g_placeInFlight, 0); return; }
-            PlacePost();
+            {
+                Guard lk(&g_csPlace);
+                if (g_placeQ.empty()) { InterlockedExchange(&g_placeInFlight, 0); return; }
+            }
+            PlaceLater();
             return;
         }
     }
@@ -25937,10 +28194,13 @@ static void RetireAcrossLoad(const char* why)
         wounds = int(g_placeQ.size());
         g_placeQ.clear();
         g_placedLive.clear();            // the pieces belong to the timeline being left
+        g_throwWatch.clear();
+        InterlockedExchange(&g_throwWatchN, 0);
         TintForgetAllLocked();           // and so do their colour asks and material notes
         // The placer's task, if one is queued, finds nothing and clears the flag
         // itself; if the load dropped the task, the flag must not stay up.
         InterlockedExchange(&g_placeInFlight, 0);
+        InterlockedExchange(&g_placeNextFrame, 0);
         g_placePostedAt = 0;
     }
     if (rebuilds || wounds || forges || warms || parked)
@@ -26369,8 +28629,7 @@ static void LogActiveSksePluginsInWindow(const char* phaseName, const SYSTEMTIME
 
             if (lines > 0) {
                 SksePluginLogActivity act{};
-                std::strncpy(act.name, fd.cFileName, sizeof(act.name) - 1);
-                act.name[sizeof(act.name) - 1] = '\0';
+                std::snprintf(act.name, sizeof(act.name), "%s", fd.cFileName);
                 act.firstMs   = firstMs;
                 act.lastMs    = lastMs;
                 act.spanMs    = activeMs;
@@ -26687,7 +28946,7 @@ static std::uint64_t                g_manifestFingerprint      = 0;
 static std::uint32_t                g_manifestBsaCount         = 0;
 static volatile bool                g_inFastTraverse           = false;
 static DWORD                        g_fastTraverseTid          = 0;
-static const char*                  g_curTraversePath          = nullptr;
+[[maybe_unused]] static const char*     g_curTraversePath          = nullptr;
 static std::uint8_t                 g_curManifestAttr[36]      = {0};
 static std::uint64_t                g_invVisited               = 0;
 static std::uint64_t                g_invPassed                = 0;
@@ -26988,6 +29247,15 @@ static bool IsMutableRuntimeSubtree(const char* relLower, std::size_t len)
         std::strncmp(relLower, "skse\\plugins\\skyrimnet\\screenshots", 34) == 0) {
         return true;
     }
+    // Add-on folders beside the main one (skse\plugins\skyrimnet<name>\...) are written
+    // while the game runs, like the three skyrimnet subfolders above. The main folder
+    // (character 22 is '\\', or the path ends there) and the main plugin's own files
+    // (character 22 is '.') are not matched. The length is checked before character 22
+    // is read, because a directory string here is not always cut at len.
+    if (len > 22 && std::strncmp(relLower, "skse\\plugins\\skyrimnet", 22) == 0 &&
+        relLower[22] != '\\' && relLower[22] != '/' && relLower[22] != '.') {
+        return true;
+    }
     return false;
 }
 
@@ -27064,7 +29332,7 @@ static int LookupVfsTreeAttr(LPCSTR lpFileName, const std::uint8_t** outAttr, ch
     if (LookupVfsEntryIdx(dirIdx, childName, cLen, &entryIdx)) {
         const VfsEntryRec& er = g_vfsEntries[entryIdx];
         // If in Data\SKSE\Plugins and won by MO2's mutable overwrite layer, pass through to OS
-        if (isSksePluginsDir && er.layerIdx + 1 >= g_vfsLayers.size()) {
+        if (isSksePluginsDir && std::size_t(er.layerIdx) + 1 >= g_vfsLayers.size()) {
             return 0;
         }
         *outAttr = er.attrPtr;
@@ -27436,8 +29704,16 @@ static HANDLE WINAPI FastCreateFileA(
             return INVALID_HANDLE_VALUE;
         }
         if (m > 0 && physPath[0] != '\0') {
+            // Decode UTF-8 physical layer path to UTF-16 so non-English/accented mod folders open cleanly (#3)
+            wchar_t physPathW[MAX_PATH * 2];
+            physPathW[0] = 0;
+            int wn = MultiByteToWideChar(CP_UTF8, 0, physPath, -1, physPathW, int(MAX_PATH * 2));
+            if (wn <= 0) wn = MultiByteToWideChar(CP_ACP, 0, physPath, -1, physPathW, int(MAX_PATH * 2));
             const double t0 = NowMs();
-            const HANDLE hp = g_origCreateFileA(physPath, dwDesiredAccess, dwShareMode, lpSecurityAttributes,
+            const HANDLE hp = (wn > 0 && g_origCreateFileW)
+                            ? g_origCreateFileW(physPathW, dwDesiredAccess, dwShareMode, lpSecurityAttributes,
+                                                dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile)
+                            : g_origCreateFileA(physPath, dwDesiredAccess, dwShareMode, lpSecurityAttributes,
                                                 dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile);
             if (hp != INVALID_HANDLE_VALUE) {
                 InterlockedIncrement(&g_rtPhysOpenHits);
@@ -27477,11 +29753,10 @@ static HANDLE WINAPI FastCreateFileW(
         }
         if (m > 0 && physPath[0] != '\0') {
             wchar_t physPathW[MAX_PATH * 2];
-            std::size_t k = 0;
-            for (; physPath[k] && k < (MAX_PATH * 2) - 1; ++k) {
-                physPathW[k] = static_cast<wchar_t>(static_cast<unsigned char>(physPath[k]));
+            physPathW[0] = 0;
+            if (MultiByteToWideChar(CP_UTF8, 0, physPath, -1, physPathW, int(MAX_PATH * 2)) <= 0) {
+                MultiByteToWideChar(CP_ACP, 0, physPath, -1, physPathW, int(MAX_PATH * 2));
             }
-            physPathW[k] = 0;
             const double t0 = NowMs();
             const HANDLE hp = g_origCreateFileW(physPathW, dwDesiredAccess, dwShareMode, lpSecurityAttributes,
                                                 dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile);
@@ -28393,6 +30668,68 @@ static void ScanBsaOverrideHashes(std::unordered_set<std::uint64_t>& outHashes)
     FastFindClose(hFind);
 }
 
+// ---- Which FleshCore built the manifest
+// BuildLooseManifestThread writes FleshCore.loose_manifest.ver (this build's FC_VERSION) next to
+// every manifest it builds. The manifest lists the loose files that were there when it was built,
+// and a file missing from it is answered "not found". After an update, the manifest the old
+// version built does not list the files the update added (scripts, meshes, textures), and its BSA
+// fingerprint still matches, so nothing would rebuild it. LoadLooseManifest therefore does not use
+// a manifest whose stamp names another version, nor an unstamped one (from a version before the
+// stamp, or from another tool) that does not list this version's own Scripts\FL_Native.pex; it
+// has it rebuilt for the next launch instead.
+static const char* const kManifestStampPath = "Data\\SKSE\\Plugins\\FleshCore.loose_manifest.ver";
+
+// 1 = built by this version, -1 = built by another version, 0 = no stamp.
+static int ReadManifestStamp()
+{
+    FILE* f = std::fopen(kManifestStampPath, "rb");
+    if (!f) return 0;
+    char buf[64] = {0};
+    const std::size_t n = std::fread(buf, 1, sizeof(buf) - 1, f);
+    std::fclose(f);
+    const std::size_t want = std::strlen(FC_VERSION);
+    return (n == want && std::memcmp(buf, FC_VERSION, want) == 0) ? 1 : -1;
+}
+
+static void WriteManifestStamp()
+{
+    FILE* f = std::fopen(kManifestStampPath, "wb");
+    if (!f) return;
+    std::fwrite(FC_VERSION, 1, std::strlen(FC_VERSION), f);
+    std::fclose(f);
+}
+
+// True when the manifest read into g_manifestBuf (header already checked, prefix blocks from pos)
+// lists the loose file <prefix>\<rel>, rel without a folder, in any case. Read only, and
+// bounds-checked like the loader below.
+static bool ManifestBufListsFile(std::size_t pos, const char* prefix, const char* rel)
+{
+    const std::size_t want = std::strlen(rel);
+    for (int i = 0; i < 12; ++i) {
+        if (pos + 20 > g_manifestBuf.size()) return false;
+        char name[16];
+        std::memcpy(name, &g_manifestBuf[pos], 16);
+        name[15] = '\0';
+        std::uint32_t cnt = 0;
+        std::memcpy(&cnt, &g_manifestBuf[pos + 16], 4);
+        pos += 20;
+        const bool mine = (std::strcmp(name, prefix) == 0);
+        for (std::uint32_t j = 0; j < cnt; ++j) {
+            if (pos + 38 > g_manifestBuf.size()) return false;
+            std::uint16_t relLen = 0;
+            std::memcpy(&relLen, &g_manifestBuf[pos + 36], 2);
+            if (pos + 38 + std::size_t(relLen) + 1 > g_manifestBuf.size()) return false;
+            if (mine && std::size_t(relLen) == want &&
+                _strnicmp(reinterpret_cast<const char*>(&g_manifestBuf[pos + 38]), rel, want) == 0) {
+                return true;
+            }
+            pos += 38 + std::size_t(relLen) + 1;
+        }
+        if (mine) return false;
+    }
+    return false;
+}
+
 static DWORD WINAPI BuildLooseManifestThread(LPVOID)
 {
     Sleep(g_manifestLoaded ? 180000 : 15000); // never compete with game startup or first save load
@@ -28490,9 +30827,11 @@ static DWORD WINAPI BuildLooseManifestThread(LPVOID)
         }
     }
     std::fclose(out);
-    MoveFileExA("Data\\SKSE\\Plugins\\FleshCore.loose_manifest.bin.tmp",
-                "Data\\SKSE\\Plugins\\FleshCore.loose_manifest.bin",
-                MOVEFILE_REPLACE_EXISTING);
+    if (MoveFileExA("Data\\SKSE\\Plugins\\FleshCore.loose_manifest.bin.tmp",
+                    "Data\\SKSE\\Plugins\\FleshCore.loose_manifest.bin",
+                    MOVEFILE_REPLACE_EXISTING)) {
+        WriteManifestStamp();
+    }
     g_manifestFingerprint = vfsFp;
     g_manifestFingerprintMismatch = false;
     Log("[ARCHIVEOPT] background-generated Data\\SKSE\\Plugins\\FleshCore.loose_manifest.bin (%u files, %u BSA overrides, fp=0x%016llX)",
@@ -28527,8 +30866,19 @@ static bool LoadLooseManifest()
     std::uint32_t numPrefixes = 0, totalFiles = 0;
     std::memcpy(&numPrefixes, &g_manifestBuf[8], 4);
     std::memcpy(&totalFiles,  &g_manifestBuf[12], 4);
-    if (numPrefixes != 12) {
+    if (numPrefixes != 12 || totalFiles >= (kManifestHashSlots * 3u) / 4u) {
         g_manifestBuf.clear();
+        return false;
+    }
+    // A manifest from before this install is not used (see ReadManifestStamp): its "not found"
+    // answers would hide the files this version added. It is rebuilt for the next launch, and this
+    // session asks the OS, as a first launch with no manifest does.
+    const int stamp = ReadManifestStamp();
+    if (stamp < 0 || (stamp == 0 && !ManifestBufListsFile(isV2 ? 24 : 16, "SCRIPTS", "fl_native.pex"))) {
+        Log("[ARCHIVEOPT] FleshCore.loose_manifest.bin was built by %s -- not used this session; rebuilding it in the background for the next launch",
+            stamp < 0 ? "another FleshCore version" : "an earlier FleshCore version (it does not list Scripts\\FL_Native.pex)");
+        g_manifestBuf.clear();
+        CreateThread(nullptr, 0, &BuildLooseManifestThread, nullptr, 0, nullptr);
         return false;
     }
     g_manifestFingerprint = 0;
@@ -28549,8 +30899,12 @@ static bool LoadLooseManifest()
             Log("[ARCHIVEOPT] updated manifest BSA fingerprint to 0x%016llX in-place (authoritative negative cache remains active)",
                 (unsigned long long)curFp);
         } else {
-            Log("[ARCHIVEOPT] manifest format upgrade required -- scheduling deferred background rebuild");
+            // Out of date (an older format, or the BSA set changed): rebuilt for the next launch, and
+            // not used this session, so its "not found" answers cannot hide new files.
+            Log("[ARCHIVEOPT] manifest out of date (format or BSA fingerprint) -- not used this session; scheduling a background rebuild for the next launch");
+            g_manifestBuf.clear();
             CreateThread(nullptr, 0, &BuildLooseManifestThread, nullptr, 0, nullptr);
+            return false;
         }
     }
     g_manifestHash.assign(kManifestHashSlots, ManifestHashSlot{0, 0, 0, 0});
@@ -28726,19 +31080,23 @@ static void InstallStartupInvalidationOpt()
 
     HMODULE hK32 = GetModuleHandleA("kernel32.dll");
     if (hK32) {
-        g_origGetFileAttributesExA = reinterpret_cast<FnGetFileAttributesExA>(GetProcAddress(hK32, "GetFileAttributesExA"));
-        g_origGetFileAttributesExW = reinterpret_cast<FnGetFileAttributesExW>(GetProcAddress(hK32, "GetFileAttributesExW"));
-        g_origGetFileAttributesA   = reinterpret_cast<FnGetFileAttributesA>(GetProcAddress(hK32, "GetFileAttributesA"));
-        g_origGetFileAttributesW   = reinterpret_cast<FnGetFileAttributesW>(GetProcAddress(hK32, "GetFileAttributesW"));
-        g_origCreateFileA          = reinterpret_cast<FnCreateFileA>(GetProcAddress(hK32, "CreateFileA"));
-        g_origCreateFileW          = reinterpret_cast<FnCreateFileW>(GetProcAddress(hK32, "CreateFileW"));
-        g_origFindFirstFileW       = reinterpret_cast<FnFindFirstFileW>(GetProcAddress(hK32, "FindFirstFileW"));
-        g_origFindFirstFileExW     = reinterpret_cast<FnFindFirstFileExW>(GetProcAddress(hK32, "FindFirstFileExW"));
-        g_origFindNextFileW        = reinterpret_cast<FnFindNextFileW>(GetProcAddress(hK32, "FindNextFileW"));
-        g_origFindFirstFileA       = reinterpret_cast<FnFindFirstFileA>(GetProcAddress(hK32, "FindFirstFileA"));
-        g_origFindFirstFileExA     = reinterpret_cast<FnFindFirstFileExA>(GetProcAddress(hK32, "FindFirstFileExA"));
-        g_origFindNextFileA        = reinterpret_cast<FnFindNextFileA>(GetProcAddress(hK32, "FindNextFileA"));
-        g_origFindClose            = reinterpret_cast<FnFindClose>(GetProcAddress(hK32, "FindClose"));
+        auto gp = [&](auto& dst, const char* nm) {
+            FARPROC p = GetProcAddress(hK32, nm);
+            std::memcpy(&dst, &p, sizeof(dst));
+        };
+        gp(g_origGetFileAttributesExA, "GetFileAttributesExA");
+        gp(g_origGetFileAttributesExW, "GetFileAttributesExW");
+        gp(g_origGetFileAttributesA,   "GetFileAttributesA");
+        gp(g_origGetFileAttributesW,   "GetFileAttributesW");
+        gp(g_origCreateFileA,          "CreateFileA");
+        gp(g_origCreateFileW,          "CreateFileW");
+        gp(g_origFindFirstFileW,       "FindFirstFileW");
+        gp(g_origFindFirstFileExW,     "FindFirstFileExW");
+        gp(g_origFindNextFileW,        "FindNextFileW");
+        gp(g_origFindFirstFileA,       "FindFirstFileA");
+        gp(g_origFindFirstFileExA,     "FindFirstFileExA");
+        gp(g_origFindNextFileA,        "FindNextFileA");
+        gp(g_origFindClose,            "FindClose");
     }
 
     if (!LoadLooseManifest() && !g_vfsTreeLoaded) return;
@@ -28817,19 +31175,701 @@ static void InstallStartupInvalidationOpt()
     }
 }
 
+
+// =============================================== [IN-MEMORY IPC & FL_NATIVE] (#1 & #2)
+struct EngineBSFixedString { const char* data = nullptr; };
+struct SKSEModCallbackEventNative {
+    EngineBSFixedString eventName;
+    EngineBSFixedString strArg;
+    float               numArg = 0.0f;
+    void*               sender = nullptr;
+};
+static void* g_modEventDispatcher = nullptr;
+static void* g_modCbVtbl[2] = { nullptr, nullptr };
+struct ModCbSink { void* vtbl; };
+static ModCbSink g_modCbSink = { nullptr };
+static EngineBSFixedString g_bsWakeName = { nullptr };
+
+static void InitEngineFixedString(EngineBSFixedString& out, const char* s)
+{
+    if (!g_base || !s) return;
+    using Ctor_t = EngineBSFixedString* (*)(EngineBSFixedString*, const char*);
+    reinterpret_cast<Ctor_t>(g_base + fact::kBSFixedStringCtor)(&out, s);
+}
+static void ReleaseEngineFixedString(EngineBSFixedString& s)
+{
+    if (!g_base || !s.data) return;
+    using Rel_t = void (*)(EngineBSFixedString*);
+    reinterpret_cast<Rel_t>(g_base + fact::kBSFixedStringRelease)(&s);
+    s.data = nullptr;
+}
+
+static bool SendWakeModEvent()   // true when the event was handed to the dispatcher
+{
+    const long game = InterlockedCompareExchange(&g_taskThread, 0, 0);
+    if (!game || long(GetCurrentThreadId()) != game) return false;
+    if (g_guardDepth != 0) return false;
+    if (!g_base || !g_modEventDispatcher || !g_bsWakeName.data) return false;
+    if (HandsOff() || TearingDown() || LoadScreenUp()) return false;
+    void* senderForm = g_prefix ? LookupForm(g_prefix + 0x835u, fact::kFormType_QUST) : nullptr;
+    if (!senderForm) senderForm = LookupForm(fact::kPlayerFormID, fact::kFormType_ACHR);
+    EngineBSFixedString emptyStr{ nullptr };
+    InitEngineFixedString(emptyStr, "");
+    SKSEModCallbackEventNative ev{};
+    ev.eventName = g_bsWakeName;
+    ev.strArg    = emptyStr;
+    ev.numArg    = 0.0f;
+    ev.sender    = senderForm;
+    using Send_t = void (*)(void*, const SKSEModCallbackEventNative*);
+    reinterpret_cast<Send_t>(g_base + fact::kModEventSendEvent)(g_modEventDispatcher, &ev);
+    ReleaseEngineFixedString(emptyStr);
+    return true;
+}
+
+static void FlushWakePending()
+{
+    if (InterlockedCompareExchange(&g_wakePending, 0, 0) == 0) return;
+    const long game = InterlockedCompareExchange(&g_taskThread, 0, 0);
+    if (!game || long(GetCurrentThreadId()) != game || g_guardDepth != 0) return;
+    if (InterlockedExchange(&g_wakePending, 0) == 0) return;
+    if (InterlockedCompareExchange(&g_wakeOutstanding, 0, 0) != 0 &&
+        DWORD(GetTickCount() - DWORD(InterlockedCompareExchange(&g_wakeSentTick, 0, 0))) < kWakeRearmMs) {
+        // One is out and unanswered: hold this one (see g_wakeOutstanding).
+        InterlockedExchange(&g_wakeHeldFlag, 1);
+        InterlockedIncrement(&g_wakeHeld);
+        return;
+    }
+    InterlockedExchange(&g_wakeHeldFlag, 0);
+    // THE FLAG GOES UP BEFORE THE SEND. An FC_WakeDone dispatched between the
+    // send and a flag written after it would be cleared first and the flag
+    // then set with no answer coming, holding every later wake for the full
+    // rearm. A send that did not happen takes the flag back down.
+    InterlockedExchange(&g_wakeSentTick, LONG(GetTickCount()));
+    InterlockedExchange(&g_wakeOutstanding, 1);
+    if (SendWakeModEvent()) InterlockedIncrement(&g_wakeSent);
+    else InterlockedExchange(&g_wakeOutstanding, 0);
+}
+
+static void WakeRun(void* self) { GuardedTask("Wake", [](void*) { FlushWakePending(); }, self); InterlockedExchange(&g_wakeTaskInFlight, 0); }
+static void WakeDispose(void* self) { InterlockedExchange(&g_wakeTaskInFlight, 0); delete static_cast<TaskObj*>(self); }
+static const TaskVtbl g_wakeVtbl = { WakeRun, WakeDispose };
+
+static void RequestWakeModEvent()
+{
+    InterlockedExchange(&g_wakePending, 1);
+    const long game = InterlockedCompareExchange(&g_taskThread, 0, 0);
+    if (game && long(GetCurrentThreadId()) == game && g_guardDepth == 0) {
+        FlushWakePending();
+    } else if (g_task && g_task->AddTask && InterlockedCompareExchange(&g_wakeTaskInFlight, 1, 0) == 0) {
+        g_task->AddTask(new TaskObj{ &g_wakeVtbl });
+    }
+}
+
+static u32 ModCallback_ProcessEvent(void*, const void* rawEv, void*)
+{
+    if (!rawEv || !Readable(rawEv, sizeof(SKSEModCallbackEventNative))) return 0;
+    const auto* ev = static_cast<const SKSEModCallbackEventNative*>(rawEv);
+    const char* ename = ev->eventName.data ? SafeStr(ev->eventName.data) : nullptr;
+    if (!ename || ename[0] != 'F' || ename[1] != 'C' || ename[2] != '_') return 0;
+    const char* sarg = ev->strArg.data ? SafeStr(ev->strArg.data) : "";
+    if (!sarg) sarg = "";
+    u32 senderFid = 0;
+    if (ev->sender && Readable(ev->sender, 0x20)) Peek(ev->sender, fact::kForm_formID, &senderFid);
+
+    if (!std::strcmp(ename, "FC_WakeDone")) {
+        // FL_Watch.OnFleshCoreWake ran to its end: the wake is answered. A wake
+        // held meanwhile is offered again from a task of its own, never sent
+        // from inside this dispatch.
+        InterlockedExchange(&g_wakeOutstanding, 0);
+        if (InterlockedExchange(&g_wakeHeldFlag, 0) != 0) {
+            InterlockedExchange(&g_wakePending, 1);
+            if (g_task && g_task->AddTask && InterlockedCompareExchange(&g_wakeTaskInFlight, 1, 0) == 0)
+                g_task->AddTask(new TaskObj{ &g_wakeVtbl });
+        }
+        return 0;
+    }
+    if (!std::strcmp(ename, "FC_Cmd")) {
+        if (sarg[0] && g_memIpcLockReady) {
+            EnterCriticalSection(&g_csMemIPC);
+            if (g_memCmds.size() < 256) g_memCmds.emplace_back(sarg);
+            LeaveCriticalSection(&g_csMemIPC);
+            if (g_task && g_task->AddTask && InterlockedCompareExchange(&g_hookInFlight, 1, 0) == 0)
+                g_task->AddTask(new TaskObj{ &g_hookVtbl });
+        }
+        return 0;
+    }
+    if (!std::strcmp(ename, "FC_NoKill")) {
+        if (senderFid && g_memIpcLockReady) {
+            EnterCriticalSection(&g_csMemIPC);
+            if (ev->numArg != 0.0f) g_memNoKill.insert(senderFid);
+            else g_memNoKill.erase(senderFid);
+            LeaveCriticalSection(&g_csMemIPC);
+        }
+        return 0;
+    }
+    if (!std::strcmp(ename, "FC_HoldDeath")) {
+        if (senderFid && g_memIpcLockReady) {
+            EnterCriticalSection(&g_csMemIPC);
+            if (ev->numArg > 0.0f) g_memDeathHeld[senderFid] = GetTickCount() + DWORD(ev->numArg * 1000.0f);
+            else g_memDeathHeld.erase(senderFid);
+            LeaveCriticalSection(&g_csMemIPC);
+        }
+        return 0;
+    }
+    if (!std::strcmp(ename, "FC_DressDone")) {
+        if (senderFid) {
+            const float narg = ev->numArg;
+            const int doneMask = (narg >= 0.5f) ? (int(narg + 0.5f) & 3) : 0;
+            if (TryEnterCriticalSection(&g_csBodies)) {
+                if (doneMask != 0) g_dressFinalMask[senderFid] |= doneMask;
+                for (std::size_t di = 0; di < g_dress.size(); ) {
+                    if (g_dress[di] == senderFid) g_dress.erase(g_dress.begin() + std::ptrdiff_t(di));
+                    else ++di;
+                }
+                g_dressNeed.erase(senderFid);
+                LeaveCriticalSection(&g_csBodies);
+            } else if (g_memIpcLockReady) {
+                EnterCriticalSection(&g_csMemIPC);
+                g_memDressDoneQ.emplace_back(senderFid, doneMask);
+                LeaveCriticalSection(&g_csMemIPC);
+                if (g_task && g_task->AddTask && InterlockedCompareExchange(&g_hookInFlight, 1, 0) == 0)
+                    g_task->AddTask(new TaskObj{ &g_hookVtbl });
+            }
+        }
+        return 0;
+    }
+    if (!std::strcmp(ename, "FC_SplatSet")) {
+        if (TryEnterCriticalSection(&g_csPanel)) {
+            const int on = (ev->numArg != 0.0f) ? 1 : 0;
+            g_panel.tog["bloodSplat"] = on;
+            g_cfg.bloodSplatter = on;
+            LeaveCriticalSection(&g_csPanel);
+        } else {
+            g_cfg.bloodSplatter = (ev->numArg != 0.0f) ? 1 : 0;
+        }
+        return 0;
+    }
+    if (!std::strcmp(ename, "FC_SplatPctSet")) {
+        const float narg = ev->numArg;
+        int pct = int(narg + (narg >= 0.0f ? 0.5f : -0.5f));
+        if (pct < 0) pct = 0;
+        else if (pct > 100) pct = 100;
+        bool saved = false;
+        if (TryEnterCriticalSection(&g_csPanel)) {
+            g_panel.num["bloodSplatPct"] = double(pct);
+            g_cfg.bloodSplatterPct = pct;
+            LeaveCriticalSection(&g_csPanel);
+            saved = true;
+        } else {
+            g_cfg.bloodSplatterPct = pct;
+        }
+        if (saved) PanelSave();
+        InterlockedExchange(&g_panelPushPending, 1);
+        RequestHookTick();
+        return 0;
+    }
+    if (!std::strcmp(ename, "FC_OverkillBonusSet")) {
+        const float narg = ev->numArg;
+        int pct = int(narg + (narg >= 0.0f ? 0.5f : -0.5f));
+        if (pct < 0) pct = 0;
+        else if (pct > 100) pct = 100;
+        g_cfg.fodderOverkillBonusPct = pct;
+        return 0;
+    }
+    if (!std::strcmp(ename, "FC_Dirty")) {
+        InterlockedExchange(&g_tablesDirtyFlag, 1);
+        return 0;
+    }
+    return 0;
+}
+
+static void RegisterModEventChannel()
+{
+    static bool s_done = false;
+    if (s_done || !g_msg || !g_msg->GetEventDispatcher || !g_base) return;
+    void* disp = g_msg->GetEventDispatcher(0); // kDispatcher_ModEvent == 0
+    if (!disp || !Readable(disp, 0x58)) {
+        Log("[IPC] SKSE ModEvent dispatcher unavailable");
+        return;
+    }
+    s_done = true;
+    InitEngineFixedString(g_bsWakeName, "FC_Wake");
+    g_modCbVtbl[0] = reinterpret_cast<void*>(&SinkDtor);
+    g_modCbVtbl[1] = reinterpret_cast<void*>(&ModCallback_ProcessEvent);
+    g_modCbSink.vtbl = g_modCbVtbl;
+    using Add_t = void (*)(void*, void*);
+    reinterpret_cast<Add_t>(g_base + fact::kAddEventSink)(disp, &g_modCbSink);
+    g_modEventDispatcher = disp;
+    Log("[IPC] SKSE in-memory ModEvent channel armed (FC_Wake / FC_Cmd / FC_DressDone)");
+}
+
+// NativeFunctionBase (0x50 header + inline param descriptors, NfNoopDtor avoids SimpleArray::deallocate)
+struct PapyrusVariableRaw {
+    std::uint64_t type; // 0=None, 1=Object, 2=String, 3=Int, 4=Float, 5=Bool
+    union {
+        std::int32_t        i;
+        float               f;
+        bool                b;
+        EngineBSFixedString s;
+        std::uint64_t       u;
+    } val;
+};
+struct NativeParamDesc {
+    EngineBSFixedString name;
+    std::uint64_t       type;
+};
+struct NativeFn {
+    void*               vtbl;                  // 00
+    std::uint32_t       pad08;                 // 08
+    volatile long       refCount;              // 0C
+    EngineBSFixedString fnName;                // 10
+    EngineBSFixedString className;             // 18
+    EngineBSFixedString stateName;             // 20
+    std::uint64_t       retType;               // 28 (2=String, 3=Int, 4=Float, 5=Bool)
+    NativeParamDesc*    descEntries;           // 30
+    std::uint16_t       paramCount;            // 38
+    std::uint16_t       totalEntries;          // 3A
+    std::uint32_t       pad3C;                 // 3C
+    bool                isStatic;              // 40 (true)
+    bool                callableFromTasklet;   // 41 (true)
+    bool                isLatent;              // 42 (false)
+    std::uint8_t        pad43;                 // 43
+    std::uint32_t       userFlags;             // 44 (0)
+    EngineBSFixedString docString;             // 48
+    int                 kind;                  // 50 (dispatch selector)
+    NativeParamDesc     params[2];             // 58 (inline param descriptors)
+};
+static_assert(offsetof(NativeFn, fnName) == 0x10, "NativeFn::_name offset");
+static_assert(offsetof(NativeFn, retType) == 0x28, "NativeFn::_retType offset");
+static_assert(offsetof(NativeFn, descEntries) == 0x30, "NativeFn::_descTable offset");
+static_assert(offsetof(NativeFn, paramCount) == 0x38, "NativeFn::_paramCount offset");
+static_assert(offsetof(NativeFn, isStatic) == 0x40, "NativeFn::_isStatic offset");
+static_assert(offsetof(NativeFn, docString) == 0x48, "NativeFn::_docString offset");
+
+enum {
+    kNF_IsReady = 1,
+    kNF_GetPresetId,
+    kNF_GetPresetBase,
+    kNF_GetBloodSplatter,
+    kNF_GetVersionString,
+    kNF_PopWoundBatch,
+    kNF_PopEvent,
+    kNF_PopDressLine,
+    kNF_PopReviveLine,
+    kNF_HasBody,
+    kNF_IsBuiltWhole,
+    kNF_GetWoundedCellCount,
+    kNF_IsDismembered,
+    kNF_GetPartsLostMask,
+    kNF_GetPartsBornMask,
+    kNF_GetPartIntegrityPct,
+    kNF_GetPartLayersGoneMask,
+    kNF_GetOwnFillFrac,
+    kNF_HasSkullFill,
+    kNF_GetBodyRemainStr,
+    kNF_GetBloodSplatterPct,
+    kNF_SetBloodSplatterPct,
+    kNF_GetFodderOverkillPct,
+    kNF_SetFodderOverkillPct,
+    kNF_SetOverkillBonusPct,
+};
+
+static void* g_nativeNfVtbl[23] = {};
+static bool  g_nativeNfVtblReady = false;
+static void* NfNoopDtor(void* self, unsigned) { return self; }
+static bool  NfHasStub(const void*) { return true; }
+
+static void SetVarBool(PapyrusVariableRaw* r, bool v)
+{
+    if (!r) return;
+    if (r->type == 2u) ReleaseEngineFixedString(r->val.s);
+    r->type = 5u; // kBool
+    r->val.u = 0;
+    r->val.b = v;
+}
+static void SetVarInt(PapyrusVariableRaw* r, std::int32_t v)
+{
+    if (!r) return;
+    if (r->type == 2u) ReleaseEngineFixedString(r->val.s);
+    r->type = 3u; // kInt
+    r->val.u = 0;
+    r->val.i = v;
+}
+static void SetVarFloat(PapyrusVariableRaw* r, float v)
+{
+    if (!r) return;
+    if (r->type == 2u) ReleaseEngineFixedString(r->val.s);
+    r->type = 4u; // kFloat
+    r->val.u = 0;
+    r->val.f = v;
+}
+static void SetVarString(PapyrusVariableRaw* r, const std::string& s)
+{
+    if (!r) return;
+    if (r->type == 2u) ReleaseEngineFixedString(r->val.s);
+    r->type = 2u; // kString
+    r->val.u = 0;
+    InitEngineFixedString(r->val.s, s.c_str());
+}
+static void SetVarNone(PapyrusVariableRaw* r)
+{
+    if (!r) return;
+    if (r->type == 2u) ReleaseEngineFixedString(r->val.s);
+    r->type = 0u; // kNone
+    r->val.u = 0;
+}
+
+static bool ReadIntArg(const void* frame, u32 idx, std::int32_t& out)
+{
+    out = 0;
+    if (!frame || !g_base || !Readable(frame, 0x40)) return false;
+    void* parentStack = *reinterpret_cast<void* const*>(frame);
+    if (!parentStack) return false;
+    using GetPage_t = u32 (*)(void*, const void*);
+    using GetVar_t  = const PapyrusVariableRaw* (*)(void*, const void*, u32, u32);
+    const u32 page = reinterpret_cast<GetPage_t>(g_base + fact::kStackGetPageForFrame)(parentStack, frame);
+    const PapyrusVariableRaw* arg = reinterpret_cast<GetVar_t>(g_base + fact::kStackGetStackFrameVariable)(parentStack, frame, idx, page);
+    if (!arg || !Readable(arg, sizeof(PapyrusVariableRaw)) || arg->type != 3u) return false;
+    out = arg->val.i;
+    return true;
+}
+
+static bool CopyActorMirrorSnap(u32 fid, ActorMirrorSnap& out)
+{
+    if (!fid || !g_mirrorLockReady) return false;
+    bool found = false;
+    EnterCriticalSection(&g_csMirror);
+    auto it = g_actorMirror.find(fid);
+    if (it != g_actorMirror.end()) {
+        out = it->second;
+        found = true;
+    }
+    LeaveCriticalSection(&g_csMirror);
+    return found;
+}
+
+static bool NfMarshallAndDispatch(const NativeFn* self, void*, void*, u32, PapyrusVariableRaw* retVal, const void* frame)
+{
+    if (!self || !retVal) return false;
+    switch (self->kind) {
+        case kNF_IsReady:
+            SetVarBool(retVal, g_cfg.ok);
+            return true;
+        case kNF_GetPresetId: {
+            int pid = 50;
+            if (TryEnterCriticalSection(&g_csPanel)) {
+                auto it = g_panel.combat.find("preset.id");
+                if (it != g_panel.combat.end()) pid = int(it->second);
+                else {
+                    auto onIt = g_panel.combat.find("on");
+                    pid = (onIt != g_panel.combat.end() && onIt->second != 0.0) ? 50 : 0;
+                }
+                LeaveCriticalSection(&g_csPanel);
+            }
+            SetVarInt(retVal, pid);
+            return true;
+        }
+        case kNF_GetPresetBase: {
+            int pbase = 50;
+            if (TryEnterCriticalSection(&g_csPanel)) {
+                auto it = g_panel.combat.find("preset.base");
+                if (it != g_panel.combat.end()) pbase = int(it->second);
+                else {
+                    auto onIt = g_panel.combat.find("on");
+                    pbase = (onIt != g_panel.combat.end() && onIt->second != 0.0) ? 50 : 0;
+                }
+                LeaveCriticalSection(&g_csPanel);
+            }
+            SetVarInt(retVal, pbase);
+            return true;
+        }
+        case kNF_GetBloodSplatter:
+            SetVarBool(retVal, g_cfg.bloodSplatter != 0);
+            return true;
+        case kNF_GetVersionString:
+            SetVarString(retVal, FC_VERSION);
+            return true;
+        case kNF_PopWoundBatch: {
+            std::string s;
+            if (g_memIpcLockReady) {
+                EnterCriticalSection(&g_csMemIPC);
+                if (!g_memWounds.empty()) { s = std::move(g_memWounds.front()); g_memWounds.pop_front(); }
+                LeaveCriticalSection(&g_csMemIPC);
+            }
+            SetVarString(retVal, s);
+            return true;
+        }
+        case kNF_PopEvent: {
+            std::string s;
+            if (g_memIpcLockReady) {
+                EnterCriticalSection(&g_csMemIPC);
+                if (!g_memEvents.empty()) { s = std::move(g_memEvents.front()); g_memEvents.pop_front(); }
+                LeaveCriticalSection(&g_csMemIPC);
+            }
+            SetVarString(retVal, s);
+            return true;
+        }
+        case kNF_PopDressLine: {
+            std::string s;
+            if (g_memIpcLockReady) {
+                EnterCriticalSection(&g_csMemIPC);
+                s.swap(g_memDressLine);
+                LeaveCriticalSection(&g_csMemIPC);
+            }
+            SetVarString(retVal, s);
+            return true;
+        }
+        case kNF_PopReviveLine: {
+            std::string s;
+            if (g_memIpcLockReady) {
+                EnterCriticalSection(&g_csMemIPC);
+                s.swap(g_memReviveLine);
+                LeaveCriticalSection(&g_csMemIPC);
+            }
+            SetVarString(retVal, s);
+            return true;
+        }
+        case kNF_HasBody: {
+            std::int32_t rawFid = 0;
+            ActorMirrorSnap snap{};
+            const bool ok = ReadIntArg(frame, 0, rawFid) && CopyActorMirrorSnap(u32(rawFid), snap) && snap.hasBody;
+            SetVarBool(retVal, ok);
+            return true;
+        }
+        case kNF_IsBuiltWhole: {
+            std::int32_t rawFid = 0;
+            ActorMirrorSnap snap{};
+            const bool ok = ReadIntArg(frame, 0, rawFid) && CopyActorMirrorSnap(u32(rawFid), snap) &&
+                            snap.hasBody && snap.woundedCells == 0 && snap.partsLost == 0 && !snap.headOff;
+            SetVarBool(retVal, ok);
+            return true;
+        }
+        case kNF_GetWoundedCellCount: {
+            std::int32_t rawFid = 0;
+            ActorMirrorSnap snap{};
+            const bool ok = ReadIntArg(frame, 0, rawFid) && CopyActorMirrorSnap(u32(rawFid), snap);
+            SetVarInt(retVal, ok ? std::int32_t(snap.woundedCells) : 0);
+            return true;
+        }
+        case kNF_IsDismembered: {
+            std::int32_t rawFid = 0;
+            ActorMirrorSnap snap{};
+            const bool ok = ReadIntArg(frame, 0, rawFid) && CopyActorMirrorSnap(u32(rawFid), snap) &&
+                            (snap.partsLost != 0 || snap.headOff);
+            SetVarBool(retVal, ok);
+            return true;
+        }
+        case kNF_GetPartsLostMask: {
+            std::int32_t rawFid = 0;
+            ActorMirrorSnap snap{};
+            const bool ok = ReadIntArg(frame, 0, rawFid) && CopyActorMirrorSnap(u32(rawFid), snap);
+            SetVarInt(retVal, ok ? std::int32_t(snap.partsLost) : 0);
+            return true;
+        }
+        case kNF_GetPartsBornMask: {
+            std::int32_t rawFid = 0;
+            ActorMirrorSnap snap{};
+            const bool ok = ReadIntArg(frame, 0, rawFid) && CopyActorMirrorSnap(u32(rawFid), snap);
+            SetVarInt(retVal, ok ? std::int32_t(snap.partsBorn) : 0);
+            return true;
+        }
+        case kNF_GetPartIntegrityPct: {
+            std::int32_t rawFid = 0, partIdx = 0;
+            ActorMirrorSnap snap{};
+            float pct = 0.0f;
+            if (ReadIntArg(frame, 0, rawFid) && ReadIntArg(frame, 1, partIdx) &&
+                CopyActorMirrorSnap(u32(rawFid), snap) && snap.hasBody &&
+                partIdx > 0 && partIdx < int(flesh::Part::Count)) {
+                if (snap.partsLost & (1u << unsigned(partIdx))) {
+                    pct = 0.0f;
+                } else if (snap.bornPer[partIdx] > 0) {
+                    pct = std::min(100.0f, 100.0f * float(snap.remainPer[partIdx]) / float(snap.bornPer[partIdx]));
+                } else if (snap.partsBorn & (1u << unsigned(partIdx))) {
+                    pct = 100.0f;
+                }
+            }
+            SetVarFloat(retVal, pct);
+            return true;
+        }
+        case kNF_GetPartLayersGoneMask: {
+            std::int32_t rawFid = 0, partIdx = 0;
+            ActorMirrorSnap snap{};
+            std::int32_t mask = 0;
+            if (ReadIntArg(frame, 0, rawFid) && ReadIntArg(frame, 1, partIdx) &&
+                CopyActorMirrorSnap(u32(rawFid), snap) &&
+                partIdx > 0 && partIdx < int(flesh::Part::Count)) {
+                mask = std::int32_t(snap.partLayersGone[partIdx]);
+            }
+            SetVarInt(retVal, mask);
+            return true;
+        }
+        case kNF_GetOwnFillFrac: {
+            std::int32_t rawFid = 0;
+            ActorMirrorSnap snap{};
+            const bool ok = ReadIntArg(frame, 0, rawFid) && CopyActorMirrorSnap(u32(rawFid), snap);
+            SetVarFloat(retVal, ok ? snap.ownFillFrac : 0.0f);
+            return true;
+        }
+        case kNF_HasSkullFill: {
+            std::int32_t rawFid = 0;
+            ActorMirrorSnap snap{};
+            const bool ok = ReadIntArg(frame, 0, rawFid) && CopyActorMirrorSnap(u32(rawFid), snap) &&
+                            snap.hasBody && !snap.beastNoSkull && ((snap.partsBorn & (1u << unsigned(flesh::Part::Head))) != 0);
+            SetVarBool(retVal, ok);
+            return true;
+        }
+        case kNF_GetBodyRemainStr: {
+            std::int32_t rawFid = 0;
+            ActorMirrorSnap snap{};
+            const bool ok = ReadIntArg(frame, 0, rawFid) && CopyActorMirrorSnap(u32(rawFid), snap);
+            SetVarString(retVal, ok ? snap.remainStr : std::string());
+            return true;
+        }
+        case kNF_GetBloodSplatterPct:
+            SetVarInt(retVal, std::int32_t(g_cfg.bloodSplatterPct));
+            return true;
+        case kNF_SetBloodSplatterPct: {
+            std::int32_t pct = 100;
+            if (ReadIntArg(frame, 0, pct)) {
+                if (pct < 0) pct = 0;
+                else if (pct > 100) pct = 100;
+                {
+                    Guard lk(&g_csPanel);
+                    g_panel.num["bloodSplatPct"] = double(pct);
+                    g_cfg.bloodSplatterPct = int(pct);
+                }
+                PanelSave();
+                InterlockedExchange(&g_panelPushPending, 1);
+                RequestHookTick();
+            }
+            SetVarNone(retVal);
+            return true;
+        }
+        case kNF_GetFodderOverkillPct:
+            SetVarInt(retVal, std::int32_t(g_cfg.fodderOverkillPct));
+            return true;
+        case kNF_SetFodderOverkillPct: {
+            std::int32_t pct = 10;
+            if (ReadIntArg(frame, 0, pct)) {
+                if (pct < 0) pct = 0;
+                else if (pct > 100) pct = 100;
+                {
+                    Guard lk(&g_csPanel);
+                    g_panel.num["fodderOverkillPct"] = double(pct);
+                    g_cfg.fodderOverkillPct = int(pct);
+                }
+                PanelSave();
+                InterlockedExchange(&g_panelPushPending, 1);
+                RequestHookTick();
+            }
+            SetVarNone(retVal);
+            return true;
+        }
+        case kNF_SetOverkillBonusPct: {
+            std::int32_t pct = 0;
+            if (ReadIntArg(frame, 0, pct)) {
+                if (pct < 0) pct = 0;
+                else if (pct > 100) pct = 100;
+                g_cfg.fodderOverkillBonusPct = int(pct);
+            }
+            SetVarNone(retVal);
+            return true;
+        }
+        default:
+            return false;
+    }
+}
+
+static void BindNative(void* vm, const char* name, std::uint64_t retType, int kind,
+                       const char* p0 = nullptr, const char* p1 = nullptr)
+{
+    auto* fn = static_cast<NativeFn*>(std::calloc(1, sizeof(NativeFn)));
+    if (!fn) return;
+    fn->vtbl = g_nativeNfVtbl;
+    fn->refCount = 1;
+    InitEngineFixedString(fn->fnName, name);
+    InitEngineFixedString(fn->className, "FL_Native");
+    InitEngineFixedString(fn->stateName, "");
+    InitEngineFixedString(fn->docString, "");
+    fn->retType = retType;
+    std::uint16_t np = 0;
+    if (p0) { InitEngineFixedString(fn->params[np].name, p0); fn->params[np].type = 3u; ++np; }
+    if (p1) { InitEngineFixedString(fn->params[np].name, p1); fn->params[np].type = 3u; ++np; }
+    fn->paramCount = np;
+    fn->totalEntries = np;
+    fn->descEntries = np ? fn->params : nullptr;
+    fn->isStatic = true;
+    fn->callableFromTasklet = true;
+    fn->isLatent = false;
+    fn->userFlags = 0;
+    fn->kind = kind;
+    void* const* vmVtbl = *reinterpret_cast<void* const* const*>(vm);
+    using Bind_t = bool (*)(void*, void*);
+    reinterpret_cast<Bind_t>(vmVtbl[0x18])(vm, fn);
+}
+
+static bool RegisterPapyrusNatives(void* vm)
+{
+    if (!vm || !g_base) return false;
+    const void* srcVtbl = reinterpret_cast<const void*>(g_base + fact::kVT_NativeFunctionBase);
+    if (!Readable(srcVtbl, sizeof(g_nativeNfVtbl))) {
+        Log("[PAPYRUS] NativeFunctionBase vtable unreadable -- skipping native bind");
+        return false;
+    }
+    if (!g_nativeNfVtblReady) {
+        std::memcpy(g_nativeNfVtbl, srcVtbl, sizeof(g_nativeNfVtbl));
+        g_nativeNfVtbl[0x00] = reinterpret_cast<void*>(&NfNoopDtor);
+        g_nativeNfVtbl[0x15] = reinterpret_cast<void*>(&NfHasStub);
+        g_nativeNfVtbl[0x16] = reinterpret_cast<void*>(&NfMarshallAndDispatch);
+        g_nativeNfVtblReady = true;
+    }
+    BindNative(vm, "IsReady",               5u, kNF_IsReady);
+    BindNative(vm, "GetPresetId",           3u, kNF_GetPresetId);
+    BindNative(vm, "GetPresetBase",         3u, kNF_GetPresetBase);
+    BindNative(vm, "GetBloodSplatter",      5u, kNF_GetBloodSplatter);
+    BindNative(vm, "GetVersionString",      2u, kNF_GetVersionString);
+    BindNative(vm, "PopWoundBatch",         2u, kNF_PopWoundBatch);
+    BindNative(vm, "PopEvent",              2u, kNF_PopEvent);
+    BindNative(vm, "PopDressLine",          2u, kNF_PopDressLine);
+    BindNative(vm, "PopReviveLine",         2u, kNF_PopReviveLine);
+    BindNative(vm, "HasBody",               5u, kNF_HasBody,               "aiActorFid");
+    BindNative(vm, "IsBuiltWhole",          5u, kNF_IsBuiltWhole,          "aiActorFid");
+    BindNative(vm, "GetWoundedCellCount",   3u, kNF_GetWoundedCellCount,   "aiActorFid");
+    BindNative(vm, "IsDismembered",         5u, kNF_IsDismembered,         "aiActorFid");
+    BindNative(vm, "GetPartsLostMask",      3u, kNF_GetPartsLostMask,      "aiActorFid");
+    BindNative(vm, "GetPartsBornMask",      3u, kNF_GetPartsBornMask,      "aiActorFid");
+    BindNative(vm, "GetPartIntegrityPct",   4u, kNF_GetPartIntegrityPct,   "aiActorFid", "aiPartIdx");
+    BindNative(vm, "GetPartLayersGoneMask", 3u, kNF_GetPartLayersGoneMask, "aiActorFid", "aiPartIdx");
+    BindNative(vm, "GetOwnFillFrac",        4u, kNF_GetOwnFillFrac,        "aiActorFid");
+    BindNative(vm, "HasSkullFill",          5u, kNF_HasSkullFill,          "aiActorFid");
+    BindNative(vm, "GetBodyRemainStr",      2u, kNF_GetBodyRemainStr,      "aiActorFid");
+    BindNative(vm, "GetBloodSplatterPct",   3u, kNF_GetBloodSplatterPct);
+    BindNative(vm, "SetBloodSplatterPct",   0u, kNF_SetBloodSplatterPct,   "aiPct");
+    BindNative(vm, "GetFodderOverkillPct",  3u, kNF_GetFodderOverkillPct);
+    BindNative(vm, "SetFodderOverkillPct",  0u, kNF_SetFodderOverkillPct,  "aiPct");
+    BindNative(vm, "SetOverkillBonusPct",   0u, kNF_SetOverkillBonusPct,   "aiPct");
+    Log("[PAPYRUS] bound 25 tasklet-safe native functions on FL_Native");
+    return true;
+}
+
 static void OnMessageBody(SKSEMessage* msg);
 static void OnMessage(SKSEMessage* msg)
 {
+#if defined(__cpp_exceptions) || defined(__EXCEPTIONS)
     static volatile long said = 0;
     try { OnMessageBody(msg); }
     catch (const std::exception& e) { if (InterlockedIncrement(&said) <= 32) Log("[SKSE] OnMessage: C++ exception '%s'", e.what()); }
     catch (...) { if (InterlockedIncrement(&said) <= 32) Log("[SKSE] OnMessage: C++ exception (not std)"); }
+#else
+    OnMessageBody(msg);
+#endif
     LogFlush();
 }
 static void OnMessageBody(SKSEMessage* msg)
 {
     if (!msg) return;
     if (msg->type == kMessage_PreLoadGame) {
+        ClearHitStopNow();
         g_profSavePreLoadStartMs = NowMs();
         g_profSaveRevertMs       = 0.0;
         g_profSaveLoadCbStartMs  = 0.0;
@@ -29045,6 +32085,7 @@ static void OnMessageBody(SKSEMessage* msg)
         return;
     }
     if (msg->type == kMessage_PostLoadGame || msg->type == kMessage_NewGame) {
+        ClearHitStopNow();
         const double profPostStartMs = NowMs();
         // A FAILED LOAD IS NOT A LOAD.
         const bool loadOk = (msg->type == kMessage_NewGame) || (msg->data != nullptr);
@@ -29218,10 +32259,12 @@ static void OnMessageBody(SKSEMessage* msg)
     TruncateMailbox("Data\\SKSE\\Plugins\\FleshCore.bodies.txt");
     TruncateMailbox("Data\\SKSE\\Plugins\\FleshCore.triggers.txt");
     TruncateMailbox("Data\\SKSE\\Plugins\\FleshCore.refused.txt");
+    TruncateMailbox("Data\\SKSE\\Plugins\\FleshCore.voice.txt");
     ProbeSetup();
     const double tFill0 = NowMs();
     LoadFill();
     g_profLoadFillMs = NowMs() - tFill0;
+    RegisterModEventChannel();
     if (LoadConfig()) {
         RegisterSinks();
         PanelInit();
@@ -29366,6 +32409,9 @@ extern "C" __declspec(dllexport) bool SKSEPlugin_Load(const SKSEInterface* skse)
     g_task = static_cast<SKSETaskInterface*>(skse->QueryInterface(kInterface_Task));
     if (!g_task)
         Log("  no task interface -- a body rebuilt after a load waits for the next blow");
+    if (auto* pap = static_cast<SKSEPapyrusInterface*>(skse->QueryInterface(kInterface_Papyrus))) {
+        if (pap->Register) pap->Register(&RegisterPapyrusNatives);
+    }
     g_ser = static_cast<SKSESerializationInterface*>(
         skse->QueryInterface(kInterface_Serialization));
     if (!g_ser) {
@@ -29396,6 +32442,10 @@ BOOL APIENTRY DllMain(HMODULE h, DWORD reason, LPVOID)
         InitializeCriticalSection(&g_csPanel);
         InitializeCriticalSection(&g_csOut);
         InitializeCriticalSection(&g_csProf);
+        InitializeCriticalSection(&g_csMirror);
+        InitializeCriticalSection(&g_csMemIPC);
+        g_mirrorLockReady = true;
+        g_memIpcLockReady = true;
         g_locksReady = true;
         g_profLockReady = true;
         g_hModule = h; DisableThreadLibraryCalls(h);

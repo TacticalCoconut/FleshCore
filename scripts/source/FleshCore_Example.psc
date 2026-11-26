@@ -35,18 +35,20 @@ Function TakeThemApart(Actor target)
         Fallback(target)
         Return
     EndIf
-    If !FL_Api.Targetable(target)
-        Debug.Trace("[Example] FleshCore will not take them (reason " + FL_Api.WhyRefused(target) + ") -- fallback")
+    ; Bridge 2 (External Systems Bridge): checks universal eligibility plus
+    ; the External Systems player switch (`who.modPlayer`), independent of
+    ; whether ordinary weapon hits are allowed to cut the player in combat.
+    If !FL_Api.SystemTargetable(target)
+        Debug.Trace("[Example] FleshCore system bridge declined them (" + FL_Api.WhyNotSystem(target) + ") -- fallback")
         Fallback(target)
         Return
     EndIf
-    ; Ask before using anything optional. "wound" is in every build that has
-    ; FL_Api at all; a token that is NOT there is a feature this build lacks.
-    If !FL_Api.Has("wound")
+    ; Ask before using anything optional. "bridges" marks the two-bridge surface.
+    If !FL_Api.Has("bridges")
         Fallback(target)
         Return
     EndIf
-    If FL_Api.Wound(target, "decapitate")
+    If FL_Api.SystemWound("Example", target, "decapitate")
         Debug.Trace("[Example] asked FleshCore to behead " + target + " -- the FleshCore_Wound event says what happened")
     Else
         Fallback(target)
@@ -120,8 +122,19 @@ Function TakeTheirLeg(Actor target)
         Fallback(target)
         Return
     EndIf
-    Int ticket = FL_Api.WoundPart("Example", target, "slabz", 5.0, 3, "lthigh", "centre")
-    Debug.Trace("[Example] asked for their left thigh -- ticket " + ticket + " (" + FL_Api.CodeName(ticket) + ")")
+    Int ticket = FL_Api.SystemWoundPart("Example", target, "slabz", 5.0, 3, "lthigh", "centre")
+    Debug.Trace("[Example] system bridge asked for their left thigh -- ticket " + ticket + " (" + FL_Api.CodeName(ticket) + ")")
+EndFunction
+
+Function CombatCutTheirLeg(Actor target)
+    {BRIDGE 1 (COMBAT BRIDGE): for combat mods whose wounds should obey the
+     HQ's Combat player toggle, player layer hierarchy, vulnhp, and scalars.}
+    If !Game.IsPluginInstalled("FleshCore.esp") || !FL_Api.CombatTargetable(target)
+        Debug.Trace("[Example] combat bridge declined " + target + " (" + FL_Api.WhyNotCombat(target) + ")")
+        Return
+    EndIf
+    Int ticket = FL_Api.CombatWoundPart("Example", target, "slabz", 5.0, 3, "lthigh", "centre")
+    Debug.Trace("[Example] combat bridge asked for their left thigh -- ticket " + ticket + " (" + FL_Api.CodeName(ticket) + ")")
 EndFunction
 
 Event OnFLDone(String eventName, String strArg, Float numArg, Form sender)

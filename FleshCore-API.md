@@ -1,6 +1,6 @@
 # FleshCore - developer reference
 
-*FleshCore Beta v0.1.1 · this file ships in the mod folder*
+*FleshCore Beta v0.2.0 · this file ships in the mod folder*
 
 FleshCore voxelises playable-race actors into lattices of cells,
 forged at runtime from each actor's own meshes, and removes the cells a wound reaches; the
@@ -14,17 +14,28 @@ spells for testing, and other mods call `FL_Api`.
 | **Required** | Skyrim SE/AE 1.6.1170, Steam version only (not 1.7.x, older 1.6 builds, GOG or SE 1.5.97) · SKSE64 2.2.6, Steam build (not 2.3.x, which is for 1.7.x, and not the GOG build) · Address Library for SKSE Plugins (for PapyrusUtil, powerofthree's Papyrus Extender and PrismaUI; FleshCore's DLL does not use it) · XPMSSE (FleshCore's bodies use its bones) · PapyrusUtil · powerofthree's Papyrus Extender · PrismaUI (the HQ, the mod's own menu) · SkyUI (the MCM) · RaceMenu (marks on skin) |
 | **Body meshes** | FleshCore ships its own body, hands and feet meshes, built for CBBE 3BA and HIMBO; the female body also uses textures from CBBE 3BA and from a CBBE 3BA add-on that FleshCore does not include. Where these meshes win the file conflicts with the installed body mod and BodySlide output, they replace those meshes; naked bodies need them to win for the built-in anatomy to show. See the README's **Body Mods** section. |
 | **Detected, optional** | Acheron · Dismembering Framework |
+| **Optional, for the grinder spells only** | Leash Framework 1.1.8 (`Leash.esm` and its SKSE plugin). It is not a master: without it FleshCore loads and runs, and the two grinder spells are not given. |
 | **Masters** | `Skyrim.esm` only. FleshCore is not ESL-flagged. |
 
 ## Using it from your mod - the whole pattern
 
 ```papyrus
-If Game.IsPluginInstalled("FleshCore.esp") && FL_Api.CoreActive() && FL_Api.Targetable(target)
-    FL_Api.Wound(target, "decapitate")
+; External Systems Bridge (traps, hazards, scripted events -- independent of combat player gates):
+If Game.IsPluginInstalled("FleshCore.esp") && FL_Api.SystemTargetable(target)
+    FL_Api.SystemWound("MyMod", target, "decapitate")
 Else
     ; whatever you did before FleshCore
 EndIf
 ```
+
+## Two separate integration bridges: Combat vs External Systems
+
+FleshCore splits player eligibility and wound routing into **two independent bridges** so combat gameplay and external mod mechanics never block or override each other:
+
+1. **Bridge 1 — The Combat Bridge (`CombatTargetable`, `CombatWound*`, `AddTrigger*`)**:
+   Used by weapon blows, arrows, bashes, hostile combat magic, rolling damage windows, and combat mods. Governed by the HQ's **Player Character (Combat Hits)** switch (`who.player`, default **off**), progressive player layer unlocks (`player.skin` -> `flesh` -> `bones` -> `sever`), `vulnhp` health gates, and per-actor scalars.
+2. **Bridge 2 — The External Systems Bridge (`SystemTargetable`, `SystemWound*`, `SystemCast`, `SystemDetonate`)**:
+   Used by external mods, traps, environmental hazards, and scripted mechanics. Governed by its own separate HQ switch — **Player Character (External Mods & Systems)** (`who.modPlayer`, default **on**) — with full anatomical layers and full severing even while combat hits on the player remain off.
 
 Three rules make the dependency **soft**:
 
@@ -42,17 +53,30 @@ a registry rule, a trigger row and a `WhyNot` line - about a hundred and twenty 
 | function | returns | meaning |
 |---|---|---|
 | `IsInstalled()` | Bool | `FleshCore.esp` is in the load order |
-| `VersionString()` | String | the engine's version, e.g. `"0.1.1 Beta"`; `""` if the SKSE plugin did not load |
+| `VersionString()` | String | the engine's version, e.g. `"0.2.0 Beta"`, queried from `FL_Native.GetVersionString()`, with `FleshCore.version.txt` as the fallback; `""` if the SKSE plugin did not load |
 | `CoreActive()` | Bool | the engine is armed. False for the first second or two of a session |
 | `Has(String feature)` | Bool | this build carries the feature token - see below |
 | `Features()` | String | all tokens, space-separated |
-| `Targetable(Actor)` | Bool | FleshCore will take this actor: a playable race, an adult vampire race of `Skyrim.esm` or the Afflicted, either sex, never a child |
-| `WhyRefused(Actor)` | Int | `0` accepted · `1` no base record · `2` a race FleshCore does not cut, or a child (child race, `IsChild()` or child voice type) · `3` record names no sex |
+| `Targetable(Actor)` | Bool | universal actor eligibility: a playable race, an adult vampire race of `Skyrim.esm` or the Afflicted, either sex, never a child |
+| `CombatTargetable(Actor)` / `WhyNotCombat(Actor)` | Bool / String | **Bridge 1 (Combat)**: eligible right now under combat rules (`who.player`, player layer mask, `vulnhp`, `immune`) |
+| `SystemTargetable(Actor)` / `WhyNotSystem(Actor)` | Bool / String | **Bridge 2 (External Systems)**: eligible right now for external mods and scripted systems (`who.modPlayer`, `immune`) |
+| `PlayerCombatEnabled()` / `PlayerSystemEnabled()` | Bool | whether the player is currently enabled on Bridge 1 (Combat) or Bridge 2 (External Systems) |
+| `SetSystemTargetOverride(Actor, Bool, caller, prio = 100)` / `ClearSystemTargetOverride(Actor, caller)` | - | set or withdraw a temporary per-session External Systems Bridge override (`systemtarget` registry key) |
+| `WhyRefused(Actor)` | Int | `0` accepted · `1` no base record · `2` a race FleshCore does not cut, or a child (child race, `IsChild()` or child voice type), or a Next-Gen Decapitations standalone head · `3` record names no sex |
 | `Wound(Actor, String kind)` | Bool | cast a named wound; true = cast, **not** taken (the event says) |
 | `Restore(Actor)` | Bool | put every piece back |
 | `Cast(Actor, Int localId)` | Bool | any FleshCore spell by local id, source and target both the actor |
-| `SetNoKill(Actor, Bool)` | - | add / remove an actor from the never-kill list |
+| `Targetable` / `WhyRefused` | | playable races, adult vampire races, Afflicted, and dynamic `0xFF......` actors (`RG 2`); never children, beast-race skulls exempted (`HasSkullFill == false`), NGD standalone heads refused |
+| `SetNoKill(Actor, Bool)` | - | add / remove an actor from the never-kill list (writes `FleshCore.nokill.txt` and sends `FC_NoKill` immediately) |
 | `NoKill(Actor)` | Bool | whether they are in it |
+| `HoldDeath(Actor, Float seconds = 10.0)` / `ReleaseDeath(Actor)` | - | hold or release in-memory death verdicts for `Actor` (`FC_HoldDeath`) |
+| `GetPresetId()` / `GetPresetBase()` | Int | active Combat Intensity preset (`-1` = Custom, `0..100`) and last applied base (`0..100`) from DLL memory |
+| `GetBloodSplatter()` / `SetBloodSplatter(Bool)` | Bool / - | read or toggle blood decals/pools/chunk coats in DLL memory (`FC_SplatSet`) |
+| `HasBody(Actor)` / `IsBuiltWhole(Actor)` | Bool | **0 ms `FL_Native` mirror**: whether the DLL holds a lattice for them; whether they are intact |
+| `GetWoundedCellCount(Actor)` / `IsDismembered(Actor)` | Int / Bool | **0 ms `FL_Native` mirror**: live wounded cell count; whether any part is severed |
+| `GetPartsLostMask(Actor)` / `GetPartsBornMask(Actor)` | Int | **0 ms `FL_Native` mirror**: bitmasks of lost / born `PartBit` indices (`1 << idx`) |
+| `GetPartIntegrityPct(Actor, Int partIdx)` / `GetPartLayersGoneMask(Actor, Int partIdx)` | Float / Int | **0 ms `FL_Native` mirror**: integrity `%` (`0..100`) and layers-gone mask (`0x1` skin, `0x2` fat, `0x4` muscle/brain, `0x8` bone) for `partIdx` (`1..15`) |
+| `GetOwnFillFrac(Actor)` / `HasSkullFill(Actor)` / `GetBodyRemainStr(Actor)` | Float / Bool / String | **0 ms `FL_Native` mirror**: own baked fill fraction (`0..1`), skull fill presence (false on beast races), and remaining-parts summary |
 | `SetInt(Actor, String key, Int value, String caller, Int prio = 0)` | - | set one registry rule for one actor - see below |
 | `ClearKey(Actor, String key, String caller)` | - | withdraw this caller's rule; other callers' stand |
 | `GetInt(Actor, String key)` | Int | the winning value, `-1` if no one set one |
@@ -64,8 +88,12 @@ a registry rule, a trigger row and a `WhyNot` line - about a hundred and twenty 
 | `Triggers(caller)` | String | your rows, one per line |
 | `AddTriggerForEffect(caller, scope, MagicEffect, kind, thr, columns, prio = 0)` / `AddTriggerForKeyword(caller, scope, Keyword, kind, thr, columns, prio = 0)` | Int | rows against one effect (`mgef:`) or a keyword on a weapon or effect (`kw:`) |
 | **Commands** | | every one returns a **ticket** (> 0) answered by `FL_Done`, or a negative code |
-| `WoundPart(caller, Actor, form, size, depth, part, anchor = "centre", nokill = false)` | Int | a wound on one named part, no record in the plugin |
-| `WoundEx(caller, Actor, columns)` / `WoundAt(caller, Actor, x, y, z, columns)` | Int | the thirteen columns; at a world point |
+| `CombatWoundPart` / `CombatWoundEx` / `CombatWoundAt` | Int | **Bridge 1 (Combat)** commands (`combatwound`, `combatwoundat`): obey `who.*`, player combat layers/sever, `vulnhp`, and scalars |
+| `SystemWound(caller, Actor, kind)` / `SystemCast(caller, Actor, localId)` | Bool | **Bridge 2 (External Systems)** self-delivery spell cast (`SystemTargetable`) |
+| `SystemWoundPart` / `SystemWoundEx` / `SystemWoundAt` | Int | **Bridge 2 (External Systems)** commands (`syswound`, `syswoundat`): full layers and severing under `who.modPlayer` |
+| `SystemDetonate(caller, Actor, mark = 1, kick = 0)` | Int | **Bridge 2 (External Systems)** detonate command with configurable piece mark and launch kick |
+| `WoundPart(caller, Actor, form, size, depth, part, anchor = "centre", nokill = false)` | Int | a wound on one named part, no record in the plugin (External Systems Bridge) |
+| `WoundEx(caller, Actor, columns)` / `WoundAt(caller, Actor, x, y, z, columns)` | Int | the thirteen columns; at a world point (External Systems Bridge) |
 | `Detonate(caller, Actor)` | Int | the standard detonate wound as a command: size 12, depth 3, at the centre; the pieces wear blood |
 | `RestoreParts(caller, Actor, parts = "all", layermask = 0)` | Int | put parts back (`all` + 0 = whole) |
 | `Heal(caller, Actor, cellsPerSec = 4.0)` / `StopHeal(caller, Actor)` | Int | regrow them over time |
@@ -82,6 +110,8 @@ a registry rule, a trigger row and a `WhyNot` line - about a hundred and twenty 
 | `PartRemaining(partsRemain, part)` / `PartBit(part)` / `PartInMask(mask, part)` | Int / Bool | payload helpers |
 | `EffectiveVulnHP` `EffectiveImmune` `EffectiveNoLethal(Actor, origin)` `EffectiveLimbsToDie` `EffectiveHeadFatal` `EffectiveTrunkFatal` `EffectiveLimbFatal` | | what is in force for them |
 | `CodeName(Int)` / `Diagnose(Actor)` | String / Int | names a code; one trace line with everything |
+| **Voice** | | |
+| `PlayVoice(String wavId, Actor speaker = None, Int baseVolPct = 100)` / `StopVoice()` | - | play a `.wav` from `Data\Sound\Voice\FleshCore.esp\` (or `Data\Sound\Voice\FleshCore\`), quieter with distance from the player (not played beyond 2,600 units) and panned to the side `speaker` stands on; a living `speaker` other than the player moves their mouth. The SKSE plugin plays it within one tick, also in the first seconds after a load; a line still waiting when the game closes is dropped at the next start. `StopVoice()` ends the line playing |
 | **Shards** | | |
 | `EnableShardActivation(caller, on)` / `EffectiveShardActivation()` | - | pieces can be activated while any caller votes yes |
 | `ShardProvenance(ref)` `ShardVictim` `ShardPart` `ShardLayers` `ShardCells` `ShardIsSection` | | what a piece is |
@@ -113,7 +143,7 @@ before using anything optional; a build that lacks a token simply lacks the feat
 
 `api` `wound` `restore` `lethality` `event` `grants` `panel` `mcm` `decals` `state` `nolethal`
 `registry` `whynot` `trig` `vulnhp` `cmd` `events` `vortex` `heal` `window` `magic` `drain` `scalar`
-`verdict` `effects` `shards` `plugin` `per` `hq` `drainspell` `armour`
+`verdict` `effects` `shards` `plugin` `per` `hq` `drainspell` `armour` `bridges`
 
 A token is added with the feature it names and is not renamed; a token whose feature is
 withdrawn goes with a note in the changelog.
@@ -128,8 +158,10 @@ about one tick (100 ms) after the engine wrote them. FormIDs inside `strArg` are
 | event | sender | numArg | strArg |
 |---|---|---|---|
 | `FL_Wounded` | victim | wound seq | `origin\|form\|caller\|cellsTaken\|layers\|partsTouched\|partsRemain\|partsLostMask\|flags\|x,y,z` - once per wound that changed them, before the pieces are placed and before any kill |
-| `FL_PartLost` | victim | wound seq | `part\|partsLostMask\|flags` - once per part freshly lost |
-| `FL_Restored` | victim | ticket (0 for a spell) | `parts\|layermask\|caller` |
+| `FL_PartLost` | victim | wound seq | `part\|partsLostMask\|flags\|caller` - once per part freshly lost (`FL_Effects` applies tiered leg crippling and removes duplicate NGD heads) |
+| `FL_BoneCrack` | victim | `1` or `2` | `caller` - emitted when bone layer `0x08` breaks (`1`) or a part severs (`2`); plays 3D `SOUN 0x0F41` |
+| `FL_Clean` | actor | `0` | `""` - emitted when `DC_Api.WashStep` finishes washing all DecalCore marks off an actor in water |
+| `FL_Restored` | victim | ticket (0 for a spell) | `parts\|layermask\|caller` (or `"resurrect\|0\|FleshCore"` on external `Resurrect()`) |
 | `FL_Done` | the command's target | ticket | `verb\|caller\|result\|detail` |
 | `FL_State` | the actor | ticket | `alive\|partsLostMask\|partsRemain\|layersGone\|lastSeq\|origin` |
 | `FL_Declined` | victim | 0 | `origin\|reason\|caller\|value` - `immune` / `vulnhp` (once per body per cooldown), `verdict` / `nolethal` (once per wound), `who` (the HQ's who-may-be-cut gate), `player` (the HQ's player layers allow none of the wound's), `armour` (reserved: armour turns no wound in this release) |
@@ -343,9 +375,45 @@ middle of their left thigh; `WoundAt` lands at a world point (their nearest fles
 `RestoreParts`, `Heal`, `Drain` (a feed - `FL_Done` 0 armed, then a bite a second, each an
 `FL_Wounded` of origin 4, until `seconds` or `StopDrain`; a second `Drain` on them re-arms the same
 feed; the registry scalar scales the rate), `Vortex` and `AskState` are the rest of the verbs. Every call returns a
-**ticket** and the engine answers with `FL_Done` on the target about a tick later - from the
-game's own thread, one wound at a time, two per tick at most. `immune` refuses a command (result
-1); `vulnhp` and the scalar do **not** apply to commands: they are deliberate. A part name the
+**ticket** and the engine answers with `FL_Done` on the target about a tick later - from the game's own thread, one wound at a time, two per tick at most (dispatched in memory via `FC_Cmd` + `FC_Wake`). `immune` refuses a command (result 1); `vulnhp` and the scalar do **not** apply to commands: they are deliberate.
+
+## `FL_Native` - 25 frozen `Global Native` functions (`Scriptname FL_Native Native Hidden`)
+
+Every actor lookup accepts `akActor.GetFormID()` as signed 32-bit `Int`, preserving bit 31 for `0xFF......` dynamic actors. Part-level functions take `aiPartIdx` in `1..15` (`FL_Api.PartBit`).
+
+- **State & Config:** `IsReady()`, `GetPresetId()`, `GetPresetBase()`, `GetBloodSplatter()`, `GetVersionString()`
+- **In-Memory Queue Drains (watcher-internal):** `PopWoundBatch()`, `PopEvent()`, `PopDressLine()`, `PopReviveLine()`
+- **Synchronous Body/Part Mirror:** `HasBody(aiActorFid)`, `IsBuiltWhole(aiActorFid)`, `GetWoundedCellCount(aiActorFid)`, `IsDismembered(aiActorFid)`, `GetPartsLostMask(aiActorFid)`, `GetPartsBornMask(aiActorFid)`, `GetPartIntegrityPct(aiActorFid, aiPartIdx)`, `GetPartLayersGoneMask(aiActorFid, aiPartIdx)`, `GetOwnFillFrac(aiActorFid)`, `HasSkullFill(aiActorFid)`, `GetBodyRemainStr(aiActorFid)`
+- **Blood and Fodder Overkill:** `GetBloodSplatterPct()` / `SetBloodSplatterPct(aiPct)` and `GetFodderOverkillPct()` / `SetFodderOverkillPct(aiPct)` read and change the player's own settings (`0..100`, saved with the HQ settings); `SetOverkillBonusPct(aiPct)` - see below.
+
+### Fodder Overkill bonus - raise the chance without touching the player's setting
+
+Fodder Overkill is the chance that a power attack, a sneak attack or a heavy hit (20% of their health or more)
+from the player blows a living, staggered or knocked-down, low-level character apart (never a follower, an
+essential, protected or unique character, or anyone on the never-kill list). The player sets the chance in the HQ ("Stagger / ragdoll fodder overkill";
+`GetFodderOverkillPct` / `SetFodderOverkillPct`). A mod can add a **bonus** on top, for as long as it wants,
+without changing that setting:
+
+```papyrus
+FL_Native.SetOverkillBonusPct(15)              ; add 15 points
+FL_Native.SetOverkillBonusPct(0)               ; take the bonus away
+Game.GetPlayer().SendModEvent("FC_OverkillBonusSet", "", 15.0)   ; the same, with no script dependency
+```
+
+- The chance in force is the player's setting plus the bonus, held to `0..100`. A bonus above 0 turns
+  Fodder Overkill on even when the player's setting is 0.
+- The bonus is one shared slot: the last mod to set it wins. Set `0` when your reason for the bonus ends.
+- `GetFodderOverkillPct()` returns the player's setting only, never the bonus.
+- The bonus is kept in memory only: it is `0` when the game starts, it stays across loading a save in the
+  same session, and it is never written to a save or to the config. Set it again in `OnPlayerLoadGame`
+  if your mod needs it after the game restarts.
+- The value is rounded and held to `0..100`. Call `FL_Native` only behind
+  `Game.IsPluginInstalled("FleshCore.esp")`, as in the pattern at the top of this page; the mod event needs
+  no such test.
+
+## Water-washing (`DC_Api`)
+
+`DC_Api.Fade(..., persist=false)` and `DC_Api.WashStep(Actor, afAlphaDrop = 0.22)` fade DecalCore overlays and clear shader coats while actors stand or swim in water (leaving other mods' overlays untouched) and emit `FL_Clean` from the actor when clean. A part name the
 engine does not know refuses the command (result 7, `bad argument`, the name in the detail)
 rather than reading as every part.
 
@@ -401,21 +469,24 @@ take it promptly; `FL_ShardConsumed` is unaffected. `LP 0 ...` = no cap.
 Existing words keep their meaning; new ones may be added. Read the word before the colon with
 `StringUtil.Split(why, ":")[0]`.
 
-## Files the engine writes (read-only to you)
+## Files and in-memory SKSE ModEvent transport
+
+Inbound SKSE ModEvents (`<Form>.SendModEvent`, zero `FC_Pin`): `FC_Cmd`, `FC_NoKill`, `FC_HoldDeath`, `FC_DressDone`, `FC_SplatSet`, `FC_SplatPctSet` (number = the blood splatter %), `FC_OverkillBonusSet` (number = the Fodder Overkill bonus, see the `FL_Native` section), `FC_Dirty`. Outbound SKSE ModEvents: `FC_Wake` (wakes `FL_Watch` immediately), `FL_BoneCrack`, `FL_PartLost`, `FL_Restored`, `FL_Clean`.
 
 | file | meaning |
 |---|---|
 | `Data\SKSE\Plugins\FleshCore.active.txt` | exists ⇔ armed. Deleted every launch. |
 | `…\FleshCore.features.txt` | the tokens. Same lifetime. |
-| `…\FleshCore.version.txt` | `<version>\|<HQ state>` |
+| `…\FleshCore.version.txt` | `<version>\|<HQ state>` (startup fallback alongside `FL_Native.GetVersionString()`) |
+| `…\FleshCore.bridges.txt` | `<combatPlayer>\|<systemPlayer>\|<combatLayerMask>\|<combatSever>` — live state of the two player bridges, updated on arm and on every HQ change |
 | `…\FleshCore.grants.txt` | which debug spells the player has, one decimal local id per line. The HQ edits it; the watcher enforces it. |
-| `…\FleshCore.nokill.txt` | the never-kill list, one decimal FormID per line as Papyrus writes it. Cleared every launch. `FL_Api.SetNoKill` is the writer. |
-| `…\FleshCore.registry.txt` | `<formID>\|<key>\|<value>\|<caller>\|<prio>`, one per line. Cleared every launch. `FL_Api.SetInt`/`ClearKey` are the writers. |
-| `…\FleshCore.bodies.txt` | the actors the engine holds a lattice for, one signed decimal FormID per line, rewritten every half second. `WhyNot` reads it. |
-| `…\FleshCore.triggers.txt` | registered trigger rows, `caller\|id\|scope\|type\|kind\|thr\|window\|<13 wound columns>\|prio`. Cleared every launch. `FL_Api.AddTrigger` is the writer. The HQ's own rows are not in it - they are built in the engine from `panel.json`. |
-| `…\FleshCore.scalars.txt` | `formID\|factor\|caller`. Cleared every launch. `FL_Api.SetScalar` is the writer. |
-| `…\FleshCore.cmd<N>.txt` | one command each, written by `FL_Api`, read and deleted by the engine on its next tick. |
-| `…\FleshCore.ev<N>.txt` | one event each, written by the engine, relayed by the watcher in order; swept at launch and at every load. |
+| `…\FleshCore.nokill.txt` | the never-kill mirror, kept alongside `FC_NoKill` in-memory updates. Cleared every launch. |
+| `…\FleshCore.registry.txt` | `<formID>\|<key>\|<value>\|<caller>\|<prio>`, one per line (paired with `FC_Dirty`). Cleared every launch. |
+| `…\FleshCore.triggers.txt` | registered trigger rows (paired with `FC_Dirty`). Cleared every launch. |
+| `…\FleshCore.scalars.txt` | `formID\|factor\|caller` (paired with `FC_Dirty`). Cleared every launch. |
+| `…\FleshCore.voice.txt` | the `PlayVoice` mailbox: `<wavId>\|<volume %>\|<pan>`, or `STOP\|0`. Read and emptied by the SKSE plugin. Cleared every launch. |
+
+*(Per-tick wound, event, dress, revive, and command disk mailboxes — `w<N>.txt`, `ev<N>.txt`, `cmd<N>.txt`, `dress.txt`, `revive.txt` — and `bodies.txt` lookups in `WhyNot*` are replaced by `FL_Native` + `FC_Wake` / `FC_Cmd`.)*
 
 ## The debug spells
 
@@ -449,6 +520,35 @@ records; every editor id is `FL_<Name>_Spell`.
 Not in `FL_SpellList`: `0x888`, a retired spell the plugin keeps so that its local id is never
 reused; the HQ does not list or grant it, and the watcher removes it from the player's spellbook.
 
+### The grinder spells - optional, they need Leash Framework
+
+Two player spells that are not debug spells and not in `FL_SpellList` (so the grants file and the HQ
+never touch them): `0xF71` **Spawn Grinder** (effect `0xF6F`, self) places the grinder activator
+`0xF6E` (`FleshCore\FL_Grinder.nif`, script `FL_GrinderRef`); `0xF72` **Grinder Hook** (effect `0xF70`,
+aimed, 15 s) chains the target to the nearest grinder in their cell (2,500 units) and reels them in (a
+target the chain cannot hold, such as a creature without the `NPC Neck [Neck]` node, is taken by the winch);
+at the spinning rollers they get FleshCore's `grind` wound and a detonate through the External Systems
+Bridge (caller `FL_Grinder`), then the kill. Wound reports are the ordinary ones for those wounds.
+
+- **Given while** the MCM's Controls page row **Grinder Spells** is on (the default) and Leash Framework
+  is ready; taken away otherwise. `FL_GrinderSpells`, a second script on the hooks quest `0x948`, checks
+  this on every load (`FleshCore_GameReload`).
+- **Soft dependency.** `FleshCore.esp`'s masters stay `Skyrim.esm` only. `FL_LeashBridge` is the one
+  script that calls Leash Framework (and Papyrus Tweaks' `DisableFastMode`); every caller asks
+  `FL_GrinderSpells.ChainReady()` first: `Leash.esm` installed, `SKSE.GetPluginVersion("LeashFramework")`
+  above 0, and the load-time probe answered (with no chain on the player, Leash Framework must
+  answer -1.0 for the shortest chain length; a function that is not answering gives 0.0). The probe
+  only reads. Without Leash Framework nothing calls the
+  bridge, so nothing is logged.
+- **Every cut** goes in one order: frame sync, the framework's ragdoll pull off, slack (max +400, then
+  min +350), 0.5 s, frame sync, the cut, 0.15 s. Before a grind or a kill every chain on the body comes
+  off, the chains the body holds included (each far end is slackened the same way first); a hook that lets go
+  takes off only its own chain. The grinder's blood follows the Blood Splatter switch and slider.
+- **StorageUtil, on `None`:** `FL_GrinderState` (1 ready, 2 Leash Framework not installed, 3 installed but
+  not answering), `FL_GrinderSpellsOn` (the player's choice, unset = on), `FL_GrinderGrindAnyone`
+  (the **Rollers grind bystanders** row, unset = off), `FL_GrinderActive` (the last grinder placed).
+  On an actor: `FL_GrindHookBusy`, `FL_GrinderClaimed`, `FL_HookChain`.
+
 ## Compatibility
 
 - **FormIDs do not move.** A record keeps its local id for as long as it exists, and a
@@ -462,7 +562,4 @@ reused; the HQ does not list or grant it, and the watcher removes it from the pl
 
 ## What is not here
 
-FleshCore has no mod-event dispatcher transport (the files cost one
-100 ms tick each way and are the method this plugin already uses), no per-condition shard records with
-their own activate text, and no swing-direction column (`dir`) in the trigger table, which the
-engine could read from the attack data but does not yet.
+There are no per-condition shard records with their own activate text, and no swing-direction column (`dir`) in the trigger table (true weapon swing angles and 3rd-person aim planes are applied automatically inside the engine's hit pipeline).

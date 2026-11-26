@@ -32,15 +32,39 @@ Scriptname FL_Api Hidden
 ; ---- presence -------------------------------------------------------------
 
 Bool Function IsInstalled() Global
-    {FleshCore.esp is in the load order. Ask this FIRST and gate every other
-     call on it -- see the header.}
-    Return Game.IsPluginInstalled("FleshCore.esp")
+    {A plugin that carries FleshCore is in the load order (InstalledPluginName
+     lists the names accepted). Ask this FIRST and gate every other call on it
+     -- see the header.}
+    Int i = 0
+    String nm = InstalledPluginName(0)
+    While nm != ""
+        If Game.IsPluginInstalled(nm)
+            Return true
+        EndIf
+        i += 1
+        nm = InstalledPluginName(i)
+    EndWhile
+    Return false
+EndFunction
+
+String Function InstalledPluginName(Int aiIndex) Global
+    {Internal to IsInstalled, not part of the promised API: the plugin names
+     that count as FleshCore being installed, by index, "" past the last.}
+    If aiIndex == 0
+        Return "FleshCore.esp"
+    EndIf
+    Return ""
 EndFunction
 
 String Function VersionString() Global
-    {The engine's own version, e.g. "0.1.1 Beta", read from what the DLL wrote this
-     session. "" means the SKSE plugin did not load -- which is the single most
-     useful thing to know when nothing else works.}
+    {The engine's own version, e.g. "0.2.0 Beta", queried from FL_Native with
+     FleshCore.version.txt fallback. "" means the SKSE plugin did not load.}
+    If FL_Native.IsReady()
+        String nv = FL_Native.GetVersionString()
+        If nv != ""
+            Return nv
+        EndIf
+    EndIf
     String raw = MiscUtil.ReadFromFile("Data/SKSE/Plugins/FleshCore.version.txt")
     If raw == ""
         Return ""
@@ -64,7 +88,7 @@ Bool Function Has(String feature) Global
      Tokens so far: api wound restore lethality event grants panel mcm decals
      state nolethal registry whynot trig vulnhp cmd events vortex heal window
      magic drain scalar verdict effects shards plugin per
-     hq drainspell.
+     hq drainspell armour bridges.
      A consumer that asks before using degrades instead of failing.}
     If feature == ""
         Return false
@@ -95,6 +119,102 @@ Int Function WhyRefused(Actor akActor) Global
     {0 accepted, 1 no base record, 2 a race FleshCore does not cut, or a child (child race,
      IsChild() or child voice type), 3 the record names no sex. Permanent codes; new ones may be added above 3.}
     Return FL_Wound.WhyRefused(akActor)
+EndFunction
+
+; ---- two separate integration bridges: Combat vs External Systems ---------
+;
+; FleshCore exposes two distinct integration bridges so third-party mods never
+; collide over player eligibility:
+;
+;   1. THE COMBAT BRIDGE (CombatTargetable, CombatWound*, AddTrigger*)
+;      For combat mods, weapon blows, and hostile combat magic. Obeys the HQ's
+;      Combat player gate (`who.player`, default OFF), progressive player
+;      layer unlocks (`player.skin` -> `flesh` -> `bones` -> `sever`),
+;      `vulnhp` thresholds, and per-actor scalars.
+;
+;   2. THE EXTERNAL SYSTEMS BRIDGE (SystemTargetable, SystemWound*, SystemCast,
+;      SystemDetonate)
+;      For non-combat mods, traps, environmental hazards, and scripted events.
+;      Obeys its own separate HQ switch (`who.modPlayer`, default ON) with full
+;      layers and full severing, completely independent of whether combat hits
+;      may cut the player.
+
+Bool Function PlayerCombatEnabled() Global
+    {True when the HQ's Combat Bridge allows player wounds (both `who.player`
+     and at least `player.skin` are enabled).}
+    String raw = MiscUtil.ReadFromFile("Data/SKSE/Plugins/FleshCore.bridges.txt")
+    If raw == ""
+        Return false
+    EndIf
+    Return (Field(StringUtil.Split(raw, "\n")[0], 0) as Int) != 0
+EndFunction
+
+Bool Function PlayerSystemEnabled() Global
+    {True when the HQ's External Systems Bridge allows player wounds
+     (`who.modPlayer`, ON by default; a per-actor `systemtarget` registry
+     rule overrides it while active).}
+    Actor p = Game.GetPlayer()
+    If p
+        Int ov = GetInt(p, "systemtarget")
+        If ov >= 0
+            Return ov != 0
+        EndIf
+    EndIf
+    String raw = MiscUtil.ReadFromFile("Data/SKSE/Plugins/FleshCore.bridges.txt")
+    If raw == ""
+        Return true
+    EndIf
+    Return (Field(StringUtil.Split(raw, "\n")[0], 1) as Int) != 0
+EndFunction
+
+Bool Function CombatTargetable(Actor akActor) Global
+    {Bridge 1 (Combat): whether `akActor` may be wounded by combat blows and
+     combat-bridge mod hooks right now.}
+    If !akActor || !IsInstalled() || !CoreActive() || !Targetable(akActor)
+        Return false
+    EndIf
+    If EffectiveImmune(akActor)
+        Return false
+    EndIf
+    If akActor == Game.GetPlayer() && !PlayerCombatEnabled()
+        Return false
+    EndIf
+    Int vh = GetInt(akActor, "vulnhp")
+    If vh > 0 && akActor.GetActorValuePercentage("Health") * 100.0 > (vh as Float)
+        Return false
+    EndIf
+    Return true
+EndFunction
+
+Bool Function SystemTargetable(Actor akActor) Global
+    {Bridge 2 (External Systems): whether `akActor` may be wounded by external
+     mods, traps, hazards, and scripted systems right now -- independent of
+     combat player settings and combat health gates.}
+    If !akActor || !IsInstalled() || !CoreActive() || !Targetable(akActor)
+        Return false
+    EndIf
+    If EffectiveImmune(akActor)
+        Return false
+    EndIf
+    If akActor == Game.GetPlayer() && !PlayerSystemEnabled()
+        Return false
+    EndIf
+    Return true
+EndFunction
+
+Function SetSystemTargetOverride(Actor akActor, Bool abAllow, String caller, Int prio = 100) Global
+    {Set a temporary per-session External Systems Bridge override on `akActor`
+     under `caller`. Call ClearSystemTargetOverride when your event ends.}
+    Int v = 0
+    If abAllow
+        v = 1
+    EndIf
+    SetInt(akActor, "systemtarget", v, caller, prio)
+EndFunction
+
+Function ClearSystemTargetOverride(Actor akActor, String caller) Global
+    {Withdraw `caller`'s temporary External Systems Bridge override.}
+    ClearKey(akActor, "systemtarget", caller)
 EndFunction
 
 ; ---- doing things ---------------------------------------------------------
@@ -145,6 +265,10 @@ Bool Function Cast(Actor akActor, Int localId) Global
             Debug.Trace("[FleshCore] FL_Api.Cast: " + akActor + " is immune (set by " + who + ") -- not cast")
             Return false
         EndIf
+        If akActor == Game.GetPlayer() && !PlayerSystemEnabled()
+            Debug.Trace("[FleshCore] FL_Api.Cast: external systems bridge is off for the player -- not cast")
+            Return false
+        EndIf
         Int vh = GetInt(akActor, "vulnhp")
         If vh > 0 && akActor.GetActorValuePercentage("Health") * 100.0 > (vh as Float)
             Debug.Trace("[FleshCore] FL_Api.Cast: " + akActor + " is above the vulnhp threshold of " + vh + "% -- not cast")
@@ -158,6 +282,38 @@ Bool Function Cast(Actor akActor, Int localId) Global
     EndIf
     sp.Cast(akActor, akActor)
     Return true
+EndFunction
+
+Bool Function SystemCast(String caller, Actor akActor, Int localId) Global
+    {Bridge 2 (External Systems): cast a self-delivery FleshCore spell by local
+     id through the External Systems Bridge (honours `SystemTargetable` and
+     ignores combat `who.player` and combat `vulnhp`).}
+    If !akActor || localId <= 0 || caller == ""
+        Return false
+    EndIf
+    If localId != 0x87C && localId != 0x87E && !SystemTargetable(akActor)
+        Debug.Trace("[FleshCore] FL_Api.SystemCast (" + caller + "): " + akActor + " refused (" + WhyNotSystem(akActor) + ") -- not cast")
+        Return false
+    EndIf
+    Spell sp = Game.GetFormFromFile(localId, "FleshCore.esp") as Spell
+    If !sp
+        Debug.Trace("[FleshCore] FL_Api.SystemCast (" + caller + "): 0x" + localId + " is not a spell in this FleshCore.esp")
+        Return false
+    EndIf
+    sp.Cast(akActor, akActor)
+    Return true
+EndFunction
+
+Bool Function SystemWound(String caller, Actor akActor, String kind) Global
+    {Bridge 2 (External Systems): open a named self-delivery wound (`decapitate`,
+     `detonate`, `bisect`, `splatter`, `armoffl`, `armoffr`, `legoffl`, `legoffr`)
+     through the External Systems Bridge.}
+    Int id = KindToLocal(kind)
+    If id <= 0
+        Debug.Trace("[FleshCore] FL_Api.SystemWound (" + caller + "): unknown kind '" + kind + "'")
+        Return false
+    EndIf
+    Return SystemCast(caller, akActor, id)
 EndFunction
 
 Int Function KindToLocal(String kind) Global
@@ -222,6 +378,31 @@ Function SetNoKill(Actor akActor, Bool abOn) Global
         EndWhile
         MiscUtil.WriteToFile(path, out, false, false)
     EndIf
+    Float val = 0.0
+    If abOn
+        val = 1.0
+    EndIf
+    akActor.SendModEvent("FC_NoKill", "", val)
+EndFunction
+
+Function HoldDeath(Actor akActor, Float afSeconds = 10.0) Global
+    {Hold FleshCore death verdicts for `akActor` in DLL memory for `afSeconds` (<= 0 releases).}
+    If !akActor
+        Return
+    EndIf
+    If afSeconds <= 0.0
+        akActor.SendModEvent("FC_HoldDeath", "", 0.0)
+    Else
+        akActor.SendModEvent("FC_HoldDeath", "", afSeconds)
+    EndIf
+EndFunction
+
+Function ReleaseDeath(Actor akActor) Global
+    {Release an active in-memory HoldDeath on `akActor`.}
+    If !akActor
+        Return
+    EndIf
+    akActor.SendModEvent("FC_HoldDeath", "", 0.0)
 EndFunction
 
 Bool Function NoKill(Actor akActor) Global
@@ -269,6 +450,7 @@ Function SetInt(Actor akActor, String key, Int value, String caller, Int prio = 
     String out = Without(MiscUtil.ReadFromFile(path), id, key, caller)
     out += id + "|" + key + "|" + value + "|" + caller + "|" + prio + "\n"
     MiscUtil.WriteToFile(path, out, false, false)
+    NotifyTablesDirty()
 EndFunction
 
 Function ClearKey(Actor akActor, String key, String caller) Global
@@ -279,6 +461,7 @@ Function ClearKey(Actor akActor, String key, String caller) Global
     String path = "Data/SKSE/Plugins/FleshCore.registry.txt"
     String out = Without(MiscUtil.ReadFromFile(path), "" + akActor.GetFormID(), key, caller)
     MiscUtil.WriteToFile(path, out, false, false)
+    NotifyTablesDirty()
 EndFunction
 
 String Function Without(String content, String id, String key, String caller) Global
@@ -451,6 +634,7 @@ Int Function AddTriggerEx(String caller, Actor scope, String type, String kind, 
     EndIf
     cur += caller + "|" + id + "|" + sc + "|" + type + "|" + kind + "|" + thr + "|" + window + "|" + columns + "|" + prio + "\n"
     MiscUtil.WriteToFile(path, cur, false, false)
+    NotifyTablesDirty()
     Return id
 EndFunction
 
@@ -473,6 +657,7 @@ Function RemoveTrigger(String caller, Int id) Global
         i += 1
     EndWhile
     MiscUtil.WriteToFile(path, out, false, false)
+    NotifyTablesDirty()
 EndFunction
 
 Function ClearTriggers(String caller) Global
@@ -494,6 +679,7 @@ Function ClearTriggers(String caller) Global
         i += 1
     EndWhile
     MiscUtil.WriteToFile(path, out, false, false)
+    NotifyTablesDirty()
 EndFunction
 
 String Function Triggers(String caller) Global
@@ -540,7 +726,7 @@ Int Function NextTicket() Global
 EndFunction
 
 Int Function Send(String verb, String caller, String args) Global
-    {Write one command file. Returns the ticket.}
+    {Send one command in memory via SKSE ModEvent ("FC_Cmd"). Returns the ticket.}
     If !IsInstalled()
         Return -2
     EndIf
@@ -548,12 +734,19 @@ Int Function Send(String verb, String caller, String args) Global
         Return -1
     EndIf
     Int t = NextTicket()
-    Int n = StorageUtil.AdjustIntValue(None, "FC_cmdseq", 1)
     String line = t + "|" + verb + "|" + caller
     If args != ""
         line += "|" + args
     EndIf
-    MiscUtil.WriteToFile("Data/SKSE/Plugins/FleshCore.cmd" + n + ".txt", line + "\n#", false, false)
+    Quest hq = HooksQuest()
+    If hq
+        hq.SendModEvent("FC_Cmd", line, 0.0)
+    Else
+        Actor p = Game.GetPlayer()
+        If p
+            p.SendModEvent("FC_Cmd", line, 0.0)
+        EndIf
+    EndIf
     Return t
 EndFunction
 
@@ -619,6 +812,81 @@ Int Function Detonate(String caller, Actor akActor) Global
         Return -4
     EndIf
     Return WoundEx(caller, akActor, Columns("detonate", 12.0, 3, "-", "centre", false, 1, 34, 20, 0, false, 0, 1))
+EndFunction
+
+Int Function CombatWoundPart(String caller, Actor akActor, String form, Float size, Int depth, String part, \
+        String anchor = "centre", Bool nokill = false) Global
+    {Bridge 1 (Combat): open a combat wound on one named part, subject to the
+     HQ's Combat gates (`who.*`, player layer hierarchy, `vulnhp`, scalars).}
+    If !akActor
+        Return -4
+    EndIf
+    Return CombatWoundEx(caller, akActor, Columns(form, size, depth, part, anchor, nokill))
+EndFunction
+
+Int Function CombatWoundEx(String caller, Actor akActor, String columns) Global
+    {Bridge 1 (Combat): full thirteen-column wound routed through the Combat Bridge.}
+    If !akActor
+        Return -4
+    EndIf
+    If StringUtil.Split(columns, "|").Length != 13
+        Return -6
+    EndIf
+    Return Send("combatwound", caller, akActor.GetFormID() + "|" + columns)
+EndFunction
+
+Int Function CombatWoundAt(String caller, Actor akActor, Float x, Float y, Float z, String columns) Global
+    {Bridge 1 (Combat): world-point wound routed through the Combat Bridge.}
+    If !akActor
+        Return -4
+    EndIf
+    If StringUtil.Split(columns, "|").Length != 13
+        Return -6
+    EndIf
+    Return Send("combatwoundat", caller, akActor.GetFormID() + "|" + x + "|" + y + "|" + z + "|" + columns)
+EndFunction
+
+Int Function SystemWoundPart(String caller, Actor akActor, String form, Float size, Int depth, String part, \
+        String anchor = "centre", Bool nokill = false) Global
+    {Bridge 2 (External Systems): open a wound on one named part through the
+     External Systems Bridge (full layers and severing, governed by `who.modPlayer`).}
+    If !akActor
+        Return -4
+    EndIf
+    Return SystemWoundEx(caller, akActor, Columns(form, size, depth, part, anchor, nokill))
+EndFunction
+
+Int Function SystemWoundEx(String caller, Actor akActor, String columns) Global
+    {Bridge 2 (External Systems): full thirteen-column wound routed through the
+     External Systems Bridge.}
+    If !akActor
+        Return -4
+    EndIf
+    If StringUtil.Split(columns, "|").Length != 13
+        Return -6
+    EndIf
+    Return Send("syswound", caller, akActor.GetFormID() + "|" + columns)
+EndFunction
+
+Int Function SystemWoundAt(String caller, Actor akActor, Float x, Float y, Float z, String columns) Global
+    {Bridge 2 (External Systems): world-point wound routed through the External
+     Systems Bridge.}
+    If !akActor
+        Return -4
+    EndIf
+    If StringUtil.Split(columns, "|").Length != 13
+        Return -6
+    EndIf
+    Return Send("syswoundat", caller, akActor.GetFormID() + "|" + x + "|" + y + "|" + z + "|" + columns)
+EndFunction
+
+Int Function SystemDetonate(String caller, Actor akActor, Int mark = 1, Int kick = 0) Global
+    {Bridge 2 (External Systems): detonate `akActor` through the External Systems
+     Bridge (`mark`: 0 worn skin, 1 blood, 2..3 registered DC_Api mark kinds).}
+    If !akActor
+        Return -4
+    EndIf
+    Return SystemWoundEx(caller, akActor, Columns("detonate", 12.0, 3, "-", "centre", false, 1, 34, 20, 0, false, kick, mark))
 EndFunction
 
 Int Function RestoreParts(String caller, Actor akActor, String parts = "all", Int layermask = 0) Global
@@ -867,6 +1135,7 @@ Function SetScalar(Actor akActor, Float factor, String caller) Global
     String out = ScalarsWithout(MiscUtil.ReadFromFile(path), id, caller)
     out += id + "|" + factor + "|" + caller + "\n"
     MiscUtil.WriteToFile(path, out, false, false)
+    NotifyTablesDirty()
 EndFunction
 
 Function ClearScalar(Actor akActor, String caller) Global
@@ -875,6 +1144,7 @@ Function ClearScalar(Actor akActor, String caller) Global
     EndIf
     String path = "Data/SKSE/Plugins/FleshCore.scalars.txt"
     MiscUtil.WriteToFile(path, ScalarsWithout(MiscUtil.ReadFromFile(path), "" + akActor.GetFormID(), caller), false, false)
+    NotifyTablesDirty()
 EndFunction
 
 String Function ScalarsWithout(String content, String id, String caller) Global
@@ -1275,7 +1545,8 @@ ObjectReference[] Function PlacedShards() Global
     {The pieces the watcher holds that have 3D, up to 32 (its ring).}
     FL_Watch w = Game.GetFormFromFile(0x00000835, "FleshCore.esp") as FL_Watch
     If !w
-        Return None
+        ObjectReference[] emptyShards
+        Return emptyShards
     EndIf
     Return w.LiveShards()
 EndFunction
@@ -1309,16 +1580,81 @@ String Function WhyNot(Actor akActor) Global
     If r != 0
         Return "ineligible:" + r
     EndIf
-    String id = "" + akActor.GetFormID()
     String who = ""
     If Winner(akActor, "immune", who) > 0
         Return "immune:" + who
+    EndIf
+    If akActor == Game.GetPlayer() && !PlayerSystemEnabled() && !PlayerCombatEnabled()
+        Return "who:modplayer"
     EndIf
     Int vh = GetInt(akActor, "vulnhp")
     If vh > 0 && akActor.GetActorValuePercentage("Health") * 100.0 > (vh as Float)
         Return "vulnhp:" + vh
     EndIf
-    If StringUtil.Find("\n" + MiscUtil.ReadFromFile("Data/SKSE/Plugins/FleshCore.bodies.txt") + "\n", "\n" + id + "\n") < 0
+    If !FL_Native.HasBody(akActor.GetFormID())
+        Return "nobody"
+    EndIf
+    Return "ok"
+EndFunction
+
+String Function WhyNotCombat(Actor akActor) Global
+    {Diagnostic reason on Bridge 1 (Combat): `who:player` when the Combat Bridge
+     player toggle or layer hierarchy is off, else WhyNot's checks.}
+    If !akActor
+        Return "ineligible:1"
+    EndIf
+    If !IsInstalled()
+        Return "noplugin"
+    EndIf
+    If !CoreActive()
+        Return "notarmed"
+    EndIf
+    Int r = WhyRefused(akActor)
+    If r != 0
+        Return "ineligible:" + r
+    EndIf
+    String who = ""
+    If Winner(akActor, "immune", who) > 0
+        Return "immune:" + who
+    EndIf
+    If akActor == Game.GetPlayer() && !PlayerCombatEnabled()
+        Return "who:player"
+    EndIf
+    Int vh = GetInt(akActor, "vulnhp")
+    If vh > 0 && akActor.GetActorValuePercentage("Health") * 100.0 > (vh as Float)
+        Return "vulnhp:" + vh
+    EndIf
+    If !FL_Native.HasBody(akActor.GetFormID())
+        Return "nobody"
+    EndIf
+    Return "ok"
+EndFunction
+
+String Function WhyNotSystem(Actor akActor) Global
+    {Diagnostic reason on Bridge 2 (External Systems): `who:modplayer` when the
+     External Systems Bridge player toggle is off, else universal checks (ignores
+     combat `who.player` and combat `vulnhp`).}
+    If !akActor
+        Return "ineligible:1"
+    EndIf
+    If !IsInstalled()
+        Return "noplugin"
+    EndIf
+    If !CoreActive()
+        Return "notarmed"
+    EndIf
+    Int r = WhyRefused(akActor)
+    If r != 0
+        Return "ineligible:" + r
+    EndIf
+    String who = ""
+    If Winner(akActor, "immune", who) > 0
+        Return "immune:" + who
+    EndIf
+    If akActor == Game.GetPlayer() && !PlayerSystemEnabled()
+        Return "who:modplayer"
+    EndIf
+    If !FL_Native.HasBody(akActor.GetFormID())
         Return "nobody"
     EndIf
     Return "ok"
@@ -1381,6 +1717,121 @@ Int Function TestRestore(String caller, String targetSpec = "crosshair") Global
         targetSpec = "crosshair"
     EndIf
     Return Send("testrestore", caller, targetSpec)
+EndFunction
+
+; ---- synchronous in-memory body/part/preset/splatter API (FL_Native) ----
+
+Function NotifyTablesDirty() Global
+    Quest hq = HooksQuest()
+    If hq
+        hq.SendModEvent("FC_Dirty", "", 0.0)
+    Else
+        Actor p = Game.GetPlayer()
+        If p
+            p.SendModEvent("FC_Dirty", "", 0.0)
+        EndIf
+    EndIf
+EndFunction
+
+Int Function GetPresetId() Global
+    Return FL_Native.GetPresetId()
+EndFunction
+
+Int Function GetPresetBase() Global
+    Return FL_Native.GetPresetBase()
+EndFunction
+
+Bool Function GetBloodSplatter() Global
+    Return FL_Native.GetBloodSplatter()
+EndFunction
+
+Function SetBloodSplatter(Bool abOn) Global
+    Actor p = Game.GetPlayer()
+    If !p
+        Return
+    EndIf
+    Float val = 0.0
+    If abOn
+        val = 1.0
+    EndIf
+    p.SendModEvent("FC_SplatSet", "", val)
+EndFunction
+
+Bool Function HasBody(Actor akActor) Global
+    If !akActor
+        Return false
+    EndIf
+    Return FL_Native.HasBody(akActor.GetFormID())
+EndFunction
+
+Bool Function IsBuiltWhole(Actor akActor) Global
+    If !akActor
+        Return false
+    EndIf
+    Return FL_Native.IsBuiltWhole(akActor.GetFormID())
+EndFunction
+
+Int Function GetWoundedCellCount(Actor akActor) Global
+    If !akActor
+        Return 0
+    EndIf
+    Return FL_Native.GetWoundedCellCount(akActor.GetFormID())
+EndFunction
+
+Bool Function IsDismembered(Actor akActor) Global
+    If !akActor
+        Return false
+    EndIf
+    Return FL_Native.IsDismembered(akActor.GetFormID())
+EndFunction
+
+Int Function GetPartsLostMask(Actor akActor) Global
+    If !akActor
+        Return 0
+    EndIf
+    Return FL_Native.GetPartsLostMask(akActor.GetFormID())
+EndFunction
+
+Int Function GetPartsBornMask(Actor akActor) Global
+    If !akActor
+        Return 0
+    EndIf
+    Return FL_Native.GetPartsBornMask(akActor.GetFormID())
+EndFunction
+
+Float Function GetPartIntegrityPct(Actor akActor, Int aiPartIdx) Global
+    If !akActor
+        Return 100.0
+    EndIf
+    Return FL_Native.GetPartIntegrityPct(akActor.GetFormID(), aiPartIdx)
+EndFunction
+
+Int Function GetPartLayersGoneMask(Actor akActor, Int aiPartIdx) Global
+    If !akActor
+        Return 0
+    EndIf
+    Return FL_Native.GetPartLayersGoneMask(akActor.GetFormID(), aiPartIdx)
+EndFunction
+
+Float Function GetOwnFillFrac(Actor akActor) Global
+    If !akActor
+        Return 0.0
+    EndIf
+    Return FL_Native.GetOwnFillFrac(akActor.GetFormID())
+EndFunction
+
+Bool Function HasSkullFill(Actor akActor) Global
+    If !akActor
+        Return false
+    EndIf
+    Return FL_Native.HasSkullFill(akActor.GetFormID())
+EndFunction
+
+String Function GetBodyRemainStr(Actor akActor) Global
+    If !akActor
+        Return ""
+    EndIf
+    Return FL_Native.GetBodyRemainStr(akActor.GetFormID())
 EndFunction
 
 Function PlayVoice(String wavId, Actor speaker = None, Int baseVolPct = 100) Global

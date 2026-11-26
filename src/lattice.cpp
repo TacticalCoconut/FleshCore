@@ -38,27 +38,63 @@ void PosOf(const std::uint8_t* rec, std::uint64_t desc, float out[3])
     }
 }
 
-std::uint32_t CapWound(const std::uint16_t* orig, std::uint32_t origTris,
-                       std::vector<std::uint16_t>& keep, std::uint32_t maxTris)
+static std::uint16_t FloatToHalf(float f)
 {
-    if (!orig || !origTris || maxTris == 0) return 0;
+    std::uint32_t u = 0;
+    std::memcpy(&u, &f, 4);
+    const std::uint32_t sign = (u >> 16) & 0x8000u;
+    const std::int32_t exp = std::int32_t((u >> 23) & 0xFFu) - 127 + 15;
+    std::uint32_t mant = u & 0x7FFFFFu;
+    if (exp <= 0) {
+        if (exp < -10) return std::uint16_t(sign);
+        mant |= 0x800000u;
+        const std::uint32_t shift = std::uint32_t(14 - exp);
+        return std::uint16_t(sign | (mant >> shift));
+    }
+    if (exp >= 31) return std::uint16_t(sign | 0x7C00u);
+    return std::uint16_t(sign | (std::uint32_t(exp) << 10) | (mant >> 13));
+}
+
+static void WritePosOf(std::uint8_t* rec, std::uint64_t desc, const float p[3])
+{
+    if (((desc >> 8) & 0xF) == 2) {
+        std::uint16_t* h = reinterpret_cast<std::uint16_t*>(rec);
+        h[0] = FloatToHalf(p[0]); h[1] = FloatToHalf(p[1]); h[2] = FloatToHalf(p[2]);
+    } else {
+        std::memcpy(rec, p, 12);
+    }
+}
+
+std::uint32_t CapWound(const std::uint16_t* orig, std::uint32_t origTris,
+                       std::vector<std::uint16_t>& keep, std::uint32_t maxTris,
+                       const std::uint8_t* rawVerts, std::uint32_t nVerts,
+                       std::uint32_t vsize, std::uint64_t desc,
+                       float cellPitch,
+                       std::vector<std::uint8_t>* vbOut,
+                       bool isFace)
+{
+    if (!orig || !origTris || maxTris == 0 || keep.size() < 3) return 0;
     auto key = [](std::uint16_t a, std::uint16_t b) {
         return (a < b) ? ((std::uint32_t(a) << 16) | b) : ((std::uint32_t(b) << 16) | a);
     };
 
-    // how many triangles shared each edge BEFORE the cut
-    std::map<std::uint32_t, int> before;
-    for (std::uint32_t t = 0; t < origTris; ++t)
+    // How many triangles shared each undirected edge BEFORE the cut
+    std::unordered_map<std::uint32_t, int> before;
+    before.reserve(std::size_t(origTris) * 2);
+    for (std::uint32_t t = 0; t < origTris; ++t) {
         for (int k = 0; k < 3; ++k) {
             const std::uint16_t a = orig[t*3 + k], b = orig[t*3 + (k+1)%3];
             if (a != b) ++before[key(a, b)];
         }
+    }
 
-    // and after, keeping the direction the surviving triangle used it in
-    std::map<std::uint32_t, int> after;
-    std::map<std::uint32_t, std::pair<std::uint16_t, std::uint16_t>> dir;
+    // Surviving undirected edge multiplicity + directed surviving edge (a -> b)
+    std::unordered_map<std::uint32_t, int> after;
+    std::unordered_map<std::uint32_t, std::pair<std::uint16_t, std::uint16_t>> dir;
     const std::uint32_t nk = std::uint32_t(keep.size() / 3);
-    for (std::uint32_t t = 0; t < nk; ++t)
+    after.reserve(std::size_t(nk) * 2);
+    dir.reserve(std::size_t(nk) * 2);
+    for (std::uint32_t t = 0; t < nk; ++t) {
         for (int k = 0; k < 3; ++k) {
             const std::uint16_t a = keep[t*3 + k], b = keep[t*3 + (k+1)%3];
             if (a == b) continue;
@@ -66,47 +102,181 @@ std::uint32_t CapWound(const std::uint16_t* orig, std::uint32_t origTris,
             ++after[e];
             dir[e] = std::make_pair(a, b);
         }
+    }
 
-    // an edge the cut opened: shared before, exposed now
+    // Collect every edge opened by the cut (shared before, single surviving triangle now)
     std::vector<std::pair<std::uint16_t, std::uint16_t>> rim;
     for (const auto& [e, n] : after) {
         if (n != 1) continue;
         auto b2 = before.find(e);
-        if (b2 == before.end() || b2->second < 2) continue;   // an original border
+        if (b2 == before.end() || b2->second < 2) continue;   // original mesh border
         rim.push_back(dir[e]);
     }
     if (rim.size() < 3) return 0;
 
-    // group the rim into loops, so two separate holes are never sewn together
-    std::map<std::uint16_t, std::uint16_t> parent;
-    std::function<std::uint16_t(std::uint16_t)> find =
-        [&](std::uint16_t x) {
-            while (true) {
-                auto it = parent.find(x);
-                if (it == parent.end()) { parent[x] = x; return x; }
-                if (it->second == x) return x;
-                x = it->second;
-            }
-        };
-    for (const auto& [a, b] : rim) {
-        const std::uint16_t ra = find(a), rb = find(b);
-        if (ra != rb) parent[rb] = ra;
+    // Extract disjoint ordered loops and open boundary chains
+    std::unordered_map<std::uint16_t, std::vector<std::size_t>> outEdges;
+    std::unordered_map<std::uint16_t, int> inDeg;
+    outEdges.reserve(rim.size());
+    inDeg.reserve(rim.size());
+    for (std::size_t ei = 0; ei < rim.size(); ++ei) {
+        outEdges[rim[ei].first].push_back(ei);
+        ++inDeg[rim[ei].second];
     }
-    std::map<std::uint16_t, std::uint16_t> hub;      // loop root -> its fan hub
-    for (const auto& [a, b] : rim) hub.emplace(find(a), a);
+    std::vector<std::uint8_t> used(rim.size(), 0);
+    struct LoopChain {
+        std::vector<std::pair<std::uint16_t, std::uint16_t>> edges;
+        std::uint16_t hub = 0;
+        bool hasHub = false;
+    };
+    std::vector<LoopChain> chains;
+
+    auto walkFrom = [&](std::size_t startEdge) {
+        LoopChain ch;
+        std::size_t curEdge = startEdge;
+        while (curEdge < rim.size() && !used[curEdge]) {
+            used[curEdge] = 1;
+            const auto& ed = rim[curEdge];
+            ch.edges.push_back(ed);
+            const std::uint16_t vNext = ed.second;
+            auto it = outEdges.find(vNext);
+            if (it == outEdges.end()) break;
+            std::size_t nextEdge = rim.size();
+            for (std::size_t cand : it->second) {
+                if (!used[cand]) { nextEdge = cand; break; }
+            }
+            if (nextEdge >= rim.size()) break;
+            curEdge = nextEdge;
+        }
+        if (ch.edges.size() >= 2) chains.push_back(std::move(ch));
+    };
+
+    // Pass 1: open chains starting at nodes with inDeg < outDeg
+    for (std::size_t ei = 0; ei < rim.size(); ++ei) {
+        if (used[ei]) continue;
+        const std::uint16_t u = rim[ei].first;
+        const int od = int(outEdges[u].size());
+        const int id = inDeg.count(u) ? inDeg[u] : 0;
+        if (od > id) walkFrom(ei);
+    }
+    // Pass 2: remaining closed loops
+    for (std::size_t ei = 0; ei < rim.size(); ++ei) {
+        if (!used[ei]) walkFrom(ei);
+    }
+    if (chains.empty()) return 0;
+
+    const bool hasPos = (rawVerts != nullptr && nVerts > 0 && vsize >= 12);
+    const bool canExtendVB = (!isFace && vbOut != nullptr && hasPos && ((desc & (1ULL << 44)) != 0));
+    const bool hasColors = ((desc >> 44) & 0x20ULL) != 0;
+    const std::uint32_t colOff = std::uint32_t((desc >> 24) & 0xFULL) * 4u;
+
+    for (LoopChain& ch : chains) {
+        std::vector<std::uint16_t> verts;
+        verts.reserve(ch.edges.size() + 1);
+        for (const auto& ed : ch.edges) verts.push_back(ed.first);
+        if (ch.edges.back().second != ch.edges.front().first)
+            verts.push_back(ch.edges.back().second);
+
+        if (hasPos) {
+            double cx = 0.0, cy = 0.0, cz = 0.0;
+            std::uint32_t cnt = 0;
+            for (std::uint16_t v : verts) {
+                if (v >= nVerts) continue;
+                float p[3];
+                PosOf(rawVerts + std::size_t(v) * vsize, desc, p);
+                cx += p[0]; cy += p[1]; cz += p[2]; ++cnt;
+            }
+            if (cnt > 0) {
+                const float cen[3] = { float(cx / cnt), float(cy / cnt), float(cz / cnt) };
+                if (canExtendVB) {
+                    const std::size_t curVerts = vbOut->empty() ? nVerts : (vbOut->size() / vsize);
+                    if (curVerts < 0xFFFEu) {
+                        if (vbOut->empty())
+                            vbOut->assign(rawVerts, rawVerts + std::size_t(nVerts) * vsize);
+                        // Newell normal of loop to recess centroid inward (~0.35 * cellPitch)
+                        double nx = 0.0, ny = 0.0, nz = 0.0;
+                        for (const auto& ed : ch.edges) {
+                            if (ed.first >= nVerts || ed.second >= nVerts) continue;
+                            float p0[3], p1[3];
+                            PosOf(rawVerts + std::size_t(ed.first) * vsize, desc, p0);
+                            PosOf(rawVerts + std::size_t(ed.second) * vsize, desc, p1);
+                            const float ax = p0[0] - cen[0], ay = p0[1] - cen[1], az = p0[2] - cen[2];
+                            const float bx = p1[0] - cen[0], by = p1[1] - cen[1], bz = p1[2] - cen[2];
+                            nx += double(ay * bz - az * by);
+                            ny += double(az * bx - ax * bz);
+                            nz += double(ax * by - ay * bx);
+                        }
+                        const double nLen = std::sqrt(nx * nx + ny * ny + nz * nz);
+                        float newPos[3] = { cen[0], cen[1], cen[2] };
+                        if (nLen > 1e-5) {
+                            const float pitch = cellPitch > 0.5f ? cellPitch : 4.0f;
+                            const float rec = 0.35f * pitch;
+                            newPos[0] += float(nx / nLen) * rec;
+                            newPos[1] += float(ny / nLen) * rec;
+                            newPos[2] += float(nz / nLen) * rec;
+                        }
+                        std::uint16_t tmpl = 0;
+                        for (std::uint16_t v : verts) { if (v < nVerts) { tmpl = v; break; } }
+                        const std::size_t newIdx = vbOut->size() / vsize;
+                        vbOut->resize(vbOut->size() + vsize);
+                        std::uint8_t* dst = vbOut->data() + newIdx * vsize;
+                        std::memcpy(dst, rawVerts + std::size_t(tmpl) * vsize, vsize);
+                        WritePosOf(dst, desc, newPos);
+                        if (hasColors && colOff + 4u <= vsize) {
+                            dst[colOff + 0] = 0x55u;
+                            dst[colOff + 1] = 0x0Au;
+                            dst[colOff + 2] = 0x0Au;
+                            dst[colOff + 3] = 0xFFu;
+                        }
+                        ch.hub = std::uint16_t(newIdx);
+                        ch.hasHub = true;
+                    }
+                }
+                if (!ch.hasHub) {
+                    // Pick boundary vertex closest to loop centroid
+                    float bestD2 = 1e30f;
+                    std::uint16_t bestV = verts[0];
+                    for (std::uint16_t v : verts) {
+                        if (v >= nVerts) continue;
+                        float p[3];
+                        PosOf(rawVerts + std::size_t(v) * vsize, desc, p);
+                        const float dx = p[0] - cen[0], dy = p[1] - cen[1], dz = p[2] - cen[2];
+                        const float d2 = dx * dx + dy * dy + dz * dz;
+                        if (d2 < bestD2) { bestD2 = d2; bestV = v; }
+                    }
+                    ch.hub = bestV;
+                    ch.hasHub = true;
+                }
+            }
+        }
+        if (!ch.hasHub) {
+            ch.hub = verts[0];
+            ch.hasHub = true;
+        }
+    }
 
     std::uint32_t added = 0;
-    for (const auto& [a, b] : rim) {
-        if (added + 2 > maxTris) break;
-        const std::uint16_t h = hub[find(a)];
-        if (h == a || h == b) continue;              // degenerate at the hub
-        // The removed triangle used this edge the other way round, so b->a->h
-        // faces the way the surface used to. Both windings are emitted anyway:
-        // a cut face that can only be seen from one side is how this went wrong
-        // in the first place.
-        keep.push_back(b); keep.push_back(a); keep.push_back(h);
-        keep.push_back(a); keep.push_back(b); keep.push_back(h);
-        added += 2;
+    // Pass 1: outward-facing cut-side winding (b -> a -> hub) across ALL loops first
+    for (const LoopChain& ch : chains) {
+        const std::uint16_t h = ch.hub;
+        for (const auto& [a, b] : ch.edges) {
+            if (added >= maxTris) break;
+            if (h == a || h == b || a == b) continue;
+            keep.push_back(b); keep.push_back(a); keep.push_back(h);
+            ++added;
+        }
+        if (added >= maxTris) break;
+    }
+    // Pass 2: reverse winding reinforcement if triangle budget allows
+    for (const LoopChain& ch : chains) {
+        const std::uint16_t h = ch.hub;
+        for (const auto& [a, b] : ch.edges) {
+            if (added >= maxTris) break;
+            if (h == a || h == b || a == b) continue;
+            keep.push_back(a); keep.push_back(b); keep.push_back(h);
+            ++added;
+        }
+        if (added >= maxTris) break;
     }
     return added;
 }
@@ -959,16 +1129,27 @@ void Lattice::BuildAdjacency(const std::vector<ShapeData>& shapes)
     for (auto& [id, ks] : owners)
         for (std::size_t a = 0; a < ks.size(); ++a)
             for (std::size_t b = a + 1; b < ks.size(); ++b) {
+                const std::int32_t ox = ks[a].x - ks[b].x;
+                const std::int32_t oy = ks[a].y - ks[b].y;
+                const std::int32_t oz = ks[a].z - ks[b].z;
+                if (ox < -1 || ox > 1 || oy < -1 || oy > 1 || oz < -1 || oz > 1) continue;
                 if (!canLinkCells(ks[a], ks[b])) continue;
                 adj[ks[a]].insert(ks[b]);
                 adj[ks[b]].insert(ks[a]);
             }
 
-    // (b) cells that touch on the grid are neighbours, provided their anatomical parts touch.
+    // (b) cells that share a face on the 6-connected grid are neighbours, provided their anatomical parts touch.
+    // Using 6-connected face offsets (Manhattan distance 1) instead of 26-connected diagonal corners prevents
+    // diagonal air-corner leaks across thin/angled cuts, while (a) welded surface vertices and BridgeSections
+    // preserve genuine mesh seams and natural joint bridges.
+    static const int N6[6][3] = {
+        {-1, 0, 0}, {1, 0, 0},
+        {0, -1, 0}, {0, 1, 0},
+        {0, 0, -1}, {0, 0, 1},
+    };
     for (auto& [k, C] : cells)
-        for (const auto& d : N) {
+        for (const auto& d : N6) {
             const Key n{ k.x + d[0], k.y + d[1], k.z + d[2] };
-            if (n == k) continue;
             if (!canLinkCells(k, n)) continue;
             adj[k].insert(n); adj[n].insert(k);
         }
@@ -1083,34 +1264,63 @@ std::vector<Key> Lattice::Flood(const float p[3], float r, int maxCells,
 
 std::vector<std::vector<Key>> Lattice::Islands(const std::vector<Key>& sel, int maxCells) const
 {
-    std::set<Key> pool(sel.begin(), sel.end());
     std::vector<std::vector<Key>> out;
+    if (sel.empty()) return out;
     if (maxCells < 1) maxCells = 1;
 
-    // Breadth-first over the lattice's own neighbourhood WITHIN the selection
-    // -- 26 grid neighbours plus welded vertices plus bridges.
-    // Taking
-    // cells in BFS order and cutting at maxCells is what makes an oversized
-    // island fragment into compact lumps rather than into arbitrary slices:
-    // every fragment is still a connected run that grew outward from a seed.
+    // Sort + deduplicate keys once into a flat array and index with a 64-bit packed hash map
+    // (zero red-black tree allocations, preserving exact deterministic Key order and maxCells BFS splitting).
+    std::vector<Key> uniq = sel;
+    std::sort(uniq.begin(), uniq.end());
+    uniq.erase(std::unique(uniq.begin(), uniq.end()), uniq.end());
+    const int n = int(uniq.size());
 
-    while (!pool.empty()) {
+    auto packKey = [](const Key& k) -> std::uint64_t {
+        return (std::uint64_t(std::uint32_t(k.x) & 0x1FFFFFu))
+             | (std::uint64_t(std::uint32_t(k.y) & 0x1FFFFFu) << 21)
+             | (std::uint64_t(std::uint32_t(k.z) & 0x1FFFFFu) << 42);
+    };
+    std::unordered_map<std::uint64_t, int> idxOf;
+    idxOf.reserve(std::size_t(n) * 2u + 16u);
+    for (int i = 0; i < n; ++i) idxOf.emplace(packKey(uniq[i]), i);
+
+    // 0 = in pool, 1 = currently queued, 2 = emitted into an island
+    const std::size_t un = static_cast<std::size_t>(n);
+    std::vector<unsigned char> state(un, 0);
+    std::vector<int> q;
+    q.reserve(un);
+
+    int scan = 0;
+    for (;;) {
+        while (scan < n && state[std::size_t(scan)] != 0) ++scan;
+        if (scan >= n) break;
+
         std::vector<Key> island;
-        std::deque<Key> q;
-        Key seed = *pool.begin();
-        pool.erase(pool.begin());
-        q.push_back(seed);
-        while (!q.empty() && int(island.size()) < maxCells) {
-            Key k = q.front(); q.pop_front();
-            island.push_back(k);
-            for (const Key& n : Neighbours(k)) {
-                auto it = pool.find(n);
-                if (it != pool.end()) { pool.erase(it); q.push_back(n); }
+        island.reserve(std::size_t(std::min(n, maxCells)));
+        q.clear();
+        state[std::size_t(scan)] = 1;
+        q.push_back(scan);
+        std::size_t head = 0;
+        while (head < q.size() && int(island.size()) < maxCells) {
+            const int u = q[head++];
+            state[std::size_t(u)] = 2;
+            island.push_back(uniq[std::size_t(u)]);
+            for (const Key& nb : Neighbours(uniq[std::size_t(u)])) {
+                auto it = idxOf.find(packKey(nb));
+                if (it == idxOf.end()) continue;
+                const int w = it->second;
+                if (state[std::size_t(w)] == 0) {
+                    state[std::size_t(w)] = 1;
+                    q.push_back(w);
+                }
             }
         }
-        // anything the cut left queued goes back for the next island, so the
-        // remainder of a big lump stays connected instead of being orphaned
-        for (const Key& k : q) pool.insert(k);
+        // Return unconsumed queued indices back to pool (state 0) and rewind scan if needed
+        for (std::size_t rem = head; rem < q.size(); ++rem) {
+            const int w = q[rem];
+            state[std::size_t(w)] = 0;
+            if (w < scan) scan = w;
+        }
         if (!island.empty()) out.push_back(std::move(island));
     }
     return out;
@@ -2957,39 +3167,66 @@ std::vector<Section> Sections(const Lattice& L, std::uint32_t mask, std::uint32_
     std::vector<int> comp(n, -1);
     std::vector<Section> out;
 
-    // ---- components over the NAMED cells, hopping only across real joints
-    std::vector<int> q;
-    for (int seed = 0; seed < n; ++seed) {
-        if (ps[seed] == Part::Unknown || comp[seed] >= 0) continue;
-        const int id = int(out.size());
-        out.push_back(Section());
-        comp[seed] = id;
-        q.clear(); q.push_back(seed);
-        for (std::size_t head = 0; head < q.size(); ++head) {
-            const int u = q[head];
-            const Part pu = ps[u];
-            out[id].cells.push_back(ks[u]);
-            out[id].parts |= 1u << unsigned(pu);
-            ++out[id].cellsPer[std::size_t(pu)];
-            ++out[id].named;
-            if (cs[u]->mine) {
-                ++out[id].flesh;
-                ++out[id].minePer[std::size_t(pu)];
-            }
-            for (const Key& v : L.Neighbours(ks[u])) {
-                auto f = at.find(pack(v));
-                if (f == at.end()) continue;
-                const int w = f->second;
-                if (comp[w] >= 0 || ps[w] == Part::Unknown) continue;
-                // A bridge is walked whatever the anatomy says -- it was put
-                // there because these two cells ARE attached on their whole
-                // body, which is a stronger fact than any joint table.
-                if (!PartsTouch(pu, ps[w]) && !L.Bridged(ks[u], ks[w])) continue;
-                comp[w] = id;
-                q.push_back(w);
-            }
+    // ---- components over the NAMED cells using path-compressed Union-Find, hopping only across real joints
+    const std::size_t un = static_cast<std::size_t>(n);
+    std::vector<int> ufParent(un);
+    std::vector<unsigned char> ufRank(un, 0);
+    for (int i = 0; i < n; ++i) ufParent[std::size_t(i)] = i;
+    auto ufFind = [&](int x) -> int {
+        int r = x;
+        while (ufParent[std::size_t(r)] != r) r = ufParent[std::size_t(r)];
+        while (ufParent[std::size_t(x)] != r) {
+            const int nxt = ufParent[std::size_t(x)];
+            ufParent[std::size_t(x)] = r;
+            x = nxt;
+        }
+        return r;
+    };
+    auto ufUnite = [&](int a, int b) {
+        a = ufFind(a);
+        b = ufFind(b);
+        if (a == b) return;
+        if (ufRank[std::size_t(a)] < ufRank[std::size_t(b)]) { int t = a; a = b; b = t; }
+        ufParent[std::size_t(b)] = a;
+        if (ufRank[std::size_t(a)] == ufRank[std::size_t(b)]) ++ufRank[std::size_t(a)];
+    };
+
+    for (int u = 0; u < n; ++u) {
+        const Part pu = ps[std::size_t(u)];
+        if (pu == Part::Unknown) continue;
+        for (const Key& v : L.Neighbours(ks[std::size_t(u)])) {
+            auto f = at.find(pack(v));
+            if (f == at.end()) continue;
+            const int w = f->second;
+            if (w <= u || ps[std::size_t(w)] == Part::Unknown) continue;
+            if (!PartsTouch(pu, ps[std::size_t(w)]) && !L.Bridged(ks[std::size_t(u)], ks[std::size_t(w)])) continue;
+            ufUnite(u, w);
         }
     }
+
+    std::vector<int> rootToId(un, -1);
+    for (int u = 0; u < n; ++u) {
+        const Part pu = ps[std::size_t(u)];
+        if (pu == Part::Unknown) continue;
+        const int r = ufFind(u);
+        int id = rootToId[std::size_t(r)];
+        if (id < 0) {
+            id = int(out.size());
+            rootToId[std::size_t(r)] = id;
+            out.push_back(Section());
+        }
+        comp[std::size_t(u)] = id;
+        out[std::size_t(id)].cells.push_back(ks[std::size_t(u)]);
+        out[std::size_t(id)].parts |= 1u << unsigned(pu);
+        ++out[std::size_t(id)].cellsPer[std::size_t(pu)];
+        ++out[std::size_t(id)].named;
+        if (cs[std::size_t(u)]->mine) {
+            ++out[std::size_t(id)].flesh;
+            ++out[std::size_t(id)].minePer[std::size_t(pu)];
+        }
+    }
+
+    std::vector<int> q;
 
     // ---- the unnamed cells ride with whoever reaches them first
     //

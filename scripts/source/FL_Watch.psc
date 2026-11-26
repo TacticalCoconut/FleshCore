@@ -89,6 +89,9 @@ Int nextEvent = 1
 ; The last FL_Wounded payload, verbatim, for get_script_property readers:
 ; the same string FL_Effects keeps per actor.
 String Property LastWound Auto Hidden
+Form[] _severWatch
+Float[] _severWatchUntil
+Int _severWatchCursor = 0
 Int lastStamp = 0
 ; THE STAMP IS COMPARED AS TEXT. The DLL writes GetTickCount() | 1
 ; as an unsigned decimal, and between 24.8 and 49.7 days of machine uptime
@@ -182,6 +185,9 @@ Float panelTapAt  = 0.0
 ; unset, because a variable a save does not carry comes back as the type's
 ; default -- the rule above.
 Int   panelKeyMCM = 0
+; The lastLoad that LearnPanelFromConfig last ran under, so a menu's reload
+; push that changes nothing does not read and parse the config a second time.
+Int   panelLearnedLoad = 0
 Bool skipFirstWindow = false ; set by OnInit: a NEW GAME's first stamp opens no window (the Helgen cart)
 Int predressPasses = 0       ; passes left in the window; 0 is closed
 Int predressChanged = 0      ; actors on whom the window put an interior or a head
@@ -247,6 +253,7 @@ Event OnInit()
     ; it always has. On the existing-save case the flag costs one window, and
     ; the next load has it.
     skipFirstWindow = true
+    RegisterForModEvent("FC_Wake", "OnFleshCoreWake")
     RegisterForSingleUpdate(Tick())
 EndEvent
 
@@ -287,6 +294,18 @@ Event OnKeyDown(Int keyCode)
         panelTapAt = now
     EndIf
 EndEvent
+
+Function OnFleshCoreWake(String eventName, String strArg, Float numArg, Form sender)
+    Drain()
+    EventPass()
+    DressRequested(true)
+    ReviveRequested()
+    ; ANSWERED. The DLL sends one wake at a time and holds the rest until this
+    ; arrives (or a few seconds pass), so wakes cannot pile up as queued stacks
+    ; behind each other on this script. Nothing waits on it: the regular tick
+    ; drains the same queues anyway.
+    SendModEvent("FC_WakeDone")
+EndFunction
 
 Float Function Tick()
     {THE PROPERTY CANNOT BE TRUSTED TO BE FAST. A property filled in the plugin
@@ -364,6 +383,12 @@ Event OnUpdate()
     If beats % 5 == 2
         VoiceMouthPass()
     EndIf
+    ; A place line's SkyrimNet fallback waits three seconds for the engine's
+    ; own report of the same wound; see SNPlaceFallbackPass. One list count
+    ; when nothing is waiting.
+    If beats % 5 == 4
+        SNPlaceFallbackPass()
+    EndIf
     ; Twice a second is enough for a pool that grows over twelve seconds, and
     ; it keeps the spend predictable: at most two marks a second per bleeding
     ; target, whatever the frame rate is doing.
@@ -423,6 +448,19 @@ Event OnUpdate()
     ; that window, and Dress refuses a non-target in three cheap tests before
     ; it touches anything. The tick ALREADY runs slower than the
     ; 0.05s asked for, so this is the most it may cost.
+    If beats % 50 == 13
+        Actor pSweep = Game.GetPlayer()
+        If pSweep && Interior
+            Int sw = 0
+            While sw < 2
+                Actor ra = Game.FindRandomActorFromRef(pSweep, 3000.0)
+                If ra && ra != pSweep && !ra.IsDead() && !ra.IsDisabled()
+                    Dress(ra, false)
+                EndIf
+                sw += 1
+            EndWhile
+        EndIf
+    EndIf
     If beats % 40 == 0
         String gnow = MiscUtil.ReadFromFile("Data/SKSE/Plugins/FleshCore.grants.txt")
         If gnow != lastGrantsRaw
@@ -480,6 +518,7 @@ Race  beast1 = None          ; the four races the head fill was never built for
 Race  beast2 = None
 Race  beast3 = None
 Race  beast4 = None
+Keyword beastKeyword = None
 Bool  beastAsked = false
 
 Bool Function HasAcheron()
@@ -526,8 +565,17 @@ Function KillForReal(Actor vic)
             Acheron.ReleaseActor(vic)
         EndIf
     EndIf
+    ActorBase lab = vic.GetLeveledActorBase()
+    If lab
+        If lab.IsEssential()
+            lab.SetEssential(false)
+        EndIf
+        If lab.IsProtected()
+            lab.SetProtected(false)
+        EndIf
+    EndIf
     ActorBase ab = vic.GetActorBase()
-    If ab
+    If ab && ab != lab
         If ab.IsEssential()
             ab.SetEssential(false)
         EndIf
@@ -535,6 +583,7 @@ Function KillForReal(Actor vic)
             ab.SetProtected(false)
         EndIf
     EndIf
+    vic.SetNoBleedoutRecovery(true)
     vic.EndDeferredKill()
     vic.Kill()
     If !vic.IsDead()
@@ -542,6 +591,15 @@ Function KillForReal(Actor vic)
     EndIf
     If !vic.IsDead()
         vic.KillSilent()
+    EndIf
+    If !vic.IsDead()
+        Actor pKiller = Game.GetPlayer()
+        If pKiller && pKiller != vic
+            vic.KillSilent(pKiller)
+            If !vic.IsDead()
+                vic.KillEssential(pKiller)
+            EndIf
+        EndIf
     EndIf
     If guarded
         If Acheron.IsDefeated(vic) || Acheron.IsPacified(vic)
@@ -552,6 +610,12 @@ Function KillForReal(Actor vic)
             If !vic.IsDead()
                 vic.KillEssential()
             EndIf
+            If !vic.IsDead()
+                Actor pKiller2 = Game.GetPlayer()
+                If pKiller2 && pKiller2 != vic
+                    vic.KillSilent(pKiller2)
+                EndIf
+            EndIf
         EndIf
         killGuard -= 1
         If killGuard <= 0
@@ -560,18 +624,22 @@ Function KillForReal(Actor vic)
             Acheron.DisableConsequence(false)
         EndIf
     EndIf
+    vic.StopTranslation()
+    vic.SetVehicle(None)
+    vic.SetRestrained(false)
+    vic.SetDontMove(false)
     If !vic.IsDead()
         vic.StopCombat()
         vic.StopCombatAlarm()
         vic.SetActorValue("Aggression", 0.0)
         vic.SetActorValue("Assistance", 0.0)
-        vic.SetUnconscious(true)
-        vic.SetRestrained(true)
         vic.SetNoBleedoutRecovery(true)
-        vic.SetActorValue("Paralysis", 1.0)
         Float curHP = vic.GetActorValue("Health")
         If curHP > -500.0
             vic.DamageActorValue("Health", curHP + 1000.0)
+        EndIf
+        If !vic.IsDead()
+            vic.SetUnconscious(true)
         EndIf
     EndIf
 EndFunction
@@ -622,6 +690,11 @@ Function RegrantSpells()
     ; Taking something away has nothing to do with the list of things to give.
     Int gone = 0
     gone += DropSpell(0x00000888)         ; FL_DetonateAlt_Spell
+    gone += DropSpell(0x0000089E)         ; FL_DetonateSelf_Spell (Shredder internal)
+    gone += DropSpell(0x000008A0)         ; FL_ArmOffLSelf_Spell
+    gone += DropSpell(0x000008A2)         ; FL_ArmOffRSelf_Spell
+    gone += DropSpell(0x000008A4)         ; FL_LegOffLSelf_Spell
+    gone += DropSpell(0x000008A6)         ; FL_LegOffRSelf_Spell
     If gone > 0
         Debug.Notification("[FleshCore] " + gone + " retired spell(s) removed")
         Debug.Trace("[FleshCore] watcher removed " + gone + " retired spell(s)")
@@ -677,30 +750,6 @@ Function RegrantSpells()
             EndIf
         EndIf
         i += 1
-    EndWhile
-    ; Also sync the self-amputation and self-detonate spells in FleshCore.esp (0x089E, 0x08A0, 0x08A2, 0x08A4, 0x08A6)
-    Int[] selfLimbIds = new Int[5]
-    selfLimbIds[0] = 0x089E
-    selfLimbIds[1] = 0x08A0
-    selfLimbIds[2] = 0x08A2
-    selfLimbIds[3] = 0x08A4
-    selfLimbIds[4] = 0x08A6
-    Int sl = 0
-    While sl < 5
-        Int slid = selfLimbIds[sl]
-        Spell ssp = Game.GetFormFromFile(slid, "FleshCore.esp") as Spell
-        If ssp
-            Bool swant = StringUtil.Find(granted, "\n" + slid + "\n") >= 0
-            Bool shas = player.HasSpell(ssp)
-            If swant && !shas
-                player.AddSpell(ssp, false)
-                n += 1
-            ElseIf !swant && shas
-                player.RemoveSpell(ssp)
-                taken += 1
-            EndIf
-        EndIf
-        sl += 1
     EndWhile
     Spell panelSp = Game.GetFormFromFile(0x08C3, "FleshCore.esp") as Spell
     If panelSp && player.HasSpell(panelSp) && StringUtil.Find(granted, "\n" + 0x08C3 + "\n") < 0
@@ -765,21 +814,36 @@ Int Function DropSpell(Int localId)
 EndFunction
 
 Bool Function IsBeast(Actor a)
-    {Argonian or Khajiit, either living or vampire.
-
-     RESOLVED ONCE, like RetiredHead(). Four Game.GetFormFromFile calls per
-     SeatHead would be up to a thousand mod-by-filename lookups a second on a
-     busy dressing pass -- none of them short-circuits for a human, which is
-     the common case.}
+    {Argonian, Khajiit, or modded beast race (vanilla IDs, ActorTypeBeast, or EditorID/name).}
+    If !a
+        Return false
+    EndIf
     If !beastAsked
         beastAsked = true
         beast1 = Game.GetFormFromFile(0x00013740, "Skyrim.esm") as Race  ; Argonian
         beast2 = Game.GetFormFromFile(0x0008883A, "Skyrim.esm") as Race  ; Argonian vampire
         beast3 = Game.GetFormFromFile(0x00013745, "Skyrim.esm") as Race  ; Khajiit
         beast4 = Game.GetFormFromFile(0x00088845, "Skyrim.esm") as Race  ; Khajiit vampire
+        beastKeyword = Game.GetFormFromFile(0x00013794, "Skyrim.esm") as Keyword
     EndIf
     Race rc = a.GetRace()
-    Return rc && (rc == beast1 || rc == beast2 || rc == beast3 || rc == beast4)
+    If !rc
+        Return false
+    EndIf
+    If rc == beast1 || rc == beast2 || rc == beast3 || rc == beast4
+        Return true
+    EndIf
+    If beastKeyword && rc.HasKeyword(beastKeyword)
+        Return true
+    EndIf
+    String both = PO3_SKSEFunctions.GetFormEditorID(rc) + "|" + rc.GetName()
+    If StringUtil.Find(both, "argonian") >= 0 || StringUtil.Find(both, "khajiit") >= 0 \
+            || StringUtil.Find(both, "saxhleel") >= 0 || StringUtil.Find(both, "serval") >= 0 \
+            || StringUtil.Find(both, "ohmes") >= 0 || StringUtil.Find(both, "pahmar") >= 0 \
+            || StringUtil.Find(both, "dagi") >= 0
+        Return true
+    EndIf
+    Return false
 EndFunction
 
 FL_KO_Hold Function Hold()
@@ -811,124 +875,42 @@ Armor Function RetiredHead()
 EndFunction
 
 Function SeatHead(Actor a)
+    TrySeatHead(a)
+EndFunction
+
+Bool Function TrySeatHead(Actor a)
     {PUT THE HEAD FILL ON THEM, AND TAKE OFF THE RETIRED ONE.
-
-     Which armour `headFill` is comes from field zero of either mailbox, and
-     the engine reads it from one line of FleshCore.cfg.txt. Now that
-     line names FL_HeadFill, which lives on biped slot 47 and leaves their own
-     head alone; before it, it named FL_Head, which lives on slot 30 and made
-     the engine hide their real head -- which is why every dressed target used to
-     be bald.
-
-     The retired armour is named by its local id rather than by a property:
-     FormIDs never move in this plugin, so 0x860 is a fact, and adding a
-     property to retire a record is the wrong way round. It is taken off ONLY
-     when it is not the one the config named.
-
-     PUT THE X ROW BACK TO FL_Head AND THIS SEATS IT AND NOTHING ELSE -- but
-     not quite as the old code did, and the difference is deliberate: this function
-     also refuses a beast target and refuses to fight another mod for the slot,
-     and the old code did neither. On the rollback path that means a target wearing a
-     slot-30 helmet keeps it and gets no head fill, where the old code would have
-     knocked the helmet off.}
+     Returns true if head fill is seated or already worn; false if blocked (beast, NGD, slot 47).}
     If !a || !headFill
-        Return
+        Return true
     EndIf
-    ; ---- NOT ON A BEAST TARGET -------------------------------------------
-    ;
-    ; The fill was sampled from a human FaceGen head and nothing about it was
-    ; ever measured against an Argonian or a Khajiit: their heads are different
-    ; meshes and a human skull inside a muzzle is a bug
-    ; with a texture on it. FL_HeadFill is a DefaultRace ARMO and both races
-    ; are playable, so WhyRefused lets them through -- this is the only gate.
-    ; They keep their own faces and get no fill until there is one built for
-    ; them.
-    ; THE RETIRED HEAD STILL COMES OFF THEM. They get no fill, but a human
-    ; FaceGen head on a lizard is what FL_Head was doing to them and it has to
-    ; stop whether or not there is anything to put in its place. Without this,
-    ; every Argonian and Khajiit in an existing save keeps the slot-30 head for
-    ; the life of that save while the targets around them get their faces back.
     If IsBeast(a)
         Armor beastOld = RetiredHead()
         If beastOld && beastOld != headFill && a.IsEquipped(beastOld)
             a.UnequipItem(beastOld, false, true)
         EndIf
-        Return
+        If a.IsEquipped(headFill)
+            a.UnequipItem(headFill, false, true)
+        EndIf
+        Return false
     EndIf
-    ; ---- NOTHING TO DO IS THE COMMON CASE, AND IT COSTS THREE CALLS ------
-    ;
-    ; Dress() calls this on every pass, up to five times a second per name in
-    ; the mailbox, and almost every one of those targets is already correctly
-    ; seated. Answering that with GetRace, GetSlotMask, GetWornForm, two
-    ; IsEquipped and a GetItemCount is six natives to do nothing.
-    ;
-    ; BOTH CONDITIONS, though: they are only finished when they wear the head
-    ; the config named AND is not still wearing the one it retired. Slot 30
-    ; and slot 47 are different slots and they can hold both at once, which is
-    ; the state an upgraded save starts in.
+    If Game.IsPluginInstalled("Next-Gen Decapitations.esp") && NGDecapitations.IsDecapitated(a)
+        Return false
+    EndIf
     Armor oldHead = RetiredHead()
     Bool stillOld = oldHead && oldHead != headFill && a.IsEquipped(oldHead)
     If a.IsEquipped(headFill) && !stillOld
-        Return
+        Return true
     EndIf
-    ; ---- AND NEVER FIGHT ANOTHER MOD FOR THE SLOT ------------------------
-    ;
-    ; The head fill lives on biped slot 47 and it is not alone there.
-    ; A large load order can hold hundreds of
-    ; records declaring
-    ; slot 47, ARMOs among them,
-    ; across dozens of mods -- capes, accessory sets and SMP outfits, and no
-    ; framework. Slots 61 and 54 are busy too,
-    ; and slot 55 -- which FleshCore also ships on --
-    ; is busier still.
-    ;
-
-
-
-    ;
-    ; So a collision is not a rare accident, and the wrong answer is to equip
-    ; anyway: EquipItem would knock their cape off, their outfit's own script or
-    ; the next re-seat would put it back, and the two would take turns for the
-    ; rest of the save. They keep what they are already wearing, their head simply
-    ; has no fill, and the log names the item so it can be decided rather than
-    ; discovered.
-    ; THE MASK COMES FROM THE ARMOUR, NOT FROM A NUMBER HERE. Armor.GetSlotMask
-    ; is SKSE's own (Armor.psc), so this asks about whatever slot the config
-    ; named -- 47 for FL_HeadFill, 30 if the X row is ever pointed back at
-    ; FL_Head. A hardcoded 47 would ask the wrong question the moment it is.
     Form worn = a.GetWornForm(headFill.GetSlotMask())
     If worn && worn != (headFill as Form)
-        ; NOT Debug.Trace ALONE. Papyrus logging is often off,
-        ; so a trace here
-        ; would satisfy nobody. One line per collision in a file of its own,
-        ; naming the actor and the item that holds the slot, so those records
-        ; can be decided about rather than discovered.
-        ;
-        ; AND THROTTLED, HARD. This is a synchronous open/append/close, and the
-        ; path it sits on runs at five hertz per name in the mailbox -- the
-        ; same path the re-seat below throttles to one pass in a hundred for
-        ; exactly this reason. A beat is 0.05 s and the counter runs to 1200
-        ; before it resets, so `beats % 400` is beats 400, 800 and 1200: three
-        ; passes a minute, GLOBAL rather than per target -- on one of those
-        ; passes every colliding actor in it writes a line. The collision is a
-        ; standing state, not an event, so three passes a minute is more than
-        ; enough to name it. The Return is OUTSIDE the throttle: they are left
-        ; alone on every pass and logged on a few.
         If beats % 400 == 0
             MiscUtil.WriteToFile("Data/SKSE/Plugins/FleshCore.slot.txt", \
                 Utility.GetCurrentRealTime() + " " + a + " slot held by " + worn + "\n", \
                 true, false)
         EndIf
-        Return
+        Return false
     EndIf
-    ; ---- AND ONLY NOW DOES THE RETIRED HEAD COME OFF ---------------------
-    ;
-    ; STRICTLY AFTER the occupancy check, and the order matters. If
-    ; the slot is taken they keep everything they had, including the slot-30
-    ; head from an older save -- bald, as the old head left them, but with a
-    ; skull and a brain in the lattice. Taking the old head off first and then
-    ; discovering the new one cannot be seated would leave them with NEITHER,
-    ; and a target with no head fill cannot be killed by a head wound at all.
     If stillOld
         a.UnequipItem(oldHead, false, true)
     EndIf
@@ -938,6 +920,7 @@ Function SeatHead(Actor a)
     If !a.IsEquipped(headFill)
         a.EquipItem(headFill, false, true)
     EndIf
+    Return true
 EndFunction
 
 ; THE ONE LOAD THIS USED TO MISS. The docstring below says the DLL's
@@ -1043,6 +1026,7 @@ Function CheckLoad()
     nextWound = 1
     nextEvent = 1
     moaned = false
+    ClearSeverWatchAll()
     ; ---- AND THE HEAD ARMOUR IS FORGOTTEN, NOT REMEMBERED ----------------
     ;
     ; headFill is a plain script VARIABLE, so Papyrus serialises it into the
@@ -1062,6 +1046,7 @@ Function CheckLoad()
     ; is not something to trust in the next.
     retiredHeadAsked = false
     beastAsked = false
+    beastKeyword = None
     koHoldAsked = false
     ; ---- AND LEARNED BACK FROM THE CONFIG AT ONCE ----------------
     ;
@@ -1085,7 +1070,7 @@ Function CheckLoad()
     ; exactly the sweep it has always seen, heads included only after the
     ; first mailbox, as before.
     announceDressing = false
-    preDressOff = true
+    preDressOff = false
     If !skipFirstWindow
         LearnHeadFromConfig()
     EndIf
@@ -1127,6 +1112,11 @@ Function CheckLoad()
     If hooksQuest
         hooksQuest.RegisterForModEvent("FleshCore_GameReload", "OnFleshCoreReload")
     EndIf
+    Quest dcQuest = Game.GetFormFromFile(0x000008D5, "FleshCore.esp") as Quest
+    If dcQuest
+        dcQuest.RegisterForModEvent("FleshCore_GameReload", "OnFleshCoreReload")
+    EndIf
+    RegisterForModEvent("FC_Wake", "OnFleshCoreWake")
     SendModEvent("FleshCore_GameReload")
     ; A load is the one moment the process may be carrying a death-camera
     ; setting this script's own memory of has rolled back with the save; the
@@ -1183,7 +1173,22 @@ Function CheckLoad()
     ; tick runs slow -- for the reason the strip has fifty: the stamp is not a
     ; promise that anyone's 3D has arrived. The opening pass runs this beat. Not
     ; on the stamp a new game writes (skipFirstWindow, see OnInit).
-    predressPasses = 0
+    If !predressDone || predressDone.Length < 16
+        predressDone = new Form[16]
+    EndIf
+    If !predressSkip || predressSkip.Length < 64
+        predressSkip = new Form[64]
+    EndIf
+    If !preDressOff && !skipFirstWindow
+        predressPasses = 15
+        predressPlayerDone = false
+        predressDoneN = 0
+        predressSkipN = 0
+        predressChanged = 0
+        predressSeen = 0
+    Else
+        predressPasses = 0
+    EndIf
     skipFirstWindow = false
     ; AND THE SAVE'S OWN RECORD IS SNAPSHOTTED FOR THOSE PASSES TO WORK THROUGH.
     ; Read now rather than per pass because StorageUtil has just rolled back with
@@ -1268,6 +1273,7 @@ Function CheckSession()
         lastStamp = st as Int
         nextWound = 1
         nextEvent = 1
+        ClearSeverWatchAll()
         Debug.Trace("[FleshCore] watcher: engine session " + lastStamp + " -- wound sequence restarted at 1")
         ; AND THE LOAD THAT LED HERE IS MADE VISIBLE. Reaching
         ; this line means a load happened that CheckLoad did not fire on: the
@@ -1290,12 +1296,18 @@ Function CheckSession()
     EndIf
 EndFunction
 
+Bool _draining = false
+
+Function DrainNow()
+    Drain()
+EndFunction
+
 Function Drain()
-    {Claim wound files in order. Each number is read once and never again, so
-     nothing has to be blanked and nothing can be lost to someone else's write.}
+    {Drain ready wound batches from DLL memory via FL_Native.PopWoundBatch().}
+    If _draining
+        Return
+    EndIf
     If !Pool
-        ; LOGGED ONCE, LOUDLY. This script is now the ONLY placer, so an
-        ; unwired Pool means no piece of any wound ever reaches the world.
         If !moaned
             moaned = true
             Debug.Trace("[FleshCore] watcher has NO POOL -- it can place nothing")
@@ -1304,89 +1316,32 @@ Function Drain()
     EndIf
     Int guard = 0
     While guard < 8
-        String path = "Data/SKSE/Plugins/FleshCore.w" + nextWound + ".txt"
-        Bool here = MiscUtil.FileExists(path)
-        String out = ""
-        Bool whole = false
-        If here
-            out = MiscUtil.ReadFromFile(path)
-            ; THE TERMINATOR IS THE PROOF THE FILE IS FINISHED. The forge
-            ; thread opens, writes and closes; a reader that looks in between
-            ; sees a file that exists and is empty. Rather than treat that as a
-            ; wound with no pieces, wait and read it whole.
-            Int len = StringUtil.GetLength(out)
-            whole = len > 0 && StringUtil.SubString(out, len - 1, 1) == "#"
+        String out = FL_Native.PopWoundBatch()
+        If out == ""
+            _draining = false
+            Return
         EndIf
-        If !whole
-            ; A WOUND NUMBER THAT NEVER ARRIVES USED TO STOP THE MOD DEAD.
-            ;
-            ; The engine takes its sequence number BEFORE it writes, so a write
-            ; that fails -- a scanner holding the folder, a full disk, anything
-            ; -- consumes a number that no file will ever carry. This reader
-            ; walked the sequence in strict order and simply waited for it, and
-            ; waited, and no piece of any later wound ever spawned again. That
-            ; is a permanent, silent death for the whole feature, and it needed
-            ; one file check to avoid.
-            ;
-            ; The forge writes wounds in order on one thread, so if the NEXT
-            ; number is already on disk, this one is finished or is never
-            ; coming. Either way it is safe to step over.
-            If (here || (beats % 20) == 0) && MiscUtil.FileExists("Data/SKSE/Plugins/FleshCore.w" + (nextWound + 1) + ".txt")
-                Debug.Trace("[FleshCore] watcher: wound " + nextWound + " never arrived whole -- skipping it")
-                nextWound += 1
-                guard += 1
-            Else
-                Return
-            EndIf
-        Else
-            ; HOW LATE THE PIECES ARE. The engine stamps its log with the
-            ; moment it posted a wound; this stamps the moment the wound was
-            ; picked up. The gap between them is how long a mesh sat on disk
-            ; before anything asked for it, and that is the exact interval a
-            ; race would have to live in.
-            If ProbeVerbose
-                Debug.Trace("[FleshCore] PROBE drain w=" + nextWound + " picked up at " \
-                            + Utility.GetCurrentRealTime() + " (tick " + Tick() + "s)")
-            EndIf
-            nextWound += 1
-            guard += 1
-            PlaceLine(out)
-        EndIf
+        _draining = true
+        nextWound += 1
+        guard += 1
+        PlaceLine(out)
+        _draining = false
     EndWhile
+    _draining = false
 EndFunction
 
 Function EventPass()
-    {Relay the engine's events. Each FleshCore.ev<N>.txt is
-     "<name>|<senderFormID>|<numArg>|<strArg>\n#", read once in order, and
-     sent as a mod event FROM THE SENDER it names, so a handler's fourth
-     argument is the victim (or the command's target); a sender of 0 is this
-     quest. FL_Wounded also updates LastWound and the per-actor state string
-     here, which is what FL_Api.BodyState reads.}
+    {Relay events popped from DLL memory via FL_Native.PopEvent().
+     PopEvent() strings have NO trailing "\n#" terminator.}
     Int guard = 0
     While guard < 8
-        String path = "Data/SKSE/Plugins/FleshCore.ev" + nextEvent + ".txt"
-        If !MiscUtil.FileExists(path)
+        String line = FL_Native.PopEvent()
+        If line == ""
             Return
         EndIf
-        String out = MiscUtil.ReadFromFile(path)
-        Int len = StringUtil.GetLength(out)
-        If len == 0 || StringUtil.SubString(out, len - 1, 1) != "#"
-            If MiscUtil.FileExists("Data/SKSE/Plugins/FleshCore.ev" + (nextEvent + 1) + ".txt")
-                nextEvent += 1
-                guard += 1
-            Else
-                Return
-            EndIf
-        Else
-            nextEvent += 1
-            guard += 1
-            ; strip the "\n#" the DLL wrote last
-            Int cut = len - 2
-            While cut > 0 && StringUtil.SubString(out, cut - 1, 1) == "\n"
-                cut -= 1
-            EndWhile
-            RelayEvent(StringUtil.SubString(out, 0, cut))
-        EndIf
+        nextEvent += 1
+        guard += 1
+        RelayEvent(line)
     EndWhile
 EndFunction
 
@@ -1408,12 +1363,30 @@ Function RelayEvent(String line)
     If name == "FL_Wounded" && sender
         LastWound = payload
         StorageUtil.SetStringValue(sender, "FC_state", payload)
+        ; The engine's own report of this wound. A place-line fallback queued
+        ; for them (NotifySkyrimNetFromPlace) is no longer needed, and one that
+        ; comes in the next few seconds is not sent (one row per wound).
+        StorageUtil.SetFloatValue(sender, "FC_SNRealAt", Utility.GetCurrentRealTime())
+        StorageUtil.UnsetStringValue(sender, "FC_SNPlaceSynth")
         NotifySkyrimNetWound(sender as Actor, payload)
     ElseIf name == "FL_Restored" && sender
         StorageUtil.UnsetStringValue(sender, "FC_state")
         StorageUtil.UnsetIntValue(sender, "FC_SNLostMask")
         StorageUtil.UnsetIntValue(sender, "FC_CorpseDress")
-        CleanFEC(sender as Actor)
+        ClearSeverWatchFor(sender)
+        ; FEC marks the dead, so only the dead, the down and the resurrected are
+        ; cleaned. CleanFEC resets their 3D, and a Restore must not do that to
+        ; someone still on their feet (a living player moved away by another mod).
+        Actor ra = sender as Actor
+        If ra && (FL_Api.Field(payload, 0) == "resurrect" || ra.IsDead() || ra.IsBleedingOut() || ra.IsUnconscious())
+            CleanFEC(ra)
+        EndIf
+        ; DecalCore's skin coat comes off everyone restored, standing or not;
+        ; stopping it does not touch their 3D. Loaded bodies only, as in
+        ; ReviveRequested.
+        If ra && ra.Is3DLoaded()
+            DC_Api.UncoatAll(ra)
+        EndIf
     ElseIf name == "FL_TestReport"
         StorageUtil.SetStringValue(None, "FC_LastTestReport", payload)
         Debug.Notification(payload)
@@ -1449,7 +1422,11 @@ Function NotifySkyrimNetWound(Actor vic, String payload)
     If lostMask != prevLostMask
         StorageUtil.SetIntValue(vic, "FC_SNLostMask", Math.LogicalOr(prevLostMask, lostMask))
     EndIf
-    Bool isBlast = (flags / 1024 % 2 == 1) || (wForm == "detonate")
+    ; BIT 10 MEANS A BLAST ONLY IN A PLACE LINE. In the engine's FL_Wounded
+    ; flags it is the wound's own nokill column (a wound that must not kill), so
+    ; there only a Detonate is a blast; the place-line fallback's payload
+    ; (field 0 "place") carries the place line's flags, where bit 10 is the blast.
+    Bool isBlast = (wForm == "detonate") || (FL_Api.Field(payload, 0) == "place" && flags / 1024 % 2 == 1)
     Bool headLost = (flags / 4096 % 2 == 1)
     Bool trunkLost = Math.LogicalAnd(newLostMask, 12) != 0
     Bool lArmLost = Math.LogicalAnd(newLostMask, 112) != 0
@@ -1468,6 +1445,11 @@ Function NotifySkyrimNetWound(Actor vic, String payload)
         curSev = 3
     ElseIf cellsTaken >= 25
         curSev = 2
+    EndIf
+    ; Another system tells this wound in its own words (FC_SNQuietUntil /
+    ; FC_SNQuietSev, see SkyrimNetQuiet). The lost mask above is kept current.
+    If SkyrimNetQuiet(vic, curSev, now)
+        Return
     EndIf
     If (now - lastAt) < 1.5 && curSev <= lastSev && !headLost && !trunkLost
         Return
@@ -1549,14 +1531,35 @@ Function NotifySkyrimNetWound(Actor vic, String payload)
         EndIf
         msg = vName + " suffers a grievous flesh wound tearing open their " + region + "!"
     EndIf
-    SkyrimNetApi.RegisterEvent(evType, msg, vic, None)
+    ; ONE ROW PER WOUND. The narration goes when it can go out (onlookers react
+    ; at once); otherwise the typed event goes. Never both.
+    Bool told = false
     If curSev >= 2 && StorageUtil.GetIntValue(None, "FC_SkyrimNetDirect", 1) != 0
         Float lastGlobal = StorageUtil.GetFloatValue(None, "FC_SNGlobalDirectAt", 0.0)
-        If (now - lastGlobal) >= 4.0
+        If lastGlobal > now || (now - lastGlobal) >= 4.0
             StorageUtil.SetFloatValue(None, "FC_SNGlobalDirectAt", now)
             SkyrimNetApi.DirectNarration(msg, vic, None)
+            told = true
         EndIf
     EndIf
+    If !told
+        SkyrimNetApi.RegisterEvent(evType, msg, vic, None)
+    EndIf
+EndFunction
+
+Bool Function SkyrimNetQuiet(Actor vic, Int curSev, Float now)
+    {True while another system has asked that FleshCore not tell SkyrimNet
+     about this actor's wounds, because it reports them in its own words.
+     FC_SNQuietUntil (Float, on the actor): a Utility.GetCurrentRealTime()
+     stamp the quiet lasts until; one more than 60 s ahead is from another
+     launch and is ignored. FC_SNQuietSev (Int, on the actor, default 99 =
+     every wound): the lowest severity still told. Severities: 1 small wound,
+     2 grievous wound, 3 a part severed, 4 blown apart.}
+    Float qu = StorageUtil.GetFloatValue(vic, "FC_SNQuietUntil", 0.0)
+    If qu <= now || (qu - now) > 60.0
+        Return false
+    EndIf
+    Return curSev < StorageUtil.GetIntValue(vic, "FC_SNQuietSev", 99)
 EndFunction
 
 Function NotifySkyrimNetFromPlace(Actor vic, Int flags, Int placed, Int severed, String[] prov)
@@ -1572,8 +1575,10 @@ Function NotifySkyrimNetFromPlace(Actor vic, Int flags, Int placed, Int severed,
         Return
     EndIf
     Float now = Utility.GetCurrentRealTime()
-    Float lastAt = StorageUtil.GetFloatValue(vic, "FC_SNLastTime", 0.0)
-    If (now - lastAt) < 1.5
+    ; The engine's own FL_Wounded for them came in the last 10 s: that is the
+    ; wound these pieces belong to, and it has been told already.
+    Float realAt = StorageUtil.GetFloatValue(vic, "FC_SNRealAt", -9999.0)
+    If realAt <= now && (now - realAt) < 10.0
         Return
     EndIf
     Int lostMask = 0
@@ -1604,7 +1609,69 @@ Function NotifySkyrimNetFromPlace(Actor vic, Int flags, Int placed, Int severed,
         EndWhile
     EndIf
     String synth = "place|-|FC|" + (placed * 12) + "|0|" + touched + "|-|" + lostMask + "|" + flags + "|0,0,0"
-    NotifySkyrimNetWound(vic, synth)
+    ; DEFERRED, NOT SENT. The engine's FL_Wounded for the same wound can land a
+    ; moment after its pieces; it cancels this (RelayEvent). Sent by
+    ; SNPlaceFallbackPass after 3 s only if it did not come. Several place lines
+    ; inside the wait keep the worst, and the first one's due time.
+    Int rank = 1
+    If flags / 1024 % 2 == 1
+        rank = 4
+    ElseIf lostMask != 0
+        rank = 3
+    ElseIf placed * 12 >= 25
+        rank = 2
+    EndIf
+    If StorageUtil.GetStringValue(vic, "FC_SNPlaceSynth", "") != ""
+        If rank >= StorageUtil.GetIntValue(vic, "FC_SNPlaceRank", 0)
+            StorageUtil.SetStringValue(vic, "FC_SNPlaceSynth", synth)
+            StorageUtil.SetIntValue(vic, "FC_SNPlaceRank", rank)
+        EndIf
+    Else
+        StorageUtil.SetStringValue(vic, "FC_SNPlaceSynth", synth)
+        StorageUtil.SetIntValue(vic, "FC_SNPlaceRank", rank)
+        StorageUtil.SetFloatValue(vic, "FC_SNPlaceDue", now + 3.0)
+    EndIf
+    StorageUtil.FormListAdd(None, "FC_SNPlaceQ", vic, false)
+EndFunction
+
+Function SNPlaceFallbackPass()
+    {Sends the place-line fallbacks NotifySkyrimNetFromPlace queued, once their
+     3 s wait is over, unless the engine's own FL_Wounded for that actor came in
+     meanwhile. An entry more than 30 s off its due time (a save loaded later,
+     another launch) is dropped untold.}
+    Int i = StorageUtil.FormListCount(None, "FC_SNPlaceQ")
+    If i <= 0
+        Return
+    EndIf
+    Float now = Utility.GetCurrentRealTime()
+    i -= 1
+    While i >= 0
+        Actor v = StorageUtil.FormListGet(None, "FC_SNPlaceQ", i) as Actor
+        String synth = ""
+        Float due = 0.0
+        If v
+            synth = StorageUtil.GetStringValue(v, "FC_SNPlaceSynth", "")
+            due = StorageUtil.GetFloatValue(v, "FC_SNPlaceDue", 0.0)
+        EndIf
+        If !v || synth == "" || (due - now) > 30.0 || (now - due) > 30.0
+            StorageUtil.FormListRemoveAt(None, "FC_SNPlaceQ", i)
+            If v
+                StorageUtil.UnsetStringValue(v, "FC_SNPlaceSynth")
+                StorageUtil.UnsetIntValue(v, "FC_SNPlaceRank")
+                StorageUtil.UnsetFloatValue(v, "FC_SNPlaceDue")
+            EndIf
+        ElseIf now >= due
+            StorageUtil.FormListRemoveAt(None, "FC_SNPlaceQ", i)
+            StorageUtil.UnsetStringValue(v, "FC_SNPlaceSynth")
+            StorageUtil.UnsetIntValue(v, "FC_SNPlaceRank")
+            StorageUtil.UnsetFloatValue(v, "FC_SNPlaceDue")
+            Float realAt = StorageUtil.GetFloatValue(v, "FC_SNRealAt", -9999.0)
+            If realAt > now || (now - realAt) >= 10.0
+                NotifySkyrimNetWound(v, synth)
+            EndIf
+        EndIf
+        i -= 1
+    EndWhile
 EndFunction
 
 Function PlaceLine(String out)
@@ -1751,8 +1818,7 @@ Function PlaceLine(String out)
         EndReviveCheck(vic)
         If StorageUtil.GetIntValue(vic, "FC_CorpseDress") == 0
             StorageUtil.SetIntValue(vic, "FC_CorpseDress", 1)
-            ; Listed again, once: a pass may have spent their name a beat ago.
-            MiscUtil.WriteToFile("Data/SKSE/Plugins/FleshCore.dress.txt", "|" + part[1], true, false)
+            ; Booked for corpse dressing on the next DressRequested pass.
         EndIf
     EndIf
     If flags % 2 == 1 && vic
@@ -1781,6 +1847,15 @@ Function PlaceLine(String out)
     ; go into a slot with a time on it and OnUpdate's TrunkLiftPass fires it.
     If flags / 1024 % 2 == 1 && vic
         BeginTrunkLift(vic)
+        Float nowBurst = Utility.GetCurrentRealTime()
+        Float lastBurst = StorageUtil.GetFloatValue(vic, "FL_LastDetonateBurst", -999.0)
+        If lastBurst < 0.0 || nowBurst < lastBurst || (nowBurst - lastBurst) > 1.5
+            ; STAMPED NOW, and played on a stack of its own: the burst is fifty
+            ; impact calls and a wait, and while it ran inside this function the
+            ; drain was held, so the next victim's kill waited for the splashes.
+            StorageUtil.SetFloatValue(vic, "FL_LastDetonateBurst", nowBurst)
+            QueueBurstFallback(vic, 0)
+        EndIf
     EndIf
     ; ---- THE PLAYER DIES BY THE SAME RULE --------------------------------------
     ;
@@ -1874,6 +1949,7 @@ Function PlaceLine(String out)
     ; and returns None for anything that is not one, which MarkOn treats as
     ; unmarked.
     Int mark = -1
+    Bool markForced = false
     ; A FORCED MARK OUTRANKS WHAT THEY WORE. A W row's mark column of 2 or 3
     ; names DecalCore kind 1 or 2, a kind another mod registered: every piece
     ; of them leaves wearing it at the heaviest band whether or not anyone
@@ -1884,6 +1960,7 @@ Function PlaceLine(String out)
     ; level, level 5 the heaviest of six.
     If forced >= 2 && DC_Api.HasKind(forced - 1)
         mark = (forced - 1) * 10 + 5
+        markForced = true
     ElseIf DC_Api.PaintReady()
         mark = DC_Api.MarkOn(victim as Actor)
     EndIf
@@ -1958,9 +2035,18 @@ Function PlaceLine(String out)
                 ; THE EVIDENCE FOR THE ABOVE, ONCE PER WOUND: this
                 ; reports False while the 3D is still on its way; True would mean
                 ; the 3D was ready after all.
-                If k == 0
+                If k == 0 && ProbeVerbose
                     Debug.Trace("[DecalCore] wound mark " + mark \
                         + "; first piece had 3D at placement: " + piece.Is3DLoaded())
+                EndIf
+                ; THE MARK OF THIS WOUND, LEFT ON THE PIECE. An engine-placed
+                ; piece may already have been thrown before this line was read,
+                ; and the pending mark above is one shared slot that the last
+                ; wound may still hold; FL_Chunk.TakeWoundMark collects this one.
+                ; A forced mark is not left: the piece reads it from its own roll
+                ; and would never collect it.
+                If refId != 0 && !markForced
+                    StorageUtil.SetIntValue(piece, "FC_mark", mark)
                 EndIf
                 ; WHICH RECORD THIS CAME FROM, told to the piece itself, so that
                 ; when it gives up it can ask the engine what that record points
@@ -2187,8 +2273,9 @@ Function PlaceLine(String out)
         ; the floor still gets blood.
         ;
         ; Set true to bring it back.
-        If Squish && WoundSplatter
-            victim.PlayImpactEffect(Squish, "", 0.0, 0.0, -1.0, 160.0, false, false)
+        If Squish && WoundSplatter && FL_Native.GetBloodSplatter()
+            Float wAng = Utility.RandomFloat(0.0, 360.0)
+            victim.PlayImpactEffect(Squish, "", 0.22 * Math.Cos(wAng), 0.22 * Math.Sin(wAng), -0.975, 160.0, false, false)
         EndIf
         If vic
             NotifySkyrimNetFromPlace(vic, flags, placed, severed, prov)
@@ -2248,8 +2335,15 @@ Function Dismember(Actor vic)
     ; setting, and no forced third person).
     If pusher && pusher == vic
         DeathCamOut()
+    ElseIf vic
+        ArmSeverWatch(vic)
     EndIf
     KillForReal(vic)
+    vic.StopTranslation()
+    vic.SetVehicle(None)
+    vic.SetRestrained(false)
+    vic.SetDontMove(false)
+    vic.ForceAddRagdollToWorld()
     If pusher && pusher != vic
         pusher.PushActorAway(vic, 1.0)
     Else
@@ -2391,11 +2485,10 @@ Function ReviveRequested()
      their 3D, refills their inventory from their template and cancels whatever they
      were doing. The restore is supposed to be invisible to anyone still
      standing, so IsDead() is the gate and it is not optional.}
-    String req = MiscUtil.ReadFromFile("Data/SKSE/Plugins/FleshCore.revive.txt")
+    String req = FL_Native.PopReviveLine()
     If req == ""
         Return
     EndIf
-    MiscUtil.WriteToFile("Data/SKSE/Plugins/FleshCore.revive.txt", "", false, false)
     String[] ids = StringUtil.Split(req, "|")
     ; FIELD ZERO IS THE HEAD, NOT AN ACTOR. The engine names it because this
     ; script has no property for it and Resurrect() takes it off them.
@@ -2440,7 +2533,9 @@ Function ReviveRequested()
             Bool defeated = false
             FL_KO_Hold reg = Hold()
             If a
-                CleanFEC(a)
+                ; No CleanFEC here: it resets their 3D, and someone still on
+                ; their feet (a living player moved away by another mod) must be left
+                ; alone. The down branch below cleans the ones brought back.
                 defeated = HasAcheron() && Acheron.IsDefeated(a)
                 down = a.IsDead() || defeated || a.IsBleedingOut() || a.IsUnconscious()
                 ; ---- KNOCKED OUT IS NOT DOWN TO THIS SPELL ----
@@ -2460,6 +2555,13 @@ Function ReviveRequested()
                     Debug.Trace("[FleshCore] revive: " + a + " is not down " \
                         + "(dead=" + a.IsDead() + " bleedout=" + a.IsBleedingOut() \
                         + " unconscious=" + a.IsUnconscious() + ") -- left alone")
+                EndIf
+                ; THE COAT COMES OFF THE LIVING TOO. DecalCore's skin coat plays
+                ; until it is stopped, and a Restore makes them whole. UncoatAll
+                ; stops only DecalCore's own shaders and leaves their 3D alone.
+                ; Loaded bodies only: a coat ends when its reference unloads.
+                If !down && a.Is3DLoaded()
+                    DC_Api.UncoatAll(a)
                 EndIf
             EndIf
             If a && down
@@ -2551,6 +2653,9 @@ Function ReviveRequested()
                 ; put ARMOUR on them, and an overlay is written onto the 3D they
                 ; are wearing; cleaning first and equipping after invites the
                 ; rebuild an equip can queue to arrive on top of the clean.
+                If Game.IsPluginInstalled("Dismembering Framework.esm") && DismemberingFramework.IsDismembered(a)
+                    DismemberingFramework.ResetActorLimbs(a)
+                EndIf
                 DC_Api.UncoatAll(a)
                 DC_Api.ClearMarks(a)
                 CleanFEC(a)
@@ -2595,57 +2700,49 @@ String Function JoinId(String list, String id)
     Return list + "|" + id
 EndFunction
 
-Function DressRequested()
-    {The engine names who has no interior; this puts one on them -- up to 8 living
-     actors per pass, each handed a Dress on a stack of its own (DressDispatch), so
-     a fight's targets are dressed side by side rather than in turn, then one corpse.
-
-     THE DEAD ARE DRESSED TOO. The interior takes about ten seconds
-     to land and nearly every first blow is fatal, so a target struck on sight
-     dies without it. Skipping the dead here left those corpses
-     hollow -- FIELD: 10 bodies of 51 opened hollow and 8 of them never
-     got it. But a biped rebuild on a ragdoll is a visible pop, so a corpse is
-     dressed only if a FleshCore wound touched it (PlaceLine books them: 1 in
-     FC_CorpseDress) and only once (2), one a pass and after the living, so a
-     fight is not held up for its own dead. Never one already wearing it: forced,
-     Dress re-seats what is worn. And never with the head fill: `gone` holds only
-     the layers a cell had, so a skull seated on a corpse that lost its head has
-     nothing cutting it and the head comes back.}
-    String req = MiscUtil.ReadFromFile("Data/SKSE/Plugins/FleshCore.dress.txt")
+Function DressRequested(Bool abUrgent = false)
+    {Drain in-memory dress requests ("<headFid>|<actorFid>:<needMask>|...") via FL_Native.PopDressLine().}
+    String req = FL_Native.PopDressLine()
     If req == ""
         Return
     EndIf
-    MiscUtil.WriteToFile("Data/SKSE/Plugins/FleshCore.dress.txt", "", false, false)
     String[] ids = StringUtil.Split(req, "|")
     Int k = 0
-    String headToken = "0"
     If ids.Length > 0 && ids[0] != "" && ids[0] != "0"
         Armor h = Game.GetFormEx(ids[0] as Int) as Armor
         If h
             headFill = h
-            headToken = ids[0]
-            k = 1
         EndIf
+        k = 1
+    ElseIf ids.Length > 0
+        k = 1
     EndIf
     Int dressedCount = 0
     Int handed = 0
-    String leftover = ""
     String dead = ""
+    Bool ngd = Game.IsPluginInstalled("Next-Gen Decapitations.esp")
     While k < ids.Length && k < 64
         If ids[k] != ""
-            Actor a = Game.GetFormEx(ids[k] as Int) as Actor
-            If a && !a.IsDisabled()
-                If a.IsDead()
-                    dead = JoinId(dead, ids[k])
+            String[] pair = StringUtil.Split(ids[k], ":")
+            Int fid = pair[0] as Int
+            Int needMask = 3
+            If pair.Length >= 2
+                Int parsed = pair[1] as Int
+                If parsed > 0 && parsed <= 3
+                    needMask = parsed
+                EndIf
+            EndIf
+            Actor a = Game.GetFormEx(fid) as Actor
+            If a && !a.IsDisabled() && a.Is3DLoaded()
+                If ngd && NGDecapitations.IsHead(a)
+                    a.SendModEvent("FC_DressDone", "", 1.0)
+                ElseIf a.IsDead()
+                    dead = JoinId(dead, pair[0])
                 ElseIf dressedCount < 8
-                    handed = DressDispatch(a, false)
+                    handed = DressDispatch(a, false, needMask, abUrgent)
                     If handed > 0
                         dressedCount += 1
-                    ElseIf handed < 0
-                        leftover = JoinId(leftover, ids[k])
                     EndIf
-                Else
-                    leftover = JoinId(leftover, ids[k])
                 EndIf
             EndIf
         EndIf
@@ -2653,63 +2750,37 @@ Function DressRequested()
     EndWhile
     If dead != ""
         String[] corpses = StringUtil.Split(dead, "|")
-        Bool served = dressedCount >= 8
         k = 0
-        While k < corpses.Length
-            If served
-                leftover = JoinId(leftover, corpses[k])
-            Else
-                Actor c = Game.GetFormEx(corpses[k] as Int) as Actor
-                If c && StorageUtil.GetIntValue(c, "FC_CorpseDress") == 1 && c.Is3DLoaded() && !c.IsEquipped(Interior)
-                    If DressDispatch(c, true) > 0
-                        StorageUtil.SetIntValue(c, "FC_CorpseDress", 2)
-                        served = true
-                    EndIf
+        While k < corpses.Length && dressedCount < 8
+            Actor c = Game.GetFormEx(corpses[k] as Int) as Actor
+            If c && StorageUtil.GetIntValue(c, "FC_CorpseDress") == 1 && c.Is3DLoaded() && !c.IsEquipped(Interior)
+                If DressDispatch(c, true, 1, abUrgent) > 0
+                    StorageUtil.SetIntValue(c, "FC_CorpseDress", 2)
+                    dressedCount += 1
                 EndIf
             EndIf
             k += 1
         EndWhile
     EndIf
-    ; Not on top of a request the DLL wrote during this pass: that one names
-    ; everybody still undressed, these included.
-    If leftover != "" && MiscUtil.ReadFromFile("Data/SKSE/Plugins/FleshCore.dress.txt") == ""
-        MiscUtil.WriteToFile("Data/SKSE/Plugins/FleshCore.dress.txt", headToken + "|" + leftover, false, false)
-    EndIf
 EndFunction
 
-; ---- ONE DRESS, ONE STACK -------------------------------------------------
-;
-; DressRequested used to dress its targets IN TURN, inside this tick, and every
-; Dress is a dozen or more native calls, each waiting for the game's thread.
-; FIELD PROOF: six targets requested within twelve seconds, with the game in
-; focus, were dressed one after another -- 10, 22, 28, 32, 33 and 37 seconds
-; later -- each waiting for every Dress ahead of it, and the tick's other passes
-; waiting for all of them. A mod event's handler runs on a stack of its own, so
-; each target is now handed one: their native calls wait side by side, and the
-; tick goes straight back to its other passes.
-;
-; `dressing` holds whom a handed-out Dress is working on, or finished with
-; under fifteen seconds ago (`dressingDone`). The mailbox is rewritten whole on
-; every request, so a body the engine never counts as dressed -- in testing, an
-; Argonian whose interior never drew -- is named again pass after pass. FIELD
-; PROOF: one fight sent 97 Dresses to 30 targets, one of them 15 times and
-; several three to five times in three seconds, each taking off an interior
-; they already wore and putting it back. So a target is dressed at most once
-; in fifteen seconds, and a slot still in flight frees itself after twenty if
-; its Dress never returns. A new process's clock starts again at zero, so a
-; slot stamped later than now belongs to another session and is free. When no
-; slot is free, the cooling one finished longest ago gives way; only when all
-; 32 are in flight does a target wait for the next pass.
 Form[] dressing
 Float[] dressingAt
 Bool[] dressingDone
 
-Int Function DressDispatch(Actor a, Bool abNoHead)
-    {Hands one Dress to a stack of its own: a mod event whose sender is the
-     target, answered by OnFleshCoreDress. 1: handed out. 0: a Dress is working
-     on them, or finished under fifteen seconds ago. -1: every slot is in
-     flight, so the caller keeps them for the next pass.}
+Int Function DressDispatch(Actor a, Bool abNoHead, Int aiNeedMask = 3, Bool abUrgent = false)
+    {Hands one Dress to a stack of its own via FleshCore_Dress.}
     If !a
+        Return 0
+    EndIf
+    Int mask = aiNeedMask
+    If mask <= 0 || mask > 3
+        mask = 3
+    EndIf
+    If abNoHead
+        mask = Math.LogicalAnd(mask, 1)
+    EndIf
+    If mask == 0
         Return 0
     EndIf
     If !dressing || !dressingDone || dressing.Length != 32
@@ -2725,7 +2796,11 @@ Int Function DressDispatch(Actor a, Bool abNoHead)
         Float age = now - dressingAt[i]
         Bool vacant = !dressing[i] || age < 0.0 || (dressingDone[i] && age >= 15.0) || (!dressingDone[i] && age >= 20.0)
         If dressing[i] == a
-            If !vacant
+            If abUrgent
+                If !dressingDone[i] && age >= 0.0 && age < 2.0
+                    Return 0
+                EndIf
+            ElseIf !vacant
                 Return 0
             EndIf
             slot = i
@@ -2747,24 +2822,20 @@ Int Function DressDispatch(Actor a, Bool abNoHead)
     dressing[slot] = a
     dressingAt[slot] = now
     dressingDone[slot] = false
-    ; Mod-event registrations do not survive a load (SKSE's Form.psc), so this
-    ; one is made again right before the event that needs it; registering
-    ; twice changes nothing.
     RegisterForModEvent("FleshCore_Dress", "OnFleshCoreDress")
-    Float noHead = 0.0
-    If abNoHead
-        noHead = 1.0
-    EndIf
-    a.SendModEvent("FleshCore_Dress", "", noHead)
+    a.SendModEvent("FleshCore_Dress", "", mask as Float)
     Return 1
 EndFunction
 
 Function OnFleshCoreDress(String eventName, String strArg, Float numArg, Form sender)
-    {One target's Dress, on a stack of its own (DressDispatch). numArg 1 leaves
-     the head fill off, as for a corpse.}
+    {One target's Dress, on a stack of its own (DressDispatch). numArg encodes needMask (1=body, 2=head, 3=both).}
     Actor a = sender as Actor
     If a
-        Dress(a, true, numArg == 1.0)
+        Int mask = numArg as Int
+        If mask <= 0 || mask > 3
+            mask = 3
+        EndIf
+        Dress(a, true, Math.LogicalAnd(mask, 2) == 0, mask)
     EndIf
     If dressing && dressingDone
         Int i = dressing.Find(sender)
@@ -2775,16 +2846,20 @@ Function OnFleshCoreDress(String eventName, String strArg, Float numArg, Form se
     EndIf
 EndFunction
 
-Function Dress(Actor akActor, Bool abForce = false, Bool abNoHead = false)
-    {Give an eligible body its interior, once, silently. abNoHead leaves the head
-     fill off: a corpse's, see DressRequested.}
+Function Dress(Actor akActor, Bool abForce = false, Bool abNoHead = false, Int aiNeedMask = 3)
+    {Give an eligible body its missing interior/head fill without re-equipping what is already worn.}
     If !akActor || !Interior || akActor.IsDisabled() || (!abForce && akActor.IsDead())
         If ProbeVerbose && akActor && abForce
             FL_Probe.Snapshot(akActor, Interior, "GATE-null-or-disabled")
         EndIf
         Return
     EndIf
-    Bool wasWorn = akActor.IsEquipped(Interior)
+    If Game.IsPluginInstalled("Next-Gen Decapitations.esp") && NGDecapitations.IsHead(akActor)
+        If abForce
+            akActor.SendModEvent("FC_DressDone", "", 3.0)
+        EndIf
+        Return
+    EndIf
     Int why = FL_Wound.WhyRefused(akActor)
     If why != 0
         If abForce
@@ -2800,52 +2875,73 @@ Function Dress(Actor akActor, Bool abForce = false, Bool abNoHead = false)
             MiscUtil.WriteToFile("Data/SKSE/Plugins/FleshCore.refused.txt", \
                 akActor.GetFormID() + "\n", true, false)
         EndIf
+        If abForce
+            akActor.SendModEvent("FC_DressDone", "", 3.0)
+        EndIf
         Return
     EndIf
+    Bool needBody = Math.LogicalAnd(aiNeedMask, 1) != 0
+    Bool needHead = !abNoHead && Math.LogicalAnd(aiNeedMask, 2) != 0
+    Bool wasWorn = akActor.IsEquipped(Interior)
     If !abForce && wasWorn
-        If headFill && headFill != RetiredHead()
+        If needHead && headFill && headFill != RetiredHead()
             SeatHead(akActor)
         EndIf
         Return
     EndIf
-    Armor wornBody = akActor.GetWornForm(0x00000004) as Armor
-    If !wornBody && !wasWorn
-        If !abNoHead && headFill && headFill != RetiredHead()
-            SeatHead(akActor)
+    Int doneMask = 0
+    If needBody && !wasWorn
+        Armor wornBody = akActor.GetWornForm(0x00000004) as Armor
+        Form s54 = akActor.GetWornForm(0x01000000)
+        Form s55 = akActor.GetWornForm(0x02000000)
+        Form s61 = akActor.GetWornForm(0x80000000)
+        Bool slotClash = (s54 && s54 != (Interior as Form)) || (s55 && s55 != (Interior as Form)) || (s61 && s61 != (Interior as Form))
+        If slotClash
+            doneMask = Math.LogicalOr(doneMask, 1)
+        ElseIf abForce || wornBody
+            If !NiOverride.HasOverlays(akActor)
+                NiOverride.AddOverlays(akActor)
+            EndIf
+            If akActor.GetItemCount(Interior) < 1
+                akActor.AddItem(Interior, 1, true)
+            EndIf
+            If ProbeVerbose
+                FL_Probe.Snapshot(akActor, Interior, "PRE-EQUIP")
+            EndIf
+            akActor.EquipItem(Interior, true, true)
+            If wornBody && wornBody != Interior && wornBody != headFill && akActor.GetWornForm(0x00000004) != wornBody
+                If akActor.GetItemCount(wornBody) < 1
+                    akActor.AddItem(wornBody, 1, true)
+                EndIf
+                akActor.EquipItem(wornBody, false, true)
+            EndIf
+            If !akActor.IsEquipped(Interior)
+                Utility.Wait(0.15)
+                akActor.EquipItem(Interior, true, true)
+            EndIf
+            If akActor.IsEquipped(Interior)
+                If ProbeVerbose
+                    FL_Probe.Snapshot(akActor, Interior, "POST-EQUIP")
+                    MiscUtil.WriteToFile("Data/SKSE/Plugins/FleshCore.dressing.log", \
+                        Utility.GetCurrentRealTime() + " equip " + akActor + "\n", true, false)
+                EndIf
+                If announceDressing
+                    Debug.Notification("FleshCore: dressed " + akActor.GetDisplayName())
+                EndIf
+                Debug.Trace("[FleshCore] dressed " + akActor)
+            ElseIf ProbeVerbose
+                FL_Probe.Snapshot(akActor, Interior, "POST-EQUIP-RETRY-FAIL")
+            EndIf
         EndIf
-        Return
     EndIf
-    If !NiOverride.HasOverlays(akActor)
-        NiOverride.AddOverlays(akActor)
-    EndIf
-    If akActor.GetItemCount(Interior) < 1
-        akActor.AddItem(Interior, 1, true)
-    EndIf
-    If ProbeVerbose
-        FL_Probe.Snapshot(akActor, Interior, "PRE-EQUIP")
-    EndIf
-    If wasWorn && abForce
-        akActor.UnequipItem(Interior, false, true)
-    EndIf
-    akActor.EquipItem(Interior, false, true)
-    If !abNoHead && headFill && headFill != RetiredHead()
-        SeatHead(akActor)
-    EndIf
-    If wornBody && wornBody != Interior && wornBody != headFill && akActor.GetWornForm(0x00000004) != wornBody
-        If akActor.GetItemCount(wornBody) < 1
-            akActor.AddItem(wornBody, 1, true)
+    If needHead && headFill && headFill != RetiredHead()
+        If !TrySeatHead(akActor)
+            doneMask = Math.LogicalOr(doneMask, 2)
         EndIf
-        akActor.EquipItem(wornBody, false, true)
     EndIf
-    If ProbeVerbose
-        FL_Probe.Snapshot(akActor, Interior, "POST-EQUIP")
-        MiscUtil.WriteToFile("Data/SKSE/Plugins/FleshCore.dressing.log", \
-            Utility.GetCurrentRealTime() + " equip " + akActor + "\n", true, false)
+    If abForce
+        akActor.SendModEvent("FC_DressDone", "", doneMask as Float)
     EndIf
-    If announceDressing
-        Debug.Notification("FleshCore: dressed " + akActor.GetDisplayName())
-    EndIf
-    Debug.Trace("[FleshCore] dressed " + akActor)
 EndFunction
 
 ; ---- THE PRE-DRESS AFTER A LOAD ----------------------------------
@@ -3000,6 +3096,7 @@ Function LearnPanelFromConfig()
         Debug.Trace("[FleshCore] watcher: no config to read -- the panel hotkey is not registered")
         Return
     EndIf
+    panelLearnedLoad = lastLoad
     ; ---- LP <maxLive> <shardLife> <sectionLife> -- THE LIVE-PIECE CAP ----
     ; Read here because this runs on every load and the file is already in hand.
     ; FL_Chunk reads these three at its OnInit and in Life(); a missing row or
@@ -3126,6 +3223,13 @@ Function SetPanelKeyOverride(Int k)
      0 puts the config's PK row back in charge, -1 is cleared, anything else is
      their key. Applied at once and again on every load, because
      LearnPanelFromConfig re-reads the file each time.}
+    ; THE SAME CHOICE, ALREADY APPLIED UNDER THIS LOAD: nothing to do. After a
+    ; load the menus push their unchanged key two or three times, and each push
+    ; re-read the whole config. CheckLoad re-learns on every load whatever this
+    ; skips, so a key is never left unregistered by it.
+    If k == panelKeyMCM && lastLoad != 0 && panelLearnedLoad == lastLoad
+        Return
+    EndIf
     panelKeyMCM = k
     LearnPanelFromConfig()
 EndFunction
@@ -3559,12 +3663,15 @@ Function TrunkBleedPass()
                     EndIf
                 EndIf
                 Int d = 0
-                While d < drops
-                    ; Straight down, from them, onto whatever they are standing
-                    ; on. DC_Api.Splat is the same call the shards use.
-                    DC_Api.Splat(who, DC_Api.BLOOD(), DC_Api.LARGE())
-                    d += 1
-                EndWhile
+                Int tPct = FL_Native.GetBloodSplatterPct()
+                If FL_Native.GetBloodSplatter() && tPct > 0
+                    While d < drops
+                        If tPct >= 100 || Utility.RandomInt(1, 100) <= tPct
+                            DC_Api.Splat(who, DC_Api.BLOOD(), Utility.RandomInt(0, 2))
+                        EndIf
+                        d += 1
+                    EndWhile
+                EndIf
             EndIf
         EndIf
         i += 1
@@ -3648,9 +3755,13 @@ Function BeginTrunkLift(Actor who)
         EndIf
         ; The one closest to firing is the one to displace -- it is the one
         ; whose wound is oldest, exactly as in BeginTrunkBleed.
-        If i == 0 || liftAt[i] < soonestAt
+        Float effAt = liftAt[i]
+        If effAt < 0.0
+            effAt = -effAt
+        EndIf
+        If i == 0 || effAt < soonestAt
             soonest = i
-            soonestAt = liftAt[i]
+            soonestAt = effAt
         EndIf
         i += 1
     EndWhile
@@ -3677,15 +3788,29 @@ Function TrunkLiftPass()
     Int i = 0
     While i < lifter.Length
         Actor who = lifter[i] as Actor
-        If who && now >= liftAt[i]
-            lifter[i] = None
-            If !who.IsDisabled() && !who.IsDeleted()
-                ; THE ORDER IS THE POINT, and it is FL_GrindMe's order: the
-                ; ragdoll goes into the physics world first, because that is
-                ; what gives the impulse something to act on.
-                who.ForceAddRagdollToWorld()
-                who.ApplyHavokImpulse(0.0, 0.0, 1.0, LiftForce)
-                Debug.Trace("[FleshCore] blast lift: " + who + " thrown up at " + LiftForce)
+        If who
+            If liftAt[i] > 0.0 && now >= liftAt[i]
+                liftAt[i] = -(now + 0.85)
+                If !who.IsDisabled() && !who.IsDeleted()
+                    who.StopTranslation()
+                    who.SetVehicle(None)
+                    who.SetRestrained(false)
+                    who.SetDontMove(false)
+                    who.ForceAddRagdollToWorld()
+                    who.ApplyHavokImpulse(0.0, 0.0, 1.0, LiftForce)
+                    Debug.Trace("[FleshCore] blast lift: " + who + " thrown up at " + LiftForce)
+                EndIf
+            ElseIf liftAt[i] < 0.0 && now >= (-liftAt[i])
+                lifter[i] = None
+                liftAt[i] = 0.0
+                If !who.IsDisabled() && !who.IsDeleted() && who.IsDead()
+                    who.StopTranslation()
+                    who.SetVehicle(None)
+                    who.SetRestrained(false)
+                    who.SetDontMove(false)
+                    who.ForceAddRagdollToWorld()
+                    who.ApplyHavokImpulse(0.0, 0.0, -1.0, 2.5)
+                EndIf
             EndIf
         EndIf
         i += 1
@@ -3797,6 +3922,7 @@ EndFunction
 Function ReviveCheckPass()
     {One pass over everyone with a check due. Runs on every beat; nothing to do
      on almost all of them.}
+    SeverWatchPass()
     If !reviver
         Return
     EndIf
@@ -4088,4 +4214,224 @@ Function VoiceMouthPass()
             spk.SetExpressionPhoneme(5, 10)
         EndIf
     EndIf
+EndFunction
+
+Function ArmSeverWatch(Actor akVic)
+    If !akVic || akVic == Game.GetPlayer()
+        Return
+    EndIf
+    If !_severWatch || _severWatch.Length != 8
+        _severWatch = new Form[8]
+        _severWatchUntil = new Float[8]
+        _severWatchCursor = 0
+    EndIf
+    Float exp = Utility.GetCurrentRealTime() + 15.0
+    Int i = 0
+    While i < 8
+        If _severWatch[i] == akVic
+            _severWatchUntil[i] = exp
+            Return
+        EndIf
+        i += 1
+    EndWhile
+    Int slot = _severWatchCursor % 8
+    _severWatchCursor = (_severWatchCursor + 1) % 8
+    _severWatch[slot] = akVic
+    _severWatchUntil[slot] = exp
+EndFunction
+
+Function ClearSeverWatchFor(Form akForm)
+    If !_severWatch || !akForm
+        Return
+    EndIf
+    Int i = 0
+    While i < _severWatch.Length
+        If _severWatch[i] == akForm
+            _severWatch[i] = None
+            _severWatchUntil[i] = 0.0
+        EndIf
+        i += 1
+    EndWhile
+EndFunction
+
+Function ClearSeverWatchAll()
+    If !_severWatch
+        Return
+    EndIf
+    Int i = 0
+    While i < _severWatch.Length
+        _severWatch[i] = None
+        _severWatchUntil[i] = 0.0
+        i += 1
+    EndWhile
+EndFunction
+
+Function SeverWatchPass()
+    If !_severWatch
+        Return
+    EndIf
+    Float now = Utility.GetCurrentRealTime()
+    Int i = 0
+    While i < _severWatch.Length
+        Actor a = _severWatch[i] as Actor
+        If a
+            Float u = _severWatchUntil[i]
+            If now >= u || (u - now) > 30.0
+                _severWatch[i] = None
+                _severWatchUntil[i] = 0.0
+            ElseIf !a.IsDead()
+                Debug.Trace("[FleshCore] severed actor " + a + " stood back up alive -- enforcing lethal kill")
+                KillForReal(a)
+            EndIf
+        EndIf
+        i += 1
+    EndWhile
+EndFunction
+
+Function QueueBurstFallback(Actor akTarget, Int aiKind)
+    {Hands the Detonate decal burst to a stack of its own (the FleshCore_Dress
+     pattern, DressDispatch). Registered on every call: the registration is the
+     same each time and costs one native.}
+    If !akTarget
+        Return
+    EndIf
+    RegisterForModEvent("FL_BurstFallback", "OnFLBurstFallback")
+    akTarget.SendModEvent("FL_BurstFallback", "", aiKind as Float)
+EndFunction
+
+Function OnFLBurstFallback(String eventName, String strArg, Float numArg, Form sender)
+    {The burst, on its own stack. sender is the target (Form.SendModEvent).
+     A burst that reaches here more than two seconds after its wound is
+     dropped: by then the body has been lifted and thrown, and a ring of blood
+     where it no longer is would be wrong.}
+    Actor a = sender as Actor
+    If !a
+        Return
+    EndIf
+    Float queuedAt = StorageUtil.GetFloatValue(a, "FL_LastDetonateBurst", -999.0)
+    Float now = Utility.GetCurrentRealTime()
+    If queuedAt >= 0.0 && now >= queuedAt && (now - queuedAt) > 2.0
+        If ProbeVerbose
+            Debug.Trace("[FleshCore] watcher: Detonate splash for " + a + " dropped, " \
+                        + (now - queuedAt) + "s late")
+        EndIf
+        Return
+    EndIf
+    DetonateBurstFallback(a, numArg as Int)
+EndFunction
+
+Function DetonateBurstFallback(Actor akTarget, Int aiKind = 0)
+    If !akTarget
+        Return
+    EndIf
+    Int pct = 0
+    If FL_Native.GetBloodSplatter()
+        pct = FL_Native.GetBloodSplatterPct()
+    EndIf
+    If pct <= 0
+        Return
+    EndIf
+    If pct > 100
+        pct = 100
+    EndIf
+    DC_Core c = DC_Api.Core()
+    If c == None
+        Return
+    EndIf
+    Static xmk = Game.GetFormFromFile(0x0000003B, "Skyrim.esm") as Static
+    If xmk == None
+        Return
+    EndIf
+    StorageUtil.SetFloatValue(akTarget, "FL_LastDetonateBurst", Utility.GetCurrentRealTime())
+    Float scale = (pct as Float) / 100.0
+    Int coatBand = (5.0 * scale + 0.999) as Int
+    If coatBand < 1
+        coatBand = 1
+    ElseIf coatBand > 5
+        coatBand = 5
+    EndIf
+    DC_Api.CoatSkin(akTarget, DC_Api.BLOOD(), coatBand)
+    ObjectReference org = akTarget.PlaceAtMe(xmk, 1, true, false)
+    If !org
+        Return
+    EndIf
+    Float h = 48.0
+    org.MoveTo(akTarget, 0.0, 0.0, h, false)
+    If !org.Is3DLoaded()
+        Utility.Wait(0.03)
+    EndIf
+    Int nHoriz = (4.0 * scale + 0.999) as Int
+    If nHoriz > 4
+        nHoriz = 4
+    EndIf
+    ImpactDataSet s0 = c.SetFor(0, Utility.RandomInt(1, 2))
+    If s0 != None
+        Float cAng = Utility.RandomFloat(0.0, 360.0)
+        Float cTilt = Utility.RandomFloat(0.14, 0.28)
+        ; 60 units past the assumed floor, as FL_DetonateBurst: a body whose
+        ; origin sits above the floor (lying, ragdolled, a slope) still marks it.
+        org.PlayImpactEffect(s0, "", cTilt * Math.Cos(cAng), cTilt * Math.Sin(cAng), -0.97, h + 60.0, false, false)
+        Int hi = 0
+        While hi < nHoriz
+            ImpactDataSet sh = c.SetFor(0, Utility.RandomInt(0, 2))
+            If sh != None
+                Float hAng = (90.0 * hi) + Utility.RandomFloat(-28.0, 28.0)
+                Float hDz = Utility.RandomFloat(-0.22, 0.16)
+                org.PlayImpactEffect(sh, "", Math.Cos(hAng), Math.Sin(hAng), hDz, Utility.RandomFloat(84.0, 128.0), false, false)
+            EndIf
+            hi += 1
+        EndWhile
+    EndIf
+    Int ringIdx = 0
+    While ringIdx < 3
+        Float rad = 28.0
+        Int baseRays = 8
+        Float turn = 0.0
+        If ringIdx == 1
+            rad = 55.0
+            baseRays = 12
+            turn = 15.0
+        ElseIf ringIdx == 2
+            rad = 83.0
+            baseRays = 16
+            turn = 11.25
+        EndIf
+        Int rCount = ((baseRays as Float) * scale + 0.999) as Int
+        If rCount > 0 && c.SetFor(0, DC_Api.LARGE()) != None
+            Float step = 360.0 / (rCount as Float)
+            Int ri = 0
+            While ri < rCount
+                Int sz = Utility.RandomInt(0, 2)
+                If rad < 40.0 && sz == 0 && Utility.RandomInt(0, 2) > 0
+                    sz = Utility.RandomInt(1, 2)
+                EndIf
+                ImpactDataSet sr = c.SetFor(0, sz)
+                If sr != None
+                    Float ang = turn + step * ri + Utility.RandomFloat(-step * 0.44, step * 0.44)
+                    Float rJit = rad * Utility.RandomFloat(0.60, 1.42)
+                    Float lenJ = Math.sqrt(rJit * rJit + h * h)
+                    If lenJ >= 1.0
+                        org.PlayImpactEffect(sr, "", (rJit * Math.Cos(ang)) / lenJ, (rJit * Math.Sin(ang)) / lenJ, -h / lenJ, lenJ + 60.0, false, false)
+                    EndIf
+                EndIf
+                ri += 1
+            EndWhile
+        EndIf
+        ringIdx += 1
+    EndWhile
+    Int nFlat = (8.0 * scale + 0.999) as Int
+    If nFlat > 0 && c.SetFor(0, DC_Api.LARGE()) != None
+        Float fStep = 360.0 / (nFlat as Float)
+        Int fi = 0
+        While fi < nFlat
+            ImpactDataSet sf = c.SetFor(0, Utility.RandomInt(0, 2))
+            If sf != None
+                Float angF = 22.5 + fStep * fi + Utility.RandomFloat(-fStep * 0.42, fStep * 0.42)
+                org.PlayImpactEffect(sf, "", Math.Cos(angF), Math.Sin(angF), Utility.RandomFloat(-0.18, 0.16), Utility.RandomFloat(165.0, 235.0), false, false)
+            EndIf
+            fi += 1
+        EndWhile
+    EndIf
+    org.DisableNoWait()
+    org.Delete()
 EndFunction

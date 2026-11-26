@@ -487,7 +487,7 @@ static void ToMeat(Shape& s)
 // everything else.
 static const char* kBloodD = "Textures\\FleshCore\\blood_splat.dds";
 static const char* kBloodN = "Textures\\FleshCore\\blood_splat_n.dds";
-static void Bloody(std::vector<Shape>& shapes)
+[[maybe_unused]] static void Bloody(std::vector<Shape>& shapes)
 {
     std::vector<Shape> add;
     for (const Shape& src : shapes) {
@@ -1154,7 +1154,7 @@ std::vector<std::uint8_t> Build(const Chunk& c, float* massOut)
     // silent.
     // (g_lastBuild was reset at the top, before the first refusal.)
     ++g_uniqSeq;
-    if (!nShapes) return {};
+    if (!nShapes) { g_lastBuild.why = "it holds no shapes"; return {}; }
     // A SEVERED LIMB IS NOT A SHARD. A shard is a handful of cells and a
     // dozen shapes; a severed body half is a hundred and thirty cells whose
     // fill will not fit in one sixteen-bit index list and arrives already
@@ -1162,9 +1162,9 @@ std::vector<std::uint8_t> Build(const Chunk& c, float* massOut)
     // Measured on the real body, the worst cut seen is a sagittal bisection at
     // twenty-odd shapes -- so the ceiling is where an absurd chunk is still
     // refused and a real one never is.
-    if (nShapes > kShapeCeiling) return {};
+    if (nShapes > kShapeCeiling) { g_lastBuild.why = "more shapes than the ceiling"; return {}; }
     for (const Shape& s : shapes)
-        if (!s.vsize || s.vdata.size() % s.vsize) return {};
+        if (!s.vsize || s.vdata.size() % s.vsize) { g_lastBuild.why = "a shape whose records do not divide by its stride"; return {}; }
 
     // ---- centroid and bounds, in the body's bind space -------------------
     double sx = 0, sy = 0, sz = 0; std::uint64_t nPts = 0;
@@ -1183,14 +1183,14 @@ std::vector<std::uint8_t> Build(const Chunk& c, float* massOut)
             if (p[2]>zb) zb=p[2];
         }
     }
-    if (!nPts) return {};
+    if (!nPts) { g_lastBuild.why = "it holds no vertices"; return {}; }
     const float C[3] = { float(sx/nPts), float(sy/nPts), float(sz/nPts) };
     const float hx = xb-xa, hy = yb-ya, hz = zb-za;
     // A chunk thinner than a twentieth of a unit in any axis is a sliver with
     // no volume to give physics, and one over five hundred units across is not
     // a chunk of anybody. Both are refused rather than shipped.
-    if (!(hx > 0.05f && hy > 0.05f && hz > 0.05f)) return {};
-    if (hx > 500 || hy > 500 || hz > 500) return {};
+    if (!(hx > 0.05f && hy > 0.05f && hz > 0.05f)) { g_lastBuild.why = "thinner than a twentieth of a unit (a sliver)"; return {}; }
+    if (hx > 500 || hy > 500 || hz > 500) { g_lastBuild.why = "more than 500 units across"; return {}; }
     const float rad = 0.5f * std::sqrt(hx*hx + hy*hy + hz*hz);
 
     // ---- principal axes, for a hull that is not mostly air ---------------
@@ -1459,9 +1459,9 @@ std::vector<std::uint8_t> Build(const Chunk& c, float* massOut)
         const bool sRigid = shapeRigid[s] != 0;
         const std::uint32_t nV = std::uint32_t(sh.vdata.size() / sh.vsize);
         const std::uint32_t nT = std::uint32_t(sh.tris.size() / 3);
-        if (!nV || !nT || nV > 0xFFFF || nT > 0xFFFF) return {};
+        if (!nV || !nT || nV > 0xFFFF || nT > 0xFFFF) { g_lastBuild.why = "a shape with no triangles, or past 65,535 vertices or triangles"; return {}; }
         const std::uint32_t so = SkinOff(sh.desc);
-        if (so + 12 > sh.vsize) return {};
+        if (so + 12 > sh.vsize) { g_lastBuild.why = "a shape whose skin block does not fit its records"; return {}; }
 
         // THE RECORDS, chosen per shape (`sRigid` above).
         //

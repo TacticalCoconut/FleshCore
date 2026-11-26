@@ -99,6 +99,7 @@ struct BuildStat {
     int  cutout     = 0;       // shapes given an alpha test (FT col 3)
     int  normals    = 0;       // accessories given normals and tangents (FT col 4)
     int  dedup      = 0;       // duplicate accessory shapes dropped (FT col 5)
+    const char* why = nullptr; // why the last Build returned nothing (null when it built a piece)
 };
 BuildStat LastBuild();
 

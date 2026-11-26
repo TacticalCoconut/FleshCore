@@ -233,7 +233,7 @@ Function Mark(String how)
             Int sn = 0
             Int sj = 0
             While sj < Volleys
-                If DC_Api.SplatToward(Self, ch, Kind, DC_Api.MEDIUM(), 4.0, 12.0)
+                If DC_Api.SplatToward(Self, ch, Kind, Utility.RandomInt(0, 2), 4.0, 14.0)
                     sn += 1
                 EndIf
                 sj += 1
@@ -316,7 +316,7 @@ Function Mark(String how)
                     coated += 1
                 EndIf
             EndIf
-            DC_Api.SplatToward(Self, r, Kind, DC_Api.SMALL(), 6.0, 14.0)
+            DC_Api.SplatToward(Self, r, Kind, Utility.RandomInt(0, 1), 6.0, 14.0)
         EndIf
         dj += 1
     EndWhile
@@ -335,7 +335,7 @@ Function Mark(String how)
         Int on = 0
         Int oj = 0
         While oj < Volleys
-            If DC_Api.SplatToward(Self, obj, Kind, DC_Api.SMALL(), 6.0, 14.0)
+            If DC_Api.SplatToward(Self, obj, Kind, Utility.RandomInt(0, 1), 6.0, 14.0)
                 on += 1
             EndIf
             oj += 1
@@ -351,31 +351,38 @@ Function Mark(String how)
     Delete()
 EndFunction
 
-Int Function Blast(Int size, Float castDist)
-    {Every one of the six axis casts, and a count of how many landed.
+Int Function JitterRay(DC_Core c, Float bx, Float by, Float bz, Float castDist)
+    ImpactDataSet s = c.SetFor(Kind, Utility.RandomInt(0, 2))
+    If s == None
+        Return 0
+    EndIf
+    Float dx = bx + Utility.RandomFloat(-0.36, 0.36)
+    Float dy = by + Utility.RandomFloat(-0.36, 0.36)
+    Float dz = bz + Utility.RandomFloat(-0.28, 0.28)
+    Float len = Math.sqrt(dx * dx + dy * dy + dz * dz)
+    If len < 0.05
+        Return 0
+    EndIf
+    If PlayImpactEffect(s, "", dx / len, dy / len, dz / len, castDist * Utility.RandomFloat(0.88, 1.18), false, false)
+        Return 1
+    EndIf
+    Return 0
+EndFunction
 
-     Unlike Sweep this does NOT stop at the first hit. That is the difference
-     between "put a mark somewhere" and "mark every surface this reaches",
-     and this does the second.}
+Int Function Blast(Int size, Float castDist)
+    {Six randomized-size, angularly-jittered surface casts so hits scatter varied shapes and
+     do not project orthogonal cross/square patterns on flat geometry.}
+    DC_Core c = DC_Api.Core()
+    If c == None
+        Return 0
+    EndIf
     Int n = 0
-    If DC_Api.SplatDir(Self, Kind, size, 1.0, 0.0, 0.0, castDist, false)
-        n += 1
-    EndIf
-    If DC_Api.SplatDir(Self, Kind, size, -1.0, 0.0, 0.0, castDist, false)
-        n += 1
-    EndIf
-    If DC_Api.SplatDir(Self, Kind, size, 0.0, 1.0, 0.0, castDist, false)
-        n += 1
-    EndIf
-    If DC_Api.SplatDir(Self, Kind, size, 0.0, -1.0, 0.0, castDist, false)
-        n += 1
-    EndIf
-    If DC_Api.SplatDir(Self, Kind, size, 0.0, 0.0, -1.0, castDist, false)
-        n += 1
-    EndIf
-    If DC_Api.SplatDir(Self, Kind, size, 0.0, 0.0, 1.0, castDist, false)
-        n += 1
-    EndIf
+    n += JitterRay(c, 1.0, 0.0, 0.0, castDist)
+    n += JitterRay(c, -1.0, 0.0, 0.0, castDist)
+    n += JitterRay(c, 0.0, 1.0, 0.0, castDist)
+    n += JitterRay(c, 0.0, -1.0, 0.0, castDist)
+    n += JitterRay(c, 0.0, 0.0, -1.0, castDist)
+    n += JitterRay(c, 0.0, 0.0, 1.0, castDist)
     Return n
 EndFunction
 

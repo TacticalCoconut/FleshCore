@@ -137,6 +137,9 @@ Int Function WhyRefused(Actor akActor) Global
     If !akActor
         Return 1
     EndIf
+    If Game.IsPluginInstalled("Next-Gen Decapitations.esp") && NGDecapitations.IsHead(akActor)
+        Return 2
+    EndIf
     ActorBase ab = akActor.GetLeveledActorBase()
     If !ab
         ab = akActor.GetActorBase()
@@ -178,10 +181,18 @@ EndFunction
 Function ClearProtection(Actor akActor) Global
     {Protected and Essential actors survive everything in silence, which reads
      as the spell being broken. Both flags are cleared on the target's own base
-     so the body can actually come apart.}
-    ActorBase ab = akActor.GetActorBase()
+     so the body can actually come apart, unless NoKill is active for them.}
+    If !akActor || akActor == Game.GetPlayer() || FL_Api.NoKill(akActor)
+        Return
+    EndIf
+    ActorBase ab = akActor.GetLeveledActorBase()
     If ab
         ab.SetProtected(false)
         ab.SetEssential(false)
+    EndIf
+    ActorBase ed = akActor.GetActorBase()
+    If ed && ed != ab
+        ed.SetProtected(false)
+        ed.SetEssential(false)
     EndIf
 EndFunction

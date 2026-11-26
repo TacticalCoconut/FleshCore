@@ -1,10 +1,10 @@
-# FleshCore (Beta v0.1.1)
+# FleshCore (Beta v0.2.0)
 
 **Real-time volumetric dismemberment, layered anatomical wounds, and physics-enabled severed body parts for Skyrim Special Edition (Steam 1.6.1170 only), with full in-game customization and a Papyrus API (`FL_Api`) that other mods can call without making `FleshCore.esp` a master.**
 
 > **Content Warning (18+ Gore):** FleshCore renders graphic anatomical gore (skin, subcutaneous fat, muscle, and bone excavation).
 >
-> **Beta Release (`Beta v0.1.1`):** This is a public beta release of FleshCore. Expect rough edges as edge cases across custom outfits and load orders are refined.
+> **Beta Release (`Beta v0.2.0`):** This is a public beta release of FleshCore. Expect rough edges as edge cases across custom outfits and load orders are refined.
 
 > **Disclaimer: This Mod was made with the assistance of AI Code Generation.
 
@@ -100,8 +100,17 @@ FleshCore includes both a dedicated **PrismaUI HQ Panel** (opened anytime in-gam
 - **[PrismaUI](https://www.nexusmods.com/skyrimspecialedition/mods/148718)** — Powers the interactive in-game **FleshCore HQ** control panel (double-tap `.` in game)
 - **[SkyUI](https://www.nexusmods.com/skyrimspecialedition/mods/12604)** — For the SkyUI MCM configuration pages
 - **[RaceMenu](https://www.nexusmods.com/skyrimspecialedition/mods/19080)** — For surface blood/decal overlay support (`DC_Api`)
+  - *Tip:* blood and decal marks are drawn in RaceMenu's overlay slots, and RaceMenu's defaults are small (6 for the body, 3 each for hands, feet and face). To let more marks show at once, and leave room for other overlay mods, raise `iNumOverlays` in RaceMenu's `SKSE\Plugins\skee64.ini`: for example `16` under `[Overlays/Body]` and `13` under `[Overlays/Hands]`, `[Overlays/Feet]` and `[Overlays/Face]`. FleshCore does not change this file itself.
 
 If a requirement's page or its installer offers different files or options for different game versions, take the one for the Steam version of Skyrim `1.6.1170`.
+
+### Optional: the Grinder Spells (need Leash Framework)
+- **[Leash Framework](https://www.nexusmods.com/skyrimspecialedition/mods/187303)** `1.1.8` — Only for FleshCore's two grinder spells. FleshCore works without it, and `FleshCore.esp` does not need it to load.
+  - **Spawn Grinder** puts a grinder with two spiked rollers in front of you. Aim at its base and activate it to switch it on or off. Casting it again moves the grinder: there is one at a time.
+  - **Grinder Hook** chains the one you hit to the nearest grinder (in the same cell, within 2,500 units) and pulls them in. When they reach the spinning rollers, FleshCore grinds them. If the pull gets stuck, the hook's winch drags them the rest of the way. Someone the chain cannot hold (a creature has no neck bone for it) is dragged in by the winch from the start.
+  - With Leash Framework installed, both spells are added to your Conjuration spells. Turn them off or on in the MCM: **Controls**, **Grinder Spells**. Without Leash Framework the spells are not added, and the MCM row says "Requires Leash Framework".
+  - **Rollers grind bystanders** (MCM, off by default): anyone else who touches the spinning rollers is ground too, except you, your followers and anyone the game protects.
+  - Tested with Leash Framework `1.1.8`. A newer version is used, not refused: FleshCore says once that it was not tested with it.
 
 ### Body Mods (Read Before Installing)
 
@@ -141,6 +150,7 @@ FleshCore hooks hit events passively through SKSE without editing vanilla weapon
    - **Double-tap `.` (Period key)** at any time in game to open the **FleshCore HQ** panel (requires PrismaUI) — drag the **Combat Intensity** preset slider or customize per-part survivability, weapon triggers, actor restoration, and optional test spells.
    - Or open **Pause Menu -> Mod Configuration -> FleshCore** (requires SkyUI).
    - *Note:* No debug spells are added to the player's spellbook automatically; you can grant or revoke any of the test spells from the HQ panel or MCM.
+6. **Updating from an earlier version:** install over it and let the new files win. On the first start, FleshCore sees that its saved list of your loose files (`SKSE\Plugins\FleshCore.loose_manifest.bin`, with MO2 in the overwrite folder) comes from the old version, does not use it, and builds a new one in the background. There is nothing to delete.
 
 ---
 
@@ -160,44 +170,51 @@ Other mods can trigger wounds, sever limbs, restore actors, query anatomical sta
 ; Soft-check whether FleshCore is loaded and the target can be cut:
 If Game.IsPluginInstalled("FleshCore.esp") && FL_Api.CoreActive() && FL_Api.Targetable(akTarget)
 
-    ; Named presets:
+    ; Named wounds (the kinds are listed in FleshCore-API.md):
     FL_Api.Wound(akTarget, "decapitate")
     FL_Api.Wound(akTarget, "bisect")
-    FL_Api.Wound(akTarget, "gut")
+    FL_Api.Wound(akTarget, "armoffl")
 
-    ; Custom anatomical wound: part, form, radiusScale, depth (1=skin, 2=+muscle, 3=+bone)
-    FL_Api.Wound(akTarget, "rforearm", "slab", 1.0, 3)
-    FL_Api.Wound(akTarget, "chest", "bore", 1.2, 3)
+    ; A wound on one named part, with no record in the plugin:
+    ; caller, actor, form, size, depth, part (the same columns as a trigger row)
+    FL_Api.WoundPart("MyMod", akTarget, "slab", 5.0, 3, "rforearm")
+    FL_Api.WoundPart("MyMod", akTarget, "bore", 7.0, 3, "chest")
 
-    ; Restore an actor's entire body and reverse any FleshCore wounds:
+    ; Put every piece of them back:
     FL_Api.Restore(akTarget)
 EndIf
 ```
 
 #### 2. Querying an Actor's Anatomical State
 ```papyrus
-If FL_Api.HasAnyWound(akTarget)
-    If !FL_Api.HasPart(akTarget, "head")
-        Debug.Trace("Target has been decapitated!")
+If FL_Api.HasBody(akTarget) && !FL_Api.IsBuiltWhole(akTarget)
+    If FL_Api.PartInMask(FL_Api.GetPartsLostMask(akTarget), "head")
+        Debug.Trace("The target has lost their head")
     EndIf
-    Float chestBoneLeft = FL_Api.PartIntegrity(akTarget, "chest", 3) ; 0.0 .. 1.0
-    String summary      = FL_Api.DescribeWounds(akTarget)            ; e.g. "missing the left hand, cut on the chest"
+    Float chestLeft = FL_Api.GetPartIntegrityPct(akTarget, FL_Api.PartBit("chest")) ; 0 .. 100
+    String why      = FL_Api.WhyNot(akTarget)   ; one word: why FleshCore would not wound them now
 EndIf
 ```
 
 #### 3. Listening to FleshCore ModEvents
 ```papyrus
 Event OnInit()
-    RegisterForModEvent("FleshCore_OnWound", "OnFleshCoreWound")
-    RegisterForModEvent("FleshCore_OnSever", "OnFleshCoreSever")
-    RegisterForModEvent("FleshCore_OnDeath", "OnFleshCoreDeath")
-    RegisterForModEvent("FleshCore_OnRestore", "OnFleshCoreRestore")
+    RegisterForModEvent("FleshCore_Wound", "OnFleshCoreWound")
+    RegisterForModEvent("FL_PartLost", "OnFleshCorePartLost")
+    RegisterForModEvent("FL_Restored", "OnFleshCoreRestored")
 EndEvent
 
-Event OnFleshCoreSever(Form akVictim, String asPart, Float afRemaining)
-    Actor victim = akVictim as Actor
-    ; asPart is one of the 15 part names ("head", "rforearm", "lthigh", etc.)
+Event OnFleshCorePartLost(String eventName, String strArg, Float numArg, Form sender)
+    Actor victim = sender as Actor
+    String part = FL_Api.Field(strArg, 0)   ; one of the 15 part names ("head", "rforearm", "lthigh", ...)
 EndEvent
+```
+
+#### 4. Raising the Fodder Overkill Chance for a While
+```papyrus
+; Add 15 points on top of the player's own Fodder Overkill setting; send 0.0 to take them away.
+; One shared slot (the last mod to set it wins), kept in memory only. See FleshCore-API.md.
+Game.GetPlayer().SendModEvent("FC_OverkillBonusSet", "", 15.0)
 ```
 
 ---
@@ -206,7 +223,7 @@ EndEvent
 
 | Path | Description |
 | :--- | :--- |
-| [`src/`](src/) | C++17 SKSE plugin source (`flesh.cpp`, `lattice.cpp`, `chunknif.cpp`, `windiag.cpp`, `facts.h`, `armour_bits.h`, `redraw_bits.h`, `blobs.h`) |
+| [`src/`](src/) | C++17 SKSE plugin source (`flesh.cpp`, `lattice.cpp`, `chunknif.cpp`, `windiag.cpp`, `facts.h`, `armour_bits.h`, `redraw_bits.h`, `rawguard.h`, `blobs.h`) |
 | [`scripts/source/`](scripts/source/) | Papyrus `.psc` source scripts (`FL_Api.psc`, `FL_Watch.psc`, `FL_MCM.psc`, `FL_Wound.psc`, `FL_Chunk.psc`, `DC_Api.psc`, etc.) |
 | [`PrismaUI/views/FleshCore/`](PrismaUI/views/FleshCore/) | Interactive FleshCore HQ single-page UI (`index.html`) |
 | [`SKSE/Plugins/FleshCore.cfg.txt`](SKSE/Plugins/FleshCore.cfg.txt) | Default combat trigger, anatomical threshold, and engine configuration |

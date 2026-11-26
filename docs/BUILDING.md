@@ -18,6 +18,8 @@ The plugin uses neither CommonLibSSE nor the Address Library. Most engine offset
 
 Compile `scripts/source` with Caprica or the Creation Kit's compiler, against the headers for SKSE, SkyUI, PapyrusUtil, powerofthree's Papyrus Extender, and RaceMenu; with Caprica, add each of those header folders with a further `-i` option.
 
+`FL_LeashBridge.psc` also needs `LeashFramework.psc` from [Leash Framework](https://www.nexusmods.com/skyrimspecialedition/mods/187303) and `PapyrusTweaks.psc` from Papyrus Tweaks NG. It is the only script that calls them, and the game loads it only when Leash Framework is installed, so neither mod is needed to play FleshCore.
+
 ```bash
 caprica -g skyrim --ignorecwd --allow-unknown-events 1 -i scripts/source -f TESV_Papyrus_Flags.flg -o scripts scripts/source
 ```
